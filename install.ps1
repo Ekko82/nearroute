@@ -77,7 +77,7 @@ try {
     $shortcut.WorkingDirectory = $applicationRoot
     $shortcut.WindowStyle = 7
     $shortcut.Description = '近舟 NearRoute：线路探测、范围设置和自动优选'
-    $shortcut.IconLocation = (Join-Path $env:SystemRoot 'System32\shell32.dll') + ',17'
+    $shortcut.IconLocation = (Join-Path $applicationRoot 'assets\nearroute.ico') + ',0'
     $shortcut.Save()
     $installState = [ordered]@{
         schema_version = 2; installed = $true; root = $applicationRoot

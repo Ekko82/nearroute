@@ -20,7 +20,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import optimizer as core
-from tray_icon import TrayIcon, request_restore
+from tray_icon import ICON_PATH, TrayIcon, request_restore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -514,6 +514,11 @@ class Dashboard:
         self.after_id = None
 
         root.title(WINDOW_TITLE)
+        if os.name == "nt":
+            try:
+                root.iconbitmap(default=str(ICON_PATH))
+            except tk.TclError:
+                pass  # A missing icon must not prevent opening the dashboard.
         root.geometry("1080x710")
         root.minsize(900, 610)
         root.configure(background="#f4f6f9")

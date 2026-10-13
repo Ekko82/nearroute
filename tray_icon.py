@@ -16,6 +16,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import os
+from pathlib import Path
 import threading
 from typing import Callable
 
@@ -27,6 +28,7 @@ WM_QUIT = 0x0012
 WM_CONTEXTMENU = 0x007B
 WM_LBUTTONDBLCLK = 0x0203
 WM_RBUTTONUP = 0x0205
+WM_DPICHANGED = 0x02E0
 WM_USER = 0x0400
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 71
@@ -51,6 +53,11 @@ MF_STRING = 0
 MF_SEPARATOR = 0x0800
 WS_EX_TOOLWINDOW = 0x00000080
 IDI_APPLICATION = 32512
+IMAGE_ICON = 1
+LR_LOADFROMFILE = 0x0010
+SM_CXSMICON = 49
+SM_CYSMICON = 50
+ICON_PATH = Path(__file__).resolve().parent / "assets" / "nearroute.ico"
 
 LRESULT = ctypes.c_ssize_t
 WPARAM = ctypes.c_size_t
@@ -158,6 +165,21 @@ class _NativeAPI:
         bind(self.user, "RegisterWindowMessageW", wintypes.UINT, [wintypes.LPCWSTR])
         bind(self.user, "FindWindowW", wintypes.HWND, [wintypes.LPCWSTR, wintypes.LPCWSTR])
         bind(self.user, "LoadIconW", wintypes.HICON, [wintypes.HINSTANCE, wintypes.LPCWSTR])
+        bind(self.user, "LoadImageW", wintypes.HANDLE, [
+            wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+            ctypes.c_int, ctypes.c_int, wintypes.UINT,
+        ])
+        bind(self.user, "DestroyIcon", wintypes.BOOL, [wintypes.HICON])
+        bind(self.user, "GetSystemMetrics", ctypes.c_int, [ctypes.c_int])
+        for name, result, args in (
+            ("GetDpiForWindow", wintypes.UINT, [wintypes.HWND]),
+            ("GetSystemMetricsForDpi", ctypes.c_int, [ctypes.c_int, wintypes.UINT]),
+            ("SetThreadDpiAwarenessContext", wintypes.HANDLE, [wintypes.HANDLE]),
+        ):
+            try:
+                bind(self.user, name, result, args)
+            except AttributeError:
+                setattr(self, name, None)
         bind(self.user, "CreatePopupMenu", wintypes.HMENU, [])
         bind(self.user, "AppendMenuW", wintypes.BOOL, [wintypes.HMENU, wintypes.UINT, ctypes.c_size_t, wintypes.LPCWSTR])
         bind(self.user, "DestroyMenu", wintypes.BOOL, [wintypes.HMENU])
@@ -200,6 +222,7 @@ class TrayIcon:
         self._class_atom = 0
         self._wndproc_ref = None
         self._data = None
+        self._owned_icon = 0
         self._icon_added = False
         self._version4 = False
         self._in_menu = False
@@ -250,6 +273,16 @@ class TrayIcon:
         except Exception as error:
             self.last_error = "callback:" + type(error).__name__
 
+    def _small_icon_size(self) -> tuple[int, int]:
+        dpi_for_window = self._api.GetDpiForWindow
+        metrics_for_dpi = self._api.GetSystemMetricsForDpi
+        dpi = dpi_for_window(self._hwnd) if dpi_for_window else 0
+        if dpi and metrics_for_dpi:
+            dimensions = tuple(metrics_for_dpi(index, dpi) for index in (SM_CXSMICON, SM_CYSMICON))
+        else:
+            dimensions = tuple(self._api.GetSystemMetrics(index) for index in (SM_CXSMICON, SM_CYSMICON))
+        return tuple(value if value > 0 else 16 for value in dimensions)
+
     def _add_icon(self) -> bool:
         if self._stop_requested.is_set():
             return False
@@ -259,13 +292,23 @@ class TrayIcon:
         data.uID = ICON_ID
         data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP
         data.uCallbackMessage = WM_TRAY
-        # LoadIcon returns a shared system icon; it must not be DestroyIcon'd.
-        resource = ctypes.cast(ctypes.c_void_p(IDI_APPLICATION), wintypes.LPCWSTR)
-        data.hIcon = self._api.LoadIconW(None, resource)
+        width, height = self._small_icon_size()
+        # Keep this owned handle until the shell icon is removed. The ICO has
+        # separate small sizes, avoiding Windows shrinking a generic 32px icon.
+        self._owned_icon = self._api.LoadImageW(
+            None, str(ICON_PATH), IMAGE_ICON, width, height, LR_LOADFROMFILE,
+        ) or 0
+        data.hIcon = self._owned_icon
+        if not data.hIcon:
+            self.last_error = "icon:load_failed"
+            # A missing asset must not make a hidden application inaccessible.
+            # This shared system fallback must never be passed to DestroyIcon.
+            resource = ctypes.cast(ctypes.c_void_p(IDI_APPLICATION), wintypes.LPCWSTR)
+            data.hIcon = self._api.LoadIconW(None, resource)
         data.szTip = _tooltip(self.title)
         self._data = data
         if not data.hIcon or not self._api.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
-            self._available.clear()
+            self._delete_icon()
             return False
         self._icon_added = True
         data.uVersion = NOTIFYICON_VERSION_4
@@ -281,6 +324,11 @@ class TrayIcon:
         if self._icon_added and self._data is not None:
             self._api.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._data))
         self._icon_added = False
+        if self._owned_icon:
+            self._api.DestroyIcon(self._owned_icon)
+            self._owned_icon = 0
+        if self._data is not None:
+            self._data.hIcon = None
 
     def _show_menu(self, hwnd) -> None:
         if self._in_menu or self._stop_requested.is_set():
@@ -332,7 +380,7 @@ class TrayIcon:
             if not self._stop_requested.is_set():
                 self._emit("open")
             return 0
-        if self._taskbar_message and message == self._taskbar_message:
+        if message == WM_DPICHANGED or (self._taskbar_message and message == self._taskbar_message):
             # Also handles DPI-change broadcasts, where the old icon may exist.
             self._delete_icon()
             if not self._add_icon() and not self._stop_requested.is_set():
@@ -361,8 +409,15 @@ class TrayIcon:
 
     def _run(self) -> None:
         started = False
+        previous_dpi_context = None
         try:
             self._api = _NativeAPI()
+            # Set awareness only for this dedicated native thread. Changing the
+            # process default at runtime would also change Tk's window layout.
+            if self._api.SetThreadDpiAwarenessContext:
+                previous_dpi_context = self._api.SetThreadDpiAwarenessContext(ctypes.c_void_p(-4))
+                if not previous_dpi_context:  # Windows 10 before per-monitor v2.
+                    previous_dpi_context = self._api.SetThreadDpiAwarenessContext(ctypes.c_void_p(-3))
             self._native_thread_id = self._api.GetCurrentThreadId()
             self._instance = self._api.GetModuleHandleW(None)
             self._restore_message = self._api.RegisterWindowMessageW(_restore_message_name(self.instance_key))
@@ -420,5 +475,7 @@ class TrayIcon:
             except Exception as error:
                 self.last_error = "cleanup:" + type(error).__name__
             finally:
+                if previous_dpi_context:
+                    self._api.SetThreadDpiAwarenessContext(previous_dpi_context)
                 self._native_thread_id = 0
                 self._ready.set()

@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" role="img" aria-labelledby="title description">
+  <title id="title">NearRoute</title>
+  <desc id="description">A white sailing boat on a blue and teal rounded square, with transparent outer corners.</desc>
+  <defs>
+    <linearGradient id="sea" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1860c0"/>
+      <stop offset="1" stop-color="#04778e"/>
+    </linearGradient>
+  </defs>
+  <rect x="8" y="8" width="240" height="240" rx="54" fill="url(#sea)" stroke="#6dcfe0" stroke-width="4"/>
+  <g fill="#ffffff">
+    <polygon points="126,43 61,150 126,150"/>
+    <polygon points="146,82 194,150 146,150"/>
+    <polygon points="53,170 205,170 180,205 82,205"/>
+  </g>
+</svg>
