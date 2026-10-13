@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+/state/
+/config.json
+# Personal authenticated experiment; not part of the public application.
+/verify_codex_stream.py
+/dist/
+/*.zip
+*.log
+.config-*.tmp
+*.tmp
