@@ -20,6 +20,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import optimizer as core
+from tray_icon import TrayIcon, request_restore
 
 
 ROOT = Path(__file__).resolve().parent
@@ -53,6 +54,9 @@ class WindowInstance:
         if not self.handle:
             raise OSError("无法创建控制窗口的单实例锁")
         if ctypes.get_last_error() == 183:
+            if request_restore(str(ROOT)):
+                self.close()
+                return False
             user = ctypes.WinDLL("user32", use_last_error=True)
             user.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
             user.FindWindowW.restype = wintypes.HWND
@@ -171,15 +175,37 @@ def python_executable() -> str:
     raise FileNotFoundError("未找到 Python 运行环境。请使用安装时的 Python 打开近舟。")
 
 
-def start_daemon() -> None:
+def start_daemon() -> subprocess.Popen:
     if not OPTIMIZER.is_file():
         raise FileNotFoundError("未找到 optimizer.py，请先完成安装。")
-    subprocess.Popen(
+    return subprocess.Popen(
         [python_executable(), str(OPTIMIZER), "run"],
         cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
         close_fds=True,
     )
+
+
+def wait_for_helper_startup(processes, timeout: float = 10.0) -> bool:
+    """Wait until every helper we launched owns the lock or has exited.
+
+    The helper publishes its PID after acquiring the mutex and clearing a stale
+    stop request. Stopping before then could miss a still-starting child.
+    """
+    pending = list(processes)
+    deadline = time.monotonic() + timeout
+    while pending:
+        try:
+            active_pid = read_json(STATUS).get("pid")
+        except (OSError, ValueError):
+            active_pid = None
+        pending = [p for p in pending if p.poll() is None and p.pid != active_pid]
+        if not pending:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
 
 
 def display_time(value: object) -> str:
@@ -469,13 +495,20 @@ class SettingsDialog:
 
 
 class Dashboard:
-    def __init__(self, root: tk.Tk, *, start_service: bool = True):
+    def __init__(self, root: tk.Tk, *, start_service: bool = True, enable_tray: bool = True):
         self.root = root
         self.closed = False
         self.results: queue.SimpleQueue[tuple[bool, str]] = queue.SimpleQueue()
         self.notice_until = 0.0
         self.node_signature = ""
         self.restore_busy = False
+        self.exiting = False
+        self.hidden_to_tray = False
+        self.tray = None
+        self.tray_actions: queue.SimpleQueue[str] = queue.SimpleQueue()
+        self.tray_after_id = None
+        self.service_after_id = None
+        self.started_helpers = []
         self.settings_dialog: SettingsDialog | None = None
         self.started_at = time.monotonic()
         self.after_id = None
@@ -484,7 +517,7 @@ class Dashboard:
         root.geometry("1080x710")
         root.minsize(900, 610)
         root.configure(background="#f4f6f9")
-        root.protocol("WM_DELETE_WINDOW", self.close)
+        root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         style = ttk.Style(root)
         if "vista" in style.theme_names():
             style.theme_use("vista")
@@ -530,6 +563,8 @@ class Dashboard:
         self.restore_button.pack(side="left")
         self.settings_button = ttk.Button(controls, text="测速设置", command=self.open_settings)
         self.settings_button.pack(side="right")
+        self.exit_button = ttk.Button(controls, text="退出程序", command=self.request_exit)
+        self.exit_button.pack(side="right", padx=(0, 8))
 
         summary = ttk.Frame(container)
         summary.grid(row=3, column=0, sticky="ew", pady=(0, 12))
@@ -572,14 +607,21 @@ class Dashboard:
 
         footer_label = ttk.Label(
             container,
-            text="延迟为 HTTP 线路探测结果，不是模型首字时间。切换作用于当前主代理组；已建立连接不主动关闭。\n关闭窗口后，后台优选仍会继续运行。恢复原节点会同时暂停自动切换。",
+            text="延迟为 HTTP 线路探测结果，不是模型首字时间。切换作用于当前主代理组；已建立连接不主动关闭。\n点击 × 收起到右下角托盘，双击托盘图标重新打开；退出程序会停止后台优选。",
             style="Muted.TLabel", wraplength=1010,
         )
         footer_label.grid(row=6, column=0, sticky="ew", pady=(14, 0))
         self.wrapping_labels.append(footer_label)
         container.bind("<Configure>", self.resize_text)
         if start_service:
-            root.after(100, self.ensure_service)
+            self.service_after_id = root.after(100, self.ensure_service)
+        if enable_tray and os.name == "nt":
+            self.tray = TrayIcon(WINDOW_TITLE, str(ROOT), self.tray_actions.put)
+            if not self.tray.start():
+                self.tray.stop()
+                self.tray = None
+                self.notify("系统托盘暂不可用，点击 × 将最小化到任务栏。", 15)
+        self.poll_tray()
         self.refresh()
 
     def notify(self, text: str, duration: float = 8.0) -> None:
@@ -591,15 +633,19 @@ class Dashboard:
             label.configure(wraplength=max(400, event.width - 48))
 
     def ensure_service(self) -> bool:
+        if self.closed or self.exiting or self.restore_busy:
+            return False
         try:
-            start_daemon()
+            process = start_daemon()
+            self.started_helpers = [p for p in self.started_helpers if p.poll() is None]
+            self.started_helpers.append(process)
             return True
         except (OSError, ValueError) as error:
             self.notify(f"服务启动失败：{error}", 30)
             return False
 
     def open_settings(self) -> None:
-        if self.restore_busy:
+        if self.restore_busy or self.exiting:
             return
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             self.settings_dialog.window.lift()
@@ -611,6 +657,8 @@ class Dashboard:
             messagebox.showerror("无法打开设置", str(error), parent=self.root)
 
     def settings_saved(self, saved: dict) -> None:
+        if self.closed or self.exiting:
+            return
         self.policy.set(policy_summary(saved))
         try:
             STATE.mkdir(parents=True, exist_ok=True)
@@ -624,7 +672,7 @@ class Dashboard:
             self.notify(f"设置已保存，但未能请求测速：{error}", 20)
 
     def enable(self) -> None:
-        if self.restore_busy:
+        if self.restore_busy or self.exiting:
             return
         try:
             update_enabled(True)
@@ -634,7 +682,7 @@ class Dashboard:
             messagebox.showerror("未能启用", str(error), parent=self.root)
 
     def pause(self) -> None:
-        if self.restore_busy:
+        if self.restore_busy or self.exiting:
             return
         try:
             update_enabled(False)
@@ -643,7 +691,7 @@ class Dashboard:
             messagebox.showerror("未能暂停", str(error), parent=self.root)
 
     def scan(self) -> None:
-        if self.restore_busy:
+        if self.restore_busy or self.exiting:
             return
         try:
             if not self.ensure_service():
@@ -655,7 +703,7 @@ class Dashboard:
             messagebox.showerror("未能开始测速", str(error), parent=self.root)
 
     def restore(self) -> None:
-        if self.restore_busy:
+        if self.restore_busy or self.exiting:
             return
         try:
             update_enabled(False)
@@ -663,15 +711,20 @@ class Dashboard:
             messagebox.showerror("未能暂停自动切换", str(error), parent=self.root)
             return
         self.restore_busy = True
+        self.cancel_service_start()
         self.restore_button.state(["disabled"])
         self.enable_button.state(["disabled"])
         self.pause_button.state(["disabled"])
         self.scan_button.state(["disabled"])
         self.settings_button.state(["disabled"])
+        self.exit_button.state(["disabled"])
         self.notify("正在恢复原节点，自动切换已暂停…", 90)
 
         def worker() -> None:
             try:
+                if not wait_for_helper_startup(self.started_helpers):
+                    self.results.put((False, "后台仍在启动，自动切换已暂停，请稍后重试恢复原节点。"))
+                    return
                 result = subprocess.run(
                     [python_executable(), str(OPTIMIZER), "restore"],
                     cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -717,6 +770,11 @@ class Dashboard:
         self.pause_button.state(["!disabled"] if enabled and not self.restore_busy else ["disabled"])
         self.scan_button.state(["disabled"] if self.restore_busy else ["!disabled"])
         self.settings_button.state(["disabled"] if self.restore_busy else ["!disabled"])
+        self.restore_button.state(["disabled"] if self.restore_busy or self.exiting else ["!disabled"])
+        self.exit_button.state(["disabled"] if self.restore_busy or self.exiting else ["!disabled"])
+        if self.exiting:
+            for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button, self.settings_button):
+                button.state(["disabled"])
         if not enabled:
             badge, color = "已暂停自动切换", "#8b6508"
         elif not connected:
@@ -770,13 +828,124 @@ class Dashboard:
             self.node_signature = signature
         self.after_id = self.root.after(2000, self.refresh)
 
+    def hide_to_tray(self) -> None:
+        if self.closed or self.exiting:
+            return
+        if self.tray is not None and self.tray.available:
+            try:
+                if self.settings_dialog is not None and not self.settings_dialog.closed:
+                    self.settings_dialog.window.grab_release()
+                    self.settings_dialog.window.withdraw()
+                self.root.withdraw()
+                self.hidden_to_tray = True
+                return
+            except tk.TclError:
+                self.show_window()
+        self.notify("系统托盘暂不可用，窗口已最小化到任务栏；可从任务栏重新打开。", 15)
+        self.root.iconify()
+
+    def show_window(self) -> None:
+        if self.closed:
+            return
+        self.root.deiconify()
+        self.root.lift()
+        self.root.focus_force()
+        self.hidden_to_tray = False
+        if self.settings_dialog is not None and not self.settings_dialog.closed:
+            window = self.settings_dialog.window
+            window.deiconify()
+            window.lift()
+            window.grab_set()
+
+    def poll_tray(self) -> None:
+        if self.closed:
+            return
+        try:
+            while True:
+                action = self.tray_actions.get_nowait()
+                if action == "open":
+                    self.show_window()
+                elif action == "exit":
+                    self.request_exit()
+                elif action == "tray_unavailable":
+                    if self.hidden_to_tray:
+                        self.show_window()
+                    self.notify("托盘图标暂不可用，已保留窗口以便操作。", 15)
+                elif action == "exited":
+                    self.close()
+                    return
+                elif action == "exit_failed":
+                    self.exiting = False
+                    self.show_window()
+                    self.notify("后台尚未停止，已保留窗口。请稍后再点击退出程序。", 20)
+        except queue.Empty:
+            pass
+        self.tray_after_id = self.root.after(200, self.poll_tray)
+
+    def request_exit(self) -> None:
+        if self.closed or self.exiting:
+            return
+        if self.restore_busy:
+            self.show_window()
+            self.notify("正在恢复原节点，请等待恢复操作完成后再退出。", 15)
+            return
+        self.exiting = True
+        self.cancel_service_start()
+        self.show_window()
+        self.notify("正在停止后台优选并退出…", 45)
+
+        def worker() -> None:
+            try:
+                if not wait_for_helper_startup(self.started_helpers):
+                    self.tray_actions.put("exit_failed")
+                    return
+                result = subprocess.run(
+                    [python_executable(), str(OPTIMIZER), "stop"], cwd=ROOT,
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    creationflags=NO_WINDOW, timeout=35, check=False,
+                )
+                self.tray_actions.put("exited" if result.returncode == 0 else "exit_failed")
+            except (OSError, subprocess.TimeoutExpired):
+                self.tray_actions.put("exit_failed")
+
+        try:
+            threading.Thread(target=worker, name="nearroute-exit", daemon=True).start()
+        except RuntimeError:
+            self.exiting = False
+            self.notify("退出操作暂未启动，已保留窗口，请稍后重试。", 20)
+
+    def cancel_service_start(self) -> None:
+        if self.service_after_id is not None:
+            try:
+                self.root.after_cancel(self.service_after_id)
+            except tk.TclError:
+                pass
+            self.service_after_id = None
+
     def close(self) -> None:
+        """Dispose the UI; user exit first stops the helper via request_exit."""
+        if self.closed:
+            return
         self.closed = True
         if self.settings_dialog is not None and not self.settings_dialog.closed:
-            self.settings_dialog.close()
-        if self.after_id is not None:
-            self.root.after_cancel(self.after_id)
-        self.root.destroy()
+            try:
+                self.settings_dialog.close()
+            except tk.TclError:
+                pass
+        for callback in (self.after_id, self.tray_after_id, self.service_after_id):
+            if callback is not None:
+                try:
+                    self.root.after_cancel(callback)
+                except tk.TclError:
+                    pass
+        try:
+            if self.tray is not None:
+                self.tray.stop()
+        finally:
+            try:
+                self.root.destroy()
+            except tk.TclError:
+                pass
 
 
 def main() -> None:
@@ -785,8 +954,11 @@ def main() -> None:
         return
     try:
         root = tk.Tk()
-        Dashboard(root)
-        root.mainloop()
+        dashboard = Dashboard(root)
+        try:
+            root.mainloop()
+        finally:
+            dashboard.close()
     finally:
         instance.close()
 
