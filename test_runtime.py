@@ -87,7 +87,8 @@ class RuntimeTests(unittest.TestCase):
         self.helper = optimizer.Optimizer()
 
     def journal(self, previous="JP old", candidate="JP fast", **extra):
-        value = {"group": "Main", "previous": previous, "candidate": candidate, "at": optimizer.iso()}
+        value = {**optimizer.controller_identity(self.cfg), "group": "Main",
+                 "previous": previous, "candidate": candidate, "at": optimizer.iso()}
         value.update(extra)
         optimizer.atomic_json(self.state / "pending-selection.json", value)
         return value
@@ -164,6 +165,12 @@ class RuntimeTests(unittest.TestCase):
         self.cfg["controller"] = "http://127.0.0.1:9999"
         self.assertFalse(self.helper.process_manual_selection())
         self.assertFalse(self.helper.status["manual_selection_result"]["ok"])
+        self.assertEqual(self.api.select_calls, [])
+
+    def test_changed_auth_environment_rejects_stale_manual_request(self):
+        optimizer.request_manual_selection("JP manual")
+        self.cfg["controller_secret_env"] = "OTHER_CONTROLLER_TOKEN"
+        self.assertFalse(self.helper.process_manual_selection())
         self.assertEqual(self.api.select_calls, [])
 
     def test_dry_run_leaves_manual_request_for_the_real_helper(self):
@@ -318,10 +325,11 @@ class RuntimeTests(unittest.TestCase):
 
     def test_old_commit_for_same_name_does_not_complete_new_pending_switch(self):
         self.helper.record = {
+            **optimizer.controller_identity(self.cfg),
             "group": "Main", "name": "JP fast", "last_switch_at": 1000,
             "transaction_id": "old-commit",
-            "groups": {"Main": {"name": "JP fast", "last_switch_at": 1000, "transaction_id": "old-commit"}},
         }
+        optimizer.save_owned_record(self.state / "selection.json", self.helper.record, latest=True)
         self.api.proxies["Main"]["now"] = "JP fast"
         self.journal(at=optimizer.iso(2000), transaction_id="new-pending")
         self.helper.recover_pending()
@@ -331,10 +339,11 @@ class RuntimeTests(unittest.TestCase):
     def test_committed_current_pending_switch_is_preserved(self):
         now = time.time()
         self.helper.record = {
+            **optimizer.controller_identity(self.cfg),
             "group": "Main", "name": "JP fast", "last_switch_at": now,
             "transaction_id": "current-commit",
-            "groups": {"Main": {"name": "JP fast", "last_switch_at": now, "transaction_id": "current-commit"}},
         }
+        optimizer.save_owned_record(self.state / "selection.json", self.helper.record, latest=True)
         self.api.proxies["Main"]["now"] = "JP fast"
         self.journal(at=optimizer.iso(now - 1), transaction_id="current-commit")
         self.helper.recover_pending()
@@ -509,17 +518,30 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.api.select_calls, [("Main", "JP old")])
         self.assertEqual(other.select_calls, [])
 
+    def test_unconfirmed_rollback_keeps_pending_for_a_confirmed_retry(self):
+        self.api.proxies["Main"]["now"] = "JP fast"
+        self.journal(transaction_id="unconfirmed-rollback")
+        with patch.object(self.api, "select") as select:
+            with self.assertRaises(optimizer.ControllerError):
+                self.helper.recover_pending()
+        select.assert_called_once_with("Main", "JP old")
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP fast")
+        self.assertTrue((self.state / "pending-selection.json").exists())
+        self.helper.recover_pending()
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
+        self.assertFalse((self.state / "pending-selection.json").exists())
+
     def test_restore_only_changes_selections_still_owned_by_helper(self):
         self.api.proxies["Main"]["now"] = "JP fast"
         self.api.proxies["Other"] = {"type": "Selector", "all": ["old-other", "fast-other"], "now": "fast-other"}
         self.api.proxies["ManualGroup"] = {"type": "Selector", "all": ["old-manual", "owned-manual", "user-manual"], "now": "user-manual"}
-        optimizer.atomic_json(self.state / "original-selection.json", {
-            "Main": {"name": "JP old"}, "Other": {"name": "old-other"}, "ManualGroup": {"name": "old-manual"},
-        })
-        optimizer.atomic_json(self.state / "selection.json", {
-            "group": "Main", "name": "JP fast",
-            "groups": {"Main": {"name": "JP fast"}, "Other": {"name": "fast-other"}, "ManualGroup": {"name": "owned-manual"}},
-        })
+        for group, baseline, selected in (("Main", "JP old", "JP fast"),
+                                           ("Other", "old-other", "fast-other"),
+                                           ("ManualGroup", "old-manual", "owned-manual")):
+            optimizer.save_owned_record(self.state / "original-selection.json",
+                                        {**optimizer.controller_identity(self.cfg), "group": group, "name": baseline})
+            optimizer.save_owned_record(self.state / "selection.json",
+                                        {**optimizer.controller_identity(self.cfg), "group": group, "name": selected}, latest=True)
         with patch.object(optimizer, "stop_daemon", return_value=True):
             restored = optimizer.restore_original()
         self.assertEqual(set(restored), {"Main", "Other"})

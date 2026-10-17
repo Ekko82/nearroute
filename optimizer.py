@@ -135,7 +135,7 @@ def request_manual_selection(name):
     with _manual_request_lock():
         atomic_json(STATE / "select.request.json", {
             "request_id": request_id, "name": name,
-            "controller": cfg["controller"], "group": cfg["group"],
+            **controller_identity(cfg), "group": cfg["group"],
         })
     return request_id
 
@@ -286,14 +286,75 @@ def scan_candidates(names, cfg):
     return filter_scan_candidates(names, cfg["scan_regions"])
 
 
+def controller_identity(cfg):
+    return {key: cfg[key] for key in ("controller", "controller_secret_env")}
+
+
+def same_controller(record, cfg):
+    # Missing ownership is unknown, including records made by older versions.
+    return all(key in record and record[key] == value for key, value in controller_identity(cfg).items())
+
+
+def state_context(cfg):
+    return (cfg["controller"], cfg["controller_secret_env"], cfg["group"])
+
+
+def owned_records(data):
+    return data.get("records", []) if data.get("schema_version") == 2 else []
+
+
+def record_document(data, records):
+    if data.get("schema_version") == 2:
+        result = dict(data)
+    else:
+        result = {"schema_version": 2}
+        if data:
+            result["legacy"] = data
+    result["records"] = records
+    return result
+
+
+def save_owned_record(path, record, latest=False):
+    data = read_json(path, {})
+    records = [item for item in owned_records(data)
+               if not (same_controller(item, record) and item["group"] == record["group"])]
+    data = record_document(data, records + [record])
+    if latest:
+        data = {key: value for key, value in data.items() if key in ("schema_version", "records", "legacy")} | record
+    atomic_json(path, data)
+
+
+def retire_owned_record(path, cfg, group):
+    data = read_json(path, {})
+    records = owned_records(data)
+    remaining = [item for item in records if not (same_controller(item, cfg) and item["group"] == group)]
+    if len(remaining) == len(records):
+        return
+    if same_controller(data, cfg) and data.get("group") == group:
+        data = {key: value for key, value in data.items() if key in ("schema_version", "records", "legacy")}
+    atomic_json(path, record_document(data, remaining))
+
+
+def current_selection(cfg):
+    records = owned_records(read_json(STATE / "selection.json", {}))
+    matching = [item for item in records if same_controller(item, cfg)
+                and item.get("configured_group", item["group"]) == cfg["group"]]
+    return max(matching, key=lambda item: item.get("last_switch_at", 0), default={})
+
+
+def pending_record(data):
+    # Early journals named the controller but did not yet name an auth variable.
+    return {"controller_secret_env": "", **data} if data.get("controller") else data
+
+
 def probe_identity(cfg):
-    return hashlib.sha256(json.dumps([cfg["probe_url"], sorted(cfg["probe_expected_statuses"])]).encode()).hexdigest()
+    return hashlib.sha256(json.dumps([state_context(cfg), cfg["probe_url"], sorted(cfg["probe_expected_statuses"])]).encode()).hexdigest()
 
 
 def selection_policy(cfg):
     return (cfg["scan_mode"], tuple(cfg["scan_regions"]), tuple(cfg["scan_nodes"]),
             cfg["prefer_japan"], cfg["japan_poor_latency_ms"], cfg["japan_fallback_score_ratio"],
-            probe_identity(cfg), cfg["controller"], cfg["group"])
+            probe_identity(cfg), state_context(cfg))
 
 
 def select_shortlist(fresh, current, limit, prefer_japan=True):
@@ -587,8 +648,9 @@ class Optimizer:
         STATE.mkdir(parents=True, exist_ok=True)
         self.cfg = load_config()
         self.api = Controller(self.cfg)
+        self.state_context = state_context(self.cfg)
         self.history = read_json(STATE / "history.json", {})
-        self.record = read_json(STATE / "selection.json", {})
+        self.record = current_selection(self.cfg)
         self.quarantine = read_json(STATE / "quarantine.json", {})
         self.signals = LogSignals(self.cfg["codex_log_db"])
         self.status = read_json(STATE / "status.json", {})
@@ -621,18 +683,32 @@ class Optimizer:
         # A selection transaction must finish on the controller it started on.
         if not self.tentative:
             self.api = Controller(self.cfg)
+            self.sync_runtime_context()
         self.status["enabled"] = self.cfg["enabled"]
         if selection_policy(self.cfg) != selection_policy(previous):
             self.next_scan = 0
         if self.cfg["codex_log_db"] != previous["codex_log_db"]:
             self.signals = LogSignals(self.cfg["codex_log_db"])
+
+    def sync_runtime_context(self):
+        context = state_context(self.cfg)
+        if context != self.state_context:
+            self.record = current_selection(self.cfg)
+            self.manual_until = self.record.get("manual_until", 0.0)
+            self.observed_selection = None
+            self.failures = 0
+            self.scan_display_names = []
+            self.next_scan = self.last_scan = self.last_health = self.last_signal_scan = 0
+            self.status.update(selected=None, health=None, nodes=[], manual_until=None,
+                               last_switch_at=None, last_health_at=None, consecutive_health_failures=0)
+            self.state_context = context
         self.sync_probe_history()
 
     def sync_probe_history(self):
         fingerprint = probe_identity(self.cfg)
         if getattr(self, "history_probe", None) == fingerprint:
             return
-        saved = read_json(STATE / "history-probe.json", {"fingerprint": probe_identity(DEFAULTS)})
+        saved = read_json(STATE / "history-probe.json", {})
         if saved.get("fingerprint") != fingerprint:
             self.history.clear()
             self.quarantine.clear()
@@ -661,7 +737,7 @@ class Optimizer:
         result = {"request_id": request.get("request_id"), "name": request.get("name"), "ok": False}
         try:
             self.reload_config()
-            if (request.get("controller") != self.cfg["controller"] or request.get("group") != self.cfg["group"]):
+            if not same_controller(request, self.cfg) or request.get("group") != self.cfg["group"]:
                 raise ValueError("代理设置已改变，请重新选择节点")
             self.recover_pending()
             _, proxies, group = self.api.snapshot(self.cfg)
@@ -683,11 +759,10 @@ class Optimizer:
                 raise ControllerError("客户端未确认该节点，请重新选择")
             now = time.time()
             manual_until = now + self.cfg["manual_selection_grace_seconds"]
-            owned = dict(self.record.get("groups", {}))
-            owned[group] = {"name": name, "last_switch_at": now, "transaction_id": transaction_id}
-            record = {"group": group, "name": name, "last_switch_at": now,
-                      "manual_until": manual_until, "groups": owned, "source": "manual", "transaction_id": transaction_id}
-            atomic_json(STATE / "selection.json", record)
+            record = {**controller_identity(self.cfg), "configured_group": self.cfg["group"],
+                      "group": group, "name": name, "last_switch_at": now,
+                      "manual_until": manual_until, "source": "manual", "transaction_id": transaction_id}
+            save_owned_record(STATE / "selection.json", record, latest=True)
             self.record = record
             self.manual_until = manual_until
             self.recover_pending()
@@ -752,16 +827,21 @@ class Optimizer:
     def protect_original(self, group, current):
         path = STATE / "original-selection.json"
         data = read_json(path, {})
-        if group not in data:
-            data[group] = {"name": current, "saved_at": iso()}
-            atomic_json(path, data)
+        if not any(same_controller(item, self.cfg) and item["group"] == group for item in owned_records(data)):
+            save_owned_record(path, {**controller_identity(self.cfg), "group": group,
+                                     "name": current, "saved_at": iso()})
 
     def rollback(self, group, candidate, original, api=None):
         # Do not overwrite an intervening manual change in the client.
         api = api or self.api
         proxies = api.request("/proxies")["proxies"]
-        if proxies.get(group, {}).get("now") == candidate and original in proxies.get(group, {}).get("all", []):
+        if proxies.get(group, {}).get("now") == candidate:
+            if original not in proxies.get(group, {}).get("all", []):
+                raise ControllerError("原节点暂不可用，回滚记录已保留，请恢复节点后重试")
             api.select(group, original)
+            confirmed = api.request("/proxies")["proxies"]
+            if confirmed.get(group, {}).get("now") != original:
+                raise ControllerError("客户端未确认回滚，回滚记录已保留，请重试")
             event("rollback", group=group, previous=candidate, restored=original)
 
     def observe_selection(self, group, selection):
@@ -772,6 +852,7 @@ class Optimizer:
         self.observed_selection = observation
 
     def change_candidate(self, general, group, previous, candidate):
+        self.recover_pending()
         policy = selection_policy(self.cfg)
         self.protect_original(group, previous)
         self.write_status(phase="verifying", message="正在验证候选线路：" + candidate)
@@ -802,10 +883,10 @@ class Optimizer:
                     and selection_policy(self.cfg) == policy
                     and bool(scan_candidates([candidate], self.cfg))):
                 now = time.time()
-                owned = dict(self.record.get("groups", {}))
-                owned[group] = {"name": candidate, "last_switch_at": now, "transaction_id": transaction_id}
-                record = {"group": group, "name": candidate, "last_switch_at": now, "verification": result, "groups": owned, "transaction_id": transaction_id}
-                atomic_json(STATE / "selection.json", record)
+                record = {**controller_identity(self.cfg), "configured_group": self.cfg["group"],
+                          "group": group, "name": candidate, "last_switch_at": now,
+                          "verification": result, "transaction_id": transaction_id}
+                save_owned_record(STATE / "selection.json", record, latest=True)
                 self.record = record
                 committed = True
                 self.observed_selection = (group, candidate)
@@ -829,20 +910,25 @@ class Optimizer:
             raise
         finally:
             self.tentative = False
+            if self.state_context != state_context(self.cfg):
+                self.api = Controller(self.cfg)
+            self.sync_runtime_context()
 
     def recover_pending(self):
         path = STATE / "pending-selection.json"
-        pending = read_json(path, None)
+        pending = pending_record(read_json(path, {}))
         if not pending:
             return
+        if not pending.get("controller"):
+            raise ControllerError("旧回滚记录缺少控制器归属；请停止后台，确认原控制器并手动恢复后，备份移走 state/pending-selection.json 再重试")
         # Completed selections already have a durable matching journal.
-        owned = self.record.get("groups", {}).get(pending["group"], {})
-        completed = bool(pending.get("transaction_id")) and (
-            (self.record.get("group") == pending["group"] and self.record.get("transaction_id") == pending["transaction_id"])
-            or owned.get("transaction_id") == pending["transaction_id"])
+        records = owned_records(read_json(STATE / "selection.json", {}))
+        completed = bool(pending.get("transaction_id")) and any(
+            same_controller(item, pending) and item["group"] == pending["group"]
+            and item.get("transaction_id") == pending["transaction_id"] for item in records)
         if not completed:
             api = self.api
-            if pending.get("controller") and pending["controller"] != self.cfg["controller"]:
+            if not same_controller(pending, self.cfg):
                 recovery_cfg = validate_config(self.cfg | {
                     "controller": pending["controller"],
                     "controller_secret_env": pending.get("controller_secret_env", "")})
@@ -1044,22 +1130,42 @@ def restore_original():
     api = Controller(cfg)
     original = read_json(STATE / "original-selection.json", {})
     controlled = read_json(STATE / "selection.json", {})
-    pending = read_json(STATE / "pending-selection.json", {})
+    pending = pending_record(read_json(STATE / "pending-selection.json", {}))
     proxies = api.request("/proxies")["proxies"]
     restored = []
-    for group, saved in original.items():
+    restored_names = {}
+    for saved in owned_records(original):
+        if not same_controller(saved, cfg):
+            continue
+        group = saved["group"]
+        if group not in proxies:
+            continue
         now = proxies.get(group, {}).get("now")
-        owned = ((controlled.get("group") == group and controlled.get("name") == now)
-                 or controlled.get("groups", {}).get(group, {}).get("name") == now
-                 or (pending.get("group") == group and pending.get("candidate") == now))
-        if owned and saved["name"] in proxies.get(group, {}).get("all", []):
+        pending_matches = same_controller(pending, cfg) and pending.get("group") == group
+        owned = (any(same_controller(item, cfg) and item["group"] == group and item["name"] == now
+                     for item in owned_records(controlled))
+                 or (pending_matches and pending.get("candidate") == now))
+        if now != saved["name"]:
+            if not owned or saved["name"] not in proxies[group].get("all", []):
+                continue
             api.select(group, saved["name"])
-            restored.append(group)
+            proxies = api.request("/proxies")["proxies"]
+            if proxies.get(group, {}).get("now") != saved["name"]:
+                raise ControllerError("客户端未确认原节点，恢复记录已保留，请重试")
+        # Persist each success before attempting another group. If a write fails,
+        # the baseline remains so a retry can retire it without repeating the PUT.
+        retire_owned_record(STATE / "selection.json", cfg, group)
+        if pending_matches:
+            (STATE / "pending-selection.json").unlink(missing_ok=True)
+            pending = {}
+        retire_owned_record(STATE / "original-selection.json", cfg, group)
+        restored.append(group)
+        restored_names[group] = saved["name"]
     event("restore", restored_groups=restored)
     state = read_json(STATE / "status.json", {})
     state.update(enabled=False, phase="stopped", pid=None, message="已恢复原节点" if restored else "已停止；当前节点已有手动变化或无需恢复", updated_at=iso())
     if restored:
-        state["selected"] = original[restored[0]]["name"]
+        state["selected"] = restored_names[restored[0]]
     atomic_json(STATE / "status.json", state)
     return restored
 
