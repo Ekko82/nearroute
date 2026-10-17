@@ -90,20 +90,18 @@ def atomic_json(path, value):
 
 def load_config():
     if not CONFIG.exists():
-        atomic_json(CONFIG, DEFAULTS)
+        with config_update_lock():
+            if not CONFIG.exists():
+                atomic_json(CONFIG, DEFAULTS)
     raw = read_json(CONFIG, None)
     return validate_config(raw)
 
 
 @contextmanager
-def _manual_request_lock():
-    """Serialize queue writes, cancellation and claiming across GUI/helper processes.
-
-    Only local file operations belong inside this lock; controller requests run
-    after the helper has claimed and removed its queued request.
-    """
-    STATE.mkdir(parents=True, exist_ok=True)
-    with (STATE / "manual-request.lock").open("a+b") as stream:
+def _file_lock(path):
+    """Serialize local file updates across GUI/helper processes."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as stream:
         if os.name == "nt":
             import msvcrt
             stream.seek(0, os.SEEK_END)
@@ -124,6 +122,16 @@ def _manual_request_lock():
                 yield
             finally:
                 fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
+def config_update_lock(config_path=None):
+    path = CONFIG if config_path is None else Path(config_path)
+    return _file_lock(path.parent / "state" / "config.lock")
+
+
+def _manual_request_lock():
+    # Controller requests run after the helper has claimed and released the queue.
+    return _file_lock(STATE / "manual-request.lock")
 
 
 def request_manual_selection(name):
@@ -479,12 +487,22 @@ class ControllerError(RuntimeError):
     pass
 
 
-class ModeChanged(ControllerError):
+class PathChanged(ControllerError):
+    pass
+
+
+class ModeChanged(PathChanged):
     pass
 
 
 def active_mode(general, group):
     return general.get("mode", "rule").lower(), group
+
+
+def active_path(general, proxies, group):
+    selection = proxies[group].get("now") if group else None
+    leaf = resolve_leaf(proxies, selection) if group else "DIRECT"
+    return (*active_mode(general, group), selection, leaf)
 
 
 class Controller:
@@ -738,18 +756,24 @@ class Optimizer:
         self.write_status(mode=general.get("mode", "rule").lower(), group=group, selected=selected,
                           controller_available=True, last_error=None, **updates)
 
-    def require_active_mode(self, expected):
+    def require_active_mode(self, expected, expected_path=None):
         snapshot = self.api.snapshot(self.cfg, allow_direct=True)
         general, proxies, group = snapshot
-        if active_mode(general, group) != expected:
+        mode_changed = active_mode(general, group) != expected
+        path = active_path(general, proxies, group)
+        if mode_changed or (expected_path is not None and path != expected_path):
             self.next_scan = 0
+            self.observe_selection(path)
             self.failures = 0
-            self.scan_display_names = []
-            message = "代理模式已改变，本轮选点已取消，将按当前模式刷新"
-            self.publish_active_path(general, proxies, group, nodes=[], health=None, last_health_at=None,
+            if mode_changed:
+                self.scan_display_names = []
+            message = ("代理模式已改变，本轮选点已取消，将按当前模式刷新" if mode_changed
+                       else "检测到手动选点，本轮选点已取消，将按当前线路刷新")
+            self.publish_active_path(general, proxies, group, health=None, last_health_at=None,
                                      phase="monitoring" if self.cfg["enabled"] else "paused",
-                                     next_scan_at=iso(), message=message)
-            raise ModeChanged(message)
+                                     consecutive_health_failures=0, next_scan_at=iso(), message=message,
+                                     **({"nodes": []} if mode_changed else {}))
+            raise (ModeChanged if mode_changed else PathChanged)(message)
         return snapshot
 
     def observe_paused_path(self):
@@ -762,20 +786,21 @@ class Optimizer:
             self.write_status(phase="paused", controller_available=False, last_error=str(error),
                               message="已暂停；无法读取客户端当前状态")
 
-    def refresh_cancelled_mode(self):
+    def refresh_cancelled_mode(self, message="代理模式已改变，本轮选点已取消", *, clear_nodes=True):
         # GLOBAL can select the original rule group, so rollback may also change
         # its effective leaf. Publish a new snapshot after finishing recovery.
         self.next_scan = 0
         try:
             general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
-            self.publish_active_path(general, proxies, group, nodes=[], health=None,
+            self.publish_active_path(general, proxies, group, health=None,
                                      phase="monitoring" if self.cfg["enabled"] else "paused",
-                                     next_scan_at=iso(), message="代理模式已改变，本轮选点已取消")
+                                     next_scan_at=iso(), message=message,
+                                     **({"nodes": []} if clear_nodes else {}))
         except (ControllerError, ValueError, OSError) as error:
             self.write_status(controller_available=False, selected=None, group=None, mode=None,
                               health=None, last_error=str(error),
                               phase="waiting" if self.cfg["enabled"] else "paused",
-                              message="模式已改变，暂时无法确认当前线路")
+                              message="线路已改变，暂时无法确认当前线路")
 
     def process_manual_selection(self):
         if self.dry_run:
@@ -822,7 +847,7 @@ class Optimizer:
             self.manual_until = manual_until
             self.recover_pending()
             self.manual_revision += 1
-            self.observed_selection = (group, name)
+            self.observed_selection = active_path(general, latest, group)
             self.failures = 0
             self.next_scan = now + self.cfg["scan_interval_seconds"]
             result.update(ok=True, message="已手动切换；暂时尊重此选择")
@@ -906,15 +931,16 @@ class Optimizer:
                 raise ControllerError("客户端未确认回滚，回滚记录已保留，请重试")
             event("rollback", group=group, previous=candidate, restored=original)
 
-    def observe_selection(self, group, selection):
-        observation = (group, selection)
+    def observe_selection(self, observation):
         if self.observed_selection and observation != self.observed_selection:
             self.failures = 0
             self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
-            event("external_selection_change", group=group, selected=selection)
+            self.status.update(health=None, last_health_at=None, consecutive_health_failures=0,
+                               manual_until=iso(self.manual_until))
+            event("external_selection_change", group=observation[1], selected=observation[3])
         self.observed_selection = observation
 
-    def change_candidate(self, general, group, previous, candidate):
+    def change_candidate(self, general, group, previous, candidate, *, expected_path=None):
         self.recover_pending()
         policy = selection_policy(self.cfg)
         mode = active_mode(general, group)
@@ -932,7 +958,7 @@ class Optimizer:
             if (not self.cfg["enabled"] or self.stopping() or (STATE / "select.request.json").exists() or selection_policy(self.cfg) != policy
                     or not scan_candidates([candidate], self.cfg)):
                 return False
-            general, latest, _ = self.require_active_mode(mode)
+            general, latest, _ = self.require_active_mode(mode, expected_path)
             if latest.get(group, {}).get("now") != previous:
                 return False
             self.api.select(group, candidate)
@@ -953,7 +979,7 @@ class Optimizer:
                 save_owned_record(STATE / "selection.json", record, latest=True)
                 self.record = record
                 committed = True
-                self.observed_selection = (group, candidate)
+                self.observed_selection = active_path(general, latest, group)
                 self.failures = 0
                 self.write_status(selected=candidate, mode=mode[0], group=group,
                                   last_switch_at=iso(now), verification=result, last_error=None)
@@ -971,8 +997,8 @@ class Optimizer:
                 if not committed:
                     self.rollback(group, candidate, previous)
             finally:
-                if isinstance(error, ModeChanged):
-                    self.refresh_cancelled_mode()
+                if isinstance(error, PathChanged):
+                    self.refresh_cancelled_mode(str(error), clear_nodes=isinstance(error, ModeChanged))
             raise
         finally:
             self.tentative = False
@@ -1005,8 +1031,8 @@ class Optimizer:
     def scan(self, forced=False):
         try:
             self._scan(forced)
-        except ModeChanged:
-            # The mode guard has already published the current active path.
+        except PathChanged:
+            # The guard has already published the current active path.
             return
 
     def _scan(self, forced=False):
@@ -1025,6 +1051,7 @@ class Optimizer:
                                      message="客户端当前为直连模式，等待切换回规则或全局模式")
             return
         mode = active_mode(general, group)
+        path = active_path(general, proxies, group)
         previous = proxies[group].get("now")
         current = resolve_leaf(proxies, previous)
         all_names = flatten_candidates(proxies, group)
@@ -1036,7 +1063,7 @@ class Optimizer:
             self.write_status(nodes=[], scan_regions=self.cfg["scan_regions"], scan_node_count=0,
                               excluded_node_count=len(all_names))
             raise ControllerError("代理组中没有符合地区范围的节点；保留当前选择")
-        self.observe_selection(group, previous)
+        self.observe_selection(path)
         self.write_status(controller_available=True, mode=mode[0], group=group, selected=current or previous,
                           phase="scanning", message="开始对所选范围测速", last_error=None,
                           nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
@@ -1045,16 +1072,16 @@ class Optimizer:
         fresh = self.measure_round(names, "所选节点初测")
         if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
             return
-        self.require_active_mode(mode)
+        self.require_active_mode(mode, path)
         shortlist = select_shortlist(fresh, current, int(self.cfg["shortlist_size"]), self.cfg["prefer_japan"])
         for round_no in range(int(self.cfg["confirmation_rounds"])):
             if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
                 return
             self.measure_round(shortlist, f"候选复测 {round_no + 1}/{int(self.cfg['confirmation_rounds'])}")
-            self.require_active_mode(mode)
+            self.require_active_mode(mode, path)
         if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return
-        self.require_active_mode(mode)
+        self.require_active_mode(mode, path)
         def ranking():
             rows = self.statistics(names)
             for row in rows:
@@ -1075,7 +1102,7 @@ class Optimizer:
             self.next_scan = 0
             self.write_status(message="地区策略已更新，将按新范围重新测速")
             return
-        self.require_active_mode(mode)
+        self.require_active_mode(mode, path)
         if self.dry_run or not self.cfg["enabled"]:
             self.write_status(phase="paused" if not self.cfg["enabled"] else "monitoring", message="测速完成；本轮仅测量，未切换")
             return
@@ -1090,7 +1117,7 @@ class Optimizer:
             confirmation = self.verify_path(general)
             if not confirmation["ok"]:
                 self.failures += 1
-        self.require_active_mode(mode)
+        self.require_active_mode(mode, path)
         stats = ranking()
         tried = set()
         reason = "测速完成"
@@ -1112,7 +1139,7 @@ class Optimizer:
                 self.cfg["switch_cooldown_seconds"], self.failures >= 2)
             if candidate is None or self.stopping():
                 break
-            if self.change_candidate(general, group, previous, candidate):
+            if self.change_candidate(general, group, previous, candidate, expected_path=path):
                 reason = "已选用通过连接验证的低延迟节点"
                 self.recover_pending()
                 break
@@ -1124,7 +1151,7 @@ class Optimizer:
             self.reload_config()
             if not self.cfg["enabled"]:
                 break
-            _, latest, _ = self.require_active_mode(mode)
+            _, latest, _ = self.require_active_mode(mode, path)
             if latest.get(group, {}).get("now") != previous:
                 reason = "选择已被用户更改，停止本轮切换"
                 break
@@ -1139,13 +1166,24 @@ class Optimizer:
     def tick_health(self):
         self.recover_pending()
         general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
+        path = active_path(general, proxies, group)
+        self.observe_selection(path)
         if group is None:
             self.publish_active_path(general, proxies, group, health=None, nodes=[], phase="monitoring",
+                                     consecutive_health_failures=self.failures,
                                      message="客户端当前为直连模式，等待切换回规则或全局模式")
             return
-        selection = proxies[group].get("now")
-        self.observe_selection(group, selection)
         result = self.verify_path(general)
+        general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
+        latest_path = active_path(general, proxies, group)
+        if latest_path != path:
+            self.observe_selection(latest_path)
+            self.next_scan = 0
+            self.publish_active_path(general, proxies, group, health=None, phase="monitoring",
+                                     last_health_at=None, consecutive_health_failures=0, next_scan_at=iso(),
+                                     message="连接路径已改变，已丢弃上一条线路的检查结果",
+                                     **({"nodes": []} if latest_path[:2] != path[:2] else {}))
+            return
         self.failures = 0 if result["ok"] else self.failures + 1
         if self.failures >= 2 and time.time() - self.last_scan >= 30:
             self.next_scan = 0
@@ -1155,7 +1193,7 @@ class Optimizer:
             self.next_scan = 0
             self.last_signal_scan = time.time()
             event("transport_errors_recheck", errors_recent=errors)
-        self.write_status(controller_available=True, mode=general.get("mode", "rule").lower(), group=group, selected=resolve_leaf(proxies, selection),
+        self.write_status(controller_available=True, mode=latest_path[0], group=group, selected=latest_path[3],
                           health=result, network_errors_recent=errors, consecutive_health_failures=self.failures,
                           last_health_at=iso(), next_scan_at=iso(self.next_scan) if self.next_scan else iso(),
                           last_error=None if result["ok"] else result.get("reason"))
@@ -1228,9 +1266,12 @@ def restore_original():
 
 
 def _restore_original_locked():
-    cfg = load_config()
-    cfg["enabled"] = False
-    atomic_json(CONFIG, cfg)
+    # Complete first-run creation before taking its non-reentrant update lock.
+    load_config()
+    with config_update_lock():
+        cfg = load_config()
+        cfg["enabled"] = False
+        atomic_json(CONFIG, cfg)
     api = Controller(cfg)
     original = read_json(STATE / "original-selection.json", {})
     controlled = read_json(STATE / "selection.json", {})

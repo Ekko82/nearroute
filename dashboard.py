@@ -115,19 +115,20 @@ def atomic_write_config(data: dict) -> None:
 
 def update_enabled(enabled: bool) -> None:
     """Keep the pause switch usable even if another setting needs correction."""
-    data = read_json(CONFIG) if CONFIG.exists() else {}
-    data["enabled"] = enabled
-    atomic_write_config(data)
+    with core.config_update_lock(CONFIG):
+        data = read_json(CONFIG) if CONFIG.exists() else {}
+        data["enabled"] = enabled
+        atomic_write_config(data)
 
 
 def save_settings(fields: dict) -> dict:
-    # Read again at save time so toggles or unrelated external edits are retained.
-    current = read_json(CONFIG) if CONFIG.exists() else {}
-    candidate = current | fields
-    validated = core.validate_config(candidate)
-    complete = candidate | validated
-    atomic_write_config(complete)
-    return complete
+    with core.config_update_lock(CONFIG):
+        current = read_json(CONFIG) if CONFIG.exists() else {}
+        candidate = current | fields
+        validated = core.validate_config(candidate)
+        complete = candidate | validated
+        atomic_write_config(complete)
+        return complete
 
 
 def parse_statuses(value: str) -> list[int]:

@@ -233,7 +233,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertFalse((self.state / "pending-selection.json").exists())
 
     def test_client_choice_seen_at_scan_start_gets_the_manual_protection_period(self):
-        self.helper.observed_selection = ("Main", "JP old")
+        self.helper.observed_selection = ("rule", "Main", "JP old", "JP old")
         self.api.proxies["Main"]["now"] = "JP manual"
         self.helper.scan()
         self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
@@ -242,7 +242,7 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn("external_selection_change", [row["event"] for row in self.events()])
 
     def test_old_path_failures_cannot_bypass_protection_for_a_new_client_choice(self):
-        self.helper.observed_selection = ("Main", "JP old")
+        self.helper.observed_selection = ("rule", "Main", "JP old", "JP old")
         self.helper.failures = 2
         self.api.proxies["Main"]["now"] = "JP manual"
         self.helper.scan()
@@ -328,12 +328,12 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.api.select_calls, [])
 
     def test_health_observation_uses_snapshot_after_pending_rollback(self):
-        self.helper.observed_selection = ("Main", "JP old")
+        self.helper.observed_selection = ("rule", "Main", "JP old", "JP old")
         self.api.proxies["Main"]["now"] = "JP fast"
         self.journal()
         self.helper.tick_health()
         self.assertEqual(self.helper.status["selected"], "JP old")
-        self.assertEqual(self.helper.observed_selection, ("Main", "JP old"))
+        self.assertEqual(self.helper.observed_selection, ("rule", "Main", "JP old", "JP old"))
         self.assertEqual(self.helper.manual_until, 0)
         self.assertNotIn("external_selection_change", [row["event"] for row in self.events()])
 
