@@ -114,6 +114,52 @@ class TaskbarIdentityTests(unittest.TestCase):
 
 @unittest.skipUnless(os.name == "nt", "Windows shell properties only")
 class ShortcutPropertyIntegrationTests(unittest.TestCase):
+    def test_create_and_read_unicode_shortcut_outside_system_code_page(self):
+        # WScript.Shell cannot open this emoji name on ordinary ANSI code pages.
+        # Exercise both Unicode directories and the actual link file name.
+        with tempfile.TemporaryDirectory(prefix="nearroute-unicode-link-") as directory:
+            folder = Path(directory) / "近舟 🚣"
+            folder.mkdir()
+            script = folder / "launch.ps1"
+            script.write_text("# fixture\n", encoding="utf-8")
+            target = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
+            arguments = subprocess.list2cmdline([
+                "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
+                "-File", str(script), "-Mode", "dashboard"])
+            link = folder / "近舟 NearRoute 🚣.lnk"
+            app.create_shortcut(link, target, arguments, folder, app.ICON_PATH)
+            app.configure_shortcut(link)
+            before = link.read_bytes()
+            values = app.read_shortcut(link)
+            self.assertEqual(values["target"].casefold(), str(target).casefold())
+            self.assertEqual(values["arguments"], arguments)
+            self.assertTrue(app.owns_shortcut(link, target, script))
+            self.assertEqual(link.read_bytes(), before, "ownership checks must not rewrite the link")
+            with self.assertRaises(FileExistsError):
+                app.create_shortcut(link, target, arguments, folder, app.ICON_PATH)
+
+    def test_ownership_checks_executable_and_actual_file_not_quoted_mentions(self):
+        target = r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"
+        script = r"C:\NearRoute app\launch.ps1"
+        prefix = ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"]
+        examples = [
+            ([*prefix, script, "-Mode", "dashboard"], True),
+            ([*[value.upper() for value in prefix], script.upper()], True),
+            (["-Command", "Write-Output", script], False),
+            ([*prefix, r"C:\Other app\launch.ps1", script], False),
+            (["-ExecutionPolicy", "-File", script], False),
+            (["-File"], False),
+        ]
+        for tokens, expected in examples:
+            with self.subTest(tokens=tokens), patch.object(app, "read_shortcut", return_value={
+                    "target": target, "arguments": subprocess.list2cmdline(tokens)}):
+                self.assertEqual(app.owns_shortcut("fixture.lnk", target, script), expected)
+        with patch.object(app, "read_shortcut", return_value={
+                "target": r"\\unrelated-server\share\powershell.exe",
+                "arguments": subprocess.list2cmdline([*prefix, script])}), \
+             patch.object(app.os.path, "samefile", side_effect=AssertionError("must not resolve target")):
+            self.assertFalse(app.owns_shortcut("fixture.lnk", target, script))
+
     def test_isolated_process_and_hidden_tk_window_have_matching_identity(self):
         # AppID is process-global, so verify it in a child that owns only a
         # temporary withdrawn Tk window and exits after releasing all resources.

@@ -26,14 +26,17 @@ function Write-InstallState {
 }
 
 function Test-OwnedShortcut {
-    param([string]$Path, [object]$Shell)
+    param([string]$Path)
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $false }
-    $link = $null
+    $process = $null
     try {
-        $link = $Shell.CreateShortcut($Path)
-        return ($link.TargetPath -ieq $shellPath -and $link.Arguments.Contains('"' + $launchPath + '"'))
+        $arguments = @('-B', ('"' + (Join-Path $applicationRoot 'windows_app.py') + '"'),
+            '--check-shortcut', ('"' + $Path + '"'), '--target', ('"' + $shellPath + '"'),
+            '--script', ('"' + $launchPath + '"'))
+        $process = Start-Process -FilePath $PythonExe -ArgumentList $arguments -WorkingDirectory $applicationRoot -WindowStyle Hidden -Wait -PassThru
+        return ($process.ExitCode -eq 0)
     } catch { return $false }
-    finally { if ($null -ne $link) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($link) } }
+    finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
 foreach ($name in @('optimizer.py', 'dashboard.py', 'tray_icon.py', 'windows_app.py', 'launch.ps1', 'config.example.json')) {
@@ -49,19 +52,15 @@ if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
 }
 $null = New-Item -ItemType Directory -Path $stateDirectory -Force
 $runArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $launchPath + '" -Mode run -PythonExe "' + $PythonExe + '"'
-$dashboardArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $launchPath + '" -Mode dashboard -PythonExe "' + $PythonExe + '"'
 $installedRunValue = '"' + $shellPath + '" ' + $runArguments
 $runKey = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($runSubKeyPath)
 $temporaryShortcut = Join-Path $stateDirectory ('.nearroute-' + [guid]::NewGuid().ToString('N') + '.lnk')
-$wscript = $null
-$shortcut = $null
 $stateChanged = $false
 $runChanged = $false
 $shortcutChanged = $false
 $installationCommitted = $false
 $priorShortcutBytes = $null
 try {
-    $wscript = New-Object -ComObject WScript.Shell
     $currentRun = $runKey.GetValue($runValueName, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
     $currentRunKind = if ($null -ne $currentRun) { $runKey.GetValueKind($runValueName) } else { $null }
     if ($null -ne $existing -and $existing.installed -eq $true) {
@@ -77,23 +76,15 @@ try {
             if ((Get-FileHash -LiteralPath $shortcutPath -Algorithm SHA256).Hash -ne $existing.shortcut_sha256) { throw '近舟快捷方式已被修改，已保留该文件。' }
         }
     } else {
-        if ((Test-Path -LiteralPath $shortcutPath -PathType Leaf) -and -not (Test-OwnedShortcut $shortcutPath $wscript)) { throw '桌面已有同名的其他快捷方式，已保留。请先重命名该文件。' }
+        if ((Test-Path -LiteralPath $shortcutPath -PathType Leaf) -and -not (Test-OwnedShortcut $shortcutPath)) { throw '桌面已有同名的其他快捷方式，已保留。请先重命名该文件。' }
         $previousShortcut = [ordered]@{ existed = $false; bytes_base64 = $null }
     }
     if (Test-Path -LiteralPath $shortcutPath -PathType Leaf) { $priorShortcutBytes = [IO.File]::ReadAllBytes($shortcutPath) }
-    $shortcut = $wscript.CreateShortcut($temporaryShortcut)
-    $shortcut.TargetPath = $shellPath
-    $shortcut.Arguments = $dashboardArguments
-    $shortcut.WorkingDirectory = $applicationRoot
-    $shortcut.WindowStyle = 7
-    $shortcut.Description = '近舟 NearRoute：线路探测、范围设置和自动优选'
-    $shortcut.IconLocation = (Join-Path $applicationRoot 'assets\nearroute.ico') + ',0'
-    $shortcut.Save()
-    # Set shell properties only on this newly created temporary shortcut. The
-    # existing desktop link has already passed the ownership/hash checks above.
-    $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
-    $shortcut = $null
-    $identityArguments = @('-B', ('"' + (Join-Path $applicationRoot 'windows_app.py') + '"'), '--shortcut', ('"' + $temporaryShortcut + '"'))
+    # Create and stamp only a new temporary link through Unicode Shell APIs.
+    # WScript.Shell cannot read/save paths outside the system ANSI code page.
+    $identityArguments = @('-B', ('"' + (Join-Path $applicationRoot 'windows_app.py') + '"'),
+        '--create-shortcut', ('"' + $temporaryShortcut + '"'), '--target', ('"' + $shellPath + '"'),
+        '--script', ('"' + $launchPath + '"'), '--python', ('"' + $PythonExe + '"'))
     $identityProcess = Start-Process -FilePath $PythonExe -ArgumentList $identityArguments -WorkingDirectory $applicationRoot -WindowStyle Hidden -Wait -PassThru
     try {
         if ($identityProcess.ExitCode -ne 0) { throw '未能写入近舟快捷方式的任务栏标识，原快捷方式保持不变。' }
@@ -118,7 +109,7 @@ try {
     foreach ($legacyName in @('Codex线路优选.lnk', 'Codex Node Optimizer.lnk')) {
         try {
             $legacyPath = Join-Path $desktopDirectory $legacyName
-            if (-not (Test-OwnedShortcut $legacyPath $wscript)) { continue }
+            if (-not (Test-OwnedShortcut $legacyPath)) { continue }
             if ($null -ne $existing -and $existing.shortcut_path -eq $legacyPath -and $existing.shortcut_sha256) {
                 if ((Get-FileHash -LiteralPath $legacyPath -Algorithm SHA256).Hash -ne $existing.shortcut_sha256) { Write-Warning "旧项目快捷方式已修改，已保留：$legacyName"; continue }
                 if ($existing.previous_shortcut.existed) {
@@ -155,8 +146,6 @@ try {
     throw $installError
 } finally {
     $runKey.Dispose()
-    if ($null -ne $shortcut) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut) }
-    if ($null -ne $wscript) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($wscript) }
     if (Test-Path -LiteralPath $temporaryShortcut) { Remove-Item -LiteralPath $temporaryShortcut -Force }
 }
 if (-not $NoStart) { Start-Process -FilePath $shellPath -ArgumentList $runArguments -WorkingDirectory $applicationRoot -WindowStyle Hidden }

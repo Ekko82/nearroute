@@ -30,9 +30,11 @@ class InstallLifecycleTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="nearroute-install-test-")
         self.addCleanup(self.temp.cleanup)
-        self.app = Path(self.temp.name).resolve() / "NearRoute app"
+        # Emoji is outside legacy ANSI code pages on both Chinese and English
+        # Windows, covering creation as well as reopening of Unicode .lnk paths.
+        self.app = Path(self.temp.name).resolve() / "NearRoute app 🚣"
         self.app.mkdir()
-        self.desktop = Path(self.temp.name).resolve() / "Desktop fixture"
+        self.desktop = Path(self.temp.name).resolve() / "Desktop fixture 🚣"
         self.desktop.mkdir()
         self.reg_key = r"Software\NearRouteInstallTest_" + uuid.uuid4().hex
         self.addCleanup(self.remove_registry_fixture)
@@ -91,28 +93,16 @@ class InstallLifecycleTests(unittest.TestCase):
         return result
 
     def shortcut_diagnostics(self):
-        """Read this test's .lnk only; never inspect real desktop shortcuts."""
-        def literal(value):
-            return "'" + str(value).replace("'", "''") + "'"
-        source = (
-            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
-            "$shell=$null; $link=$null;"
-            "try { $shell=New-Object -ComObject WScript.Shell;"
-            "$link=$shell.CreateShortcut(" + literal(self.shortcut) + ");"
-            "[pscustomobject]@{target=$link.TargetPath;arguments=$link.Arguments;"
-            "expected_target=" + literal(self.powershell) + ";expected_file=" + literal(self.app / "launch.ps1") +
-            ";shortcut=" + literal(self.shortcut) + "} | ConvertTo-Json -Compress }"
-            "catch { [pscustomobject]@{error=$_.Exception.GetType().FullName} | ConvertTo-Json -Compress }"
-            "finally { if($null -ne $link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};"
-            "if($null -ne $shell){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)} }"
-        )
-        environment = {key: value for key, value in os.environ.items()
-                       if key.lower() != "psmodulepath"}
-        result = subprocess.run([self.powershell, "-NoProfile", "-Command", source],
+        """Read this test's .lnk through the same Unicode API as the installer."""
+        result = subprocess.run([str(self.python), "-B", str(self.app / "windows_app.py"),
+                                 "--read-shortcut", str(self.shortcut)],
                                 capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                timeout=15, creationflags=subprocess.CREATE_NO_WINDOW, env=environment)
+                                timeout=15, creationflags=subprocess.CREATE_NO_WINDOW)
         try:
-            return json.loads(result.stdout)
+            values = json.loads(result.stdout)
+            return values | {"expected_target": self.powershell,
+                             "expected_file": str(self.app / "launch.ps1"),
+                             "shortcut": str(self.shortcut)}
         except ValueError:
             return {"diagnostic_exit_code": result.returncode, "fixture": str(self.app)}
 
@@ -121,6 +111,12 @@ class InstallLifecycleTests(unittest.TestCase):
         diagnostic = json.dumps(details, ensure_ascii=True)
         self.assertEqual(details.get("target", "").casefold(), self.powershell.casefold(), diagnostic)
         self.assertIn('"' + str(self.app / "launch.ps1") + '"', details.get("arguments", ""), diagnostic)
+        result = subprocess.run([str(self.python), "-B", str(self.app / "windows_app.py"),
+                                 "--check-shortcut", str(self.shortcut), "--target", self.powershell,
+                                 "--script", str(self.app / "launch.ps1")],
+                                capture_output=True, timeout=15,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        self.assertEqual(result.returncode, 0, diagnostic)
 
     def run_value(self):
         try:
