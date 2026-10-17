@@ -16,11 +16,13 @@ catch { $PythonExe = ''; Write-Warning '没有可用 Python，将保留停止请
 function Invoke-Optimizer {
     param([string]$Command)
     if (-not $PythonExe -or -not (Test-Path -LiteralPath $optimizerPath -PathType Leaf)) { return $false }
+    $process = $null
     try {
         $arguments = @('-B', ('"' + $optimizerPath + '"'), $Command)
         $process = Start-Process -FilePath $PythonExe -ArgumentList $arguments -WorkingDirectory $applicationRoot -WindowStyle Hidden -Wait -PassThru
         return ($process.ExitCode -eq 0)
     } catch { return $false }
+    finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
 if (-not (Invoke-Optimizer 'stop')) {

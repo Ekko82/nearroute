@@ -16,11 +16,13 @@ function Test-NearRoutePython {
         $consoleSibling = Join-Path (Split-Path -Parent $Executable) 'python.exe'
         if (Test-Path -LiteralPath $consoleSibling -PathType Leaf) { $validationExecutable = $consoleSibling }
     }
+    $process = $null
     try {
         $arguments = @('-B', '-I', '-c', '"import sys, tkinter; sys.exit(0 if sys.version_info >= (3, 10) else 20)"')
         $process = Start-Process -FilePath $validationExecutable -ArgumentList $arguments -WindowStyle Hidden -Wait -PassThru
         return ($process.ExitCode -eq 0)
     } catch { return $false }
+    finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
 function Resolve-NearRoutePython {

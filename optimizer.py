@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import collections
 import concurrent.futures
+from contextlib import contextmanager
 import ctypes
 import hashlib
 import http.client
@@ -94,27 +95,59 @@ def load_config():
     return validate_config(raw)
 
 
+@contextmanager
+def _manual_request_lock():
+    """Serialize queue writes, cancellation and claiming across GUI/helper processes.
+
+    Only local file operations belong inside this lock; controller requests run
+    after the helper has claimed and removed its queued request.
+    """
+    STATE.mkdir(parents=True, exist_ok=True)
+    with (STATE / "manual-request.lock").open("a+b") as stream:
+        if os.name == "nt":
+            import msvcrt
+            stream.seek(0, os.SEEK_END)
+            if not stream.tell():
+                stream.write(b"\0")
+                stream.flush()
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
+
+
 def request_manual_selection(name):
     """Queue a user choice for the helper, which serializes all controller PUTs."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("请选择要切换的节点")
     cfg = load_config()
     request_id = uuid.uuid4().hex
-    STATE.mkdir(parents=True, exist_ok=True)
-    atomic_json(STATE / "select.request.json", {
-        "request_id": request_id, "name": name,
-        "controller": cfg["controller"], "group": cfg["group"],
-    })
+    with _manual_request_lock():
+        atomic_json(STATE / "select.request.json", {
+            "request_id": request_id, "name": name,
+            "controller": cfg["controller"], "group": cfg["group"],
+        })
     return request_id
 
 
 def cancel_manual_selection(request_id):
     """Remove only this request if the helper has not consumed it yet."""
     path = STATE / "select.request.json"
-    if read_json(path, {}).get("request_id") != request_id:
-        return False
-    path.unlink(missing_ok=True)
-    return True
+    with _manual_request_lock():
+        if read_json(path, {}).get("request_id") != request_id:
+            return False
+        path.unlink(missing_ok=True)
+        return True
 
 
 def validate_config(raw):
@@ -620,8 +653,11 @@ class Optimizer:
         path = STATE / "select.request.json"
         if not path.exists():
             return False
-        request = read_json(path, {})
-        path.unlink(missing_ok=True)
+        with _manual_request_lock():
+            if not path.exists():
+                return False
+            request = read_json(path, {})
+            path.unlink()
         result = {"request_id": request.get("request_id"), "name": request.get("name"), "ok": False}
         try:
             self.reload_config()
@@ -646,12 +682,14 @@ class Optimizer:
             if latest.get(group, {}).get("now") != name:
                 raise ControllerError("客户端未确认该节点，请重新选择")
             now = time.time()
-            self.manual_until = now + self.cfg["manual_selection_grace_seconds"]
+            manual_until = now + self.cfg["manual_selection_grace_seconds"]
             owned = dict(self.record.get("groups", {}))
             owned[group] = {"name": name, "last_switch_at": now, "transaction_id": transaction_id}
-            self.record = {"group": group, "name": name, "last_switch_at": now,
-                           "manual_until": self.manual_until, "groups": owned, "source": "manual", "transaction_id": transaction_id}
-            atomic_json(STATE / "selection.json", self.record)
+            record = {"group": group, "name": name, "last_switch_at": now,
+                      "manual_until": manual_until, "groups": owned, "source": "manual", "transaction_id": transaction_id}
+            atomic_json(STATE / "selection.json", record)
+            self.record = record
+            self.manual_until = manual_until
             self.recover_pending()
             self.manual_revision += 1
             self.observed_selection = (group, name)
@@ -725,6 +763,13 @@ class Optimizer:
         if proxies.get(group, {}).get("now") == candidate and original in proxies.get(group, {}).get("all", []):
             api.select(group, original)
             event("rollback", group=group, previous=candidate, restored=original)
+
+    def observe_selection(self, group, selection):
+        observation = (group, selection)
+        if self.observed_selection and observation != self.observed_selection:
+            self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
+            event("external_selection_change", group=group, selected=selection)
+        self.observed_selection = observation
 
     def change_candidate(self, general, group, previous, candidate):
         policy = selection_policy(self.cfg)
@@ -823,7 +868,7 @@ class Optimizer:
             self.write_status(nodes=[], scan_regions=self.cfg["scan_regions"], scan_node_count=0,
                               excluded_node_count=len(all_names))
             raise ControllerError("代理组中没有符合地区范围的节点；保留当前选择")
-        self.observed_selection = (group, previous)
+        self.observe_selection(group, previous)
         self.write_status(controller_available=True, group=group, selected=current or previous,
                           phase="scanning", message="开始对所选范围测速", last_error=None,
                           nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
@@ -922,11 +967,7 @@ class Optimizer:
         self.recover_pending()
         general, proxies, group = self.api.snapshot(self.cfg)
         selection = proxies[group].get("now")
-        observation = (group, selection)
-        if self.observed_selection and observation != self.observed_selection:
-            self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
-            event("external_selection_change", group=group, selected=selection)
-        self.observed_selection = observation
+        self.observe_selection(group, selection)
         result = self.verify_path(general)
         self.failures = 0 if result["ok"] else self.failures + 1
         if self.failures >= 2 and time.time() - self.last_scan >= 30:

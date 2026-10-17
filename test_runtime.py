@@ -204,6 +204,32 @@ class RuntimeTests(unittest.TestCase):
         self.assertTrue(optimizer.cancel_manual_selection(newer))
         self.assertFalse((self.state / "select.request.json").exists())
 
+    def test_failed_manual_commit_keeps_durable_recovery_and_previous_memory_record(self):
+        optimizer.request_manual_selection("JP manual")
+        previous_record = copy.deepcopy(self.helper.record)
+        write = optimizer.atomic_json
+        def fail_commit(path, value):
+            if Path(path).name == "selection.json":
+                raise OSError("mock disk write failure")
+            return write(path, value)
+        with patch.object(optimizer, "atomic_json", side_effect=fail_commit):
+            self.assertFalse(self.helper.process_manual_selection())
+        self.assertEqual(self.helper.record, previous_record)
+        self.assertEqual(self.helper.manual_until, 0)
+        self.assertTrue((self.state / "pending-selection.json").exists())
+        self.helper.recover_pending()
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
+        self.assertFalse((self.state / "pending-selection.json").exists())
+
+    def test_client_choice_seen_at_scan_start_gets_the_manual_protection_period(self):
+        self.helper.observed_selection = ("Main", "JP old")
+        self.api.proxies["Main"]["now"] = "JP manual"
+        self.helper.scan()
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+        self.assertEqual(self.api.select_calls, [])
+        self.assertGreater(self.helper.manual_until, time.time())
+        self.assertIn("external_selection_change", [row["event"] for row in self.events()])
+
     def test_http_403_candidate_is_rolled_back_and_quarantined(self):
         self.verify.return_value = {"ok": False, "reason": "Codex 探测返回 HTTP 403", "http_status": 403}
         switched = self.helper.change_candidate(self.api.general, "Main", "JP old", "JP fast")

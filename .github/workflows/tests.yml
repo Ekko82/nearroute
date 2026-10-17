@@ -24,3 +24,8 @@ jobs:
       - name: Run offline unit tests
         run: python -B -m unittest discover -v
         # GUI tests must skip when Tk cannot create a window (headless Ubuntu).
+      - name: Verify isolated Windows install and uninstall
+        if: matrix.os == 'windows-latest' && matrix.python == '3.12'
+        env:
+          NEARROUTE_INSTALL_SMOKE: '1'
+        run: python -B -m unittest test_install_lifecycle -v

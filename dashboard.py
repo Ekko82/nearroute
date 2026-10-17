@@ -32,6 +32,7 @@ OPTIMIZER = ROOT / "optimizer.py"
 CHINA_TIME = timezone(timedelta(hours=8))
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOW_TITLE = "近舟 NearRoute"
+STATUS_STALE_SECONDS = 120
 
 
 class WindowInstance:
@@ -887,9 +888,17 @@ class Dashboard:
         except (OSError, ValueError):
             enabled = bool(status.get("enabled", True))
             self.policy.set(policy_summary({}))
-        connected = bool(status.get("controller_available", False))
+        try:
+            updated = datetime.fromisoformat(str(status.get("updated_at", "")).replace("Z", "+00:00"))
+            if updated.tzinfo is None:
+                updated = updated.replace(tzinfo=CHINA_TIME)
+            status_age = (datetime.now(CHINA_TIME) - updated).total_seconds()
+            stale = status_age > STATUS_STALE_SECONDS
+        except ValueError:
+            stale = bool(status)
+        connected = bool(status.get("controller_available", False)) and not stale
         phase = str(status.get("phase", "starting"))
-        running = bool(status.get("pid")) and phase not in ("stopped", "stopping")
+        running = bool(status.get("pid")) and phase not in ("stopped", "stopping") and not stale
         self.enable_button.state(["disabled"] if self.restore_busy or (enabled and running) else ["!disabled"])
         self.pause_button.state(["!disabled"] if enabled and not self.restore_busy else ["disabled"])
         self.scan_button.state(["disabled"] if self.restore_busy else ["!disabled"])
@@ -901,6 +910,8 @@ class Dashboard:
                 button.state(["disabled"])
         if self.manual_busy:
             badge, color = "正在手动切换", "#1b66b0"
+        elif stale:
+            badge, color = "后台状态未更新", "#8b6508"
         elif not enabled:
             badge, color = "已暂停自动切换", "#8b6508"
         elif not connected:
@@ -915,23 +926,29 @@ class Dashboard:
         self.badge_label.configure(foreground=color)
         selected = str(status.get("selected") or "—")
         group = str(status.get("group") or "—")
-        self.current.set(f"当前节点：{selected}    代理组：{group}")
+        node_label = "上次记录节点" if stale else "当前节点"
+        self.current.set(f"{node_label}：{selected}    代理组：{group}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
         usable = sum(bool(item.get("eligible", False)) for item in nodes)
         errors = status.get("network_errors_recent", 0)
-        self.health.set(f"控制接口：{'已连接' if connected else '未连接'}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
+        connection_label = "状态待更新" if stale else ("已连接" if connected else "未连接")
+        self.health.set(f"控制接口：{connection_label}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
         self.timings.set(
             f"最近测速：{display_time(status.get('last_scan_at'))}    "
             f"下次测速：{display_time(status.get('next_scan_at'))}    "
-            f"最近切换：{display_time(status.get('last_switch_at'))}"
+            f"最近切换：{display_time(status.get('last_switch_at'))}    "
+            f"状态更新：{display_time(status.get('updated_at'))}"
         )
         if self.manual_busy:
             self.message.set(f"正在切换到“{self.manual_request_name}”…")
         elif time.monotonic() >= self.notice_until:
-            description = status.get("message") or "等待服务状态…"
-            last_error = status.get("last_error")
-            if last_error:
-                description = f"{description}  ·  {last_error}"
+            if stale:
+                description = "后台状态未更新，当前显示上次记录；可点击“立即测速”重试。"
+            else:
+                description = status.get("message") or "等待服务状态…"
+                last_error = status.get("last_error")
+                if last_error:
+                    description = f"{description}  ·  {last_error}"
             if not status and time.monotonic() - self.started_at > 60:
                 description = "暂未收到服务状态，可点击“立即测速”重试。"
             self.message.set(str(description)[:800])

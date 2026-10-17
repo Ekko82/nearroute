@@ -1,6 +1,7 @@
 """Offline UI checks for manual selection and stable measurement rows."""
 
 from contextlib import ExitStack
+from datetime import datetime, timedelta
 import queue
 from types import SimpleNamespace
 import tkinter as tk
@@ -264,6 +265,43 @@ class TaskbarWiringTests(unittest.TestCase):
         with patch.object(dashboard, "clear_window", side_effect=lambda root: order.append("clear")):
             app.close()
         self.assertEqual(order, ["clear", "destroy"])
+
+
+class StatusFreshnessTests(unittest.TestCase):
+    def setUp(self):
+        self.app = dashboard_state()
+        self.app.results = queue.SimpleQueue()
+        self.app.notice_until = 0
+        self.app.started_at = 0
+        for name in ("policy", "badge", "badge_label", "current", "health", "timings", "message",
+                     "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button"):
+            setattr(self.app, name, Mock())
+        self.app.render_nodes = Mock()
+        self.nodes = [{"name": "JP last-known", "median_ms": 100, "eligible": True}]
+        self.status = {
+            "pid": 12345, "phase": "monitoring", "controller_available": True,
+            "selected": "JP last-known", "nodes": self.nodes,
+            "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(),
+        }
+
+    def refresh(self):
+        with patch.object(dashboard, "read_json", side_effect=lambda path: self.status if path == dashboard.STATUS else {"enabled": True}):
+            self.app.refresh()
+
+    def test_stale_status_is_not_presented_as_live_and_enable_is_available(self):
+        self.status["updated_at"] = (datetime.now(dashboard.CHINA_TIME) - timedelta(minutes=10)).isoformat()
+        self.refresh()
+        self.assertIn("未更新", self.app.badge.set.call_args.args[0])
+        self.assertNotIn("控制接口：已连接", self.app.health.set.call_args.args[0])
+        self.app.enable_button.state.assert_called_with(["!disabled"])
+        self.app.render_nodes.assert_called_once_with("JP last-known", self.nodes)
+        self.assertIn("上次", self.app.current.set.call_args.args[0])
+
+    def test_recent_monitoring_status_remains_live(self):
+        self.refresh()
+        self.app.badge.set.assert_called_with("自动优选已启用")
+        self.assertIn("控制接口：已连接", self.app.health.set.call_args.args[0])
+        self.app.enable_button.state.assert_called_with(["disabled"])
 
 
 if __name__ == "__main__":

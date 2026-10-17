@@ -31,6 +31,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 测速时节点列表保留上轮结果，并逐步更新本轮数据；选中行和滚动位置会保留。双击节点、选中后按 Enter，或右键选择“切换到此节点”，即可手动切换。暂停自动优选时也可操作。手动选择默认保持 10 分钟，期间“立即测速”仍可查看排名；若当前线路连续故障，后台可恢复自动选点。
 
+后台状态超过两分钟未更新时，界面会标明“上次记录”并显示状态更新时间，保留节点排名供查看。可点击“启用自动优选”或“立即测速”重新请求服务；旧记录不会被当作仍然在线的连接。
+
 不安装启动项也可以运行：
 
 ```powershell
@@ -118,6 +120,8 @@ python -B optimizer.py restore
 
 升级时从同一目录重新运行安装脚本。脚本保持旧 `CodexNodeOptimizer` 启动项名称，避免重复启动；只迁移能证明属于当前项目的旧快捷方式。目录需要迁移时先从原目录卸载，再在新目录安装。
 
+安装中途失败会尝试恢复本次更改前的启动项、快捷方式和安装记录。若快捷方式被占用，可解除占用后重新运行安装脚本。
+
 ## 开发与许可
 
 ```powershell
@@ -125,6 +129,8 @@ python -B -m unittest discover -v
 ```
 
 测试使用模拟控制器，不发送真实代理请求或切换节点。CI 在 Ubuntu 和 Windows 上测试 Python 3.10、3.12、3.13；没有图形显示时 Tk 窗口测试应跳过。Windows 安装、单实例锁和登录启动集成需在 Windows 上验证。
+
+Windows 隔离安装测试可设置 `NEARROUTE_INSTALL_SMOKE=1` 后运行 `python -B -m unittest test_install_lifecycle -v`。测试使用临时目录、临时注册表键和模拟后台，不修改实际桌面、登录启动项或代理节点；CI 的 Windows/Python 3.12 作业也运行这组检查。
 
 图标源和生成文件在 `assets/`。需要修改图标时，安装 Pillow 后运行 `python tools/build_icon.py`；预览输出到已忽略的 `state/icon-preview/`。普通运行直接使用仓库中的 ICO，无需 Pillow。
 
