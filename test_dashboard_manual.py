@@ -284,8 +284,8 @@ class StatusFreshnessTests(unittest.TestCase):
             "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(),
         }
 
-    def refresh(self):
-        with patch.object(dashboard, "read_json", side_effect=lambda path: self.status if path == dashboard.STATUS else {"enabled": True}):
+    def refresh(self, enabled=True):
+        with patch.object(dashboard, "read_json", side_effect=lambda path: self.status if path == dashboard.STATUS else {"enabled": enabled}):
             self.app.refresh()
 
     def test_stale_status_is_not_presented_as_live_and_enable_is_available(self):
@@ -302,6 +302,31 @@ class StatusFreshnessTests(unittest.TestCase):
         self.app.badge.set.assert_called_with("自动优选已启用")
         self.assertIn("控制接口：已连接", self.app.health.set.call_args.args[0])
         self.app.enable_button.state.assert_called_with(["disabled"])
+
+    def test_offline_controller_marks_retained_node_as_last_known(self):
+        self.status["controller_available"] = False
+        self.status["phase"] = "paused"
+        self.refresh(enabled=False)
+        self.assertIn("上次记录节点：JP last-known", self.app.current.set.call_args.args[0])
+        self.assertIn("控制接口：未连接", self.app.health.set.call_args.args[0])
+        self.app.render_nodes.assert_called_once_with("JP last-known", self.nodes)
+
+    def test_stopped_backend_cannot_present_cached_controller_as_connected(self):
+        for phase in ("stopped", "stopping"):
+            with self.subTest(phase=phase):
+                self.status["phase"] = phase
+                self.refresh(enabled=False)
+                self.assertIn("上次记录节点：JP last-known", self.app.current.set.call_args.args[0])
+                self.assertIn("控制接口：状态待更新", self.app.health.set.call_args.args[0])
+                self.app.badge.set.assert_called_with("后台已停止")
+                self.app.enable_button.state.assert_called_with(["!disabled"])
+
+    def test_connected_paused_backend_still_displays_current_node(self):
+        self.status["phase"] = "paused"
+        self.refresh(enabled=False)
+        self.app.badge.set.assert_called_with("已暂停自动切换")
+        self.assertIn("当前节点：JP last-known", self.app.current.set.call_args.args[0])
+        self.assertIn("控制接口：已连接", self.app.health.set.call_args.args[0])
 
 
 if __name__ == "__main__":

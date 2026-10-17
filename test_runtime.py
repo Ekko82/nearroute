@@ -14,6 +14,7 @@ import optimizer
 
 
 REAL_VERIFY = optimizer.verify_current_path
+REAL_SNAPSHOT = optimizer.Controller.snapshot
 
 
 class FakeController:
@@ -39,8 +40,8 @@ class FakeController:
             return copy.deepcopy(self.general)
         raise AssertionError("unexpected mock controller request: " + path)
 
-    def snapshot(self, cfg):
-        return self.request("/configs"), self.request("/proxies")["proxies"], cfg["group"]
+    def snapshot(self, cfg, *, allow_direct=False):
+        return REAL_SNAPSHOT(self, cfg, allow_direct=allow_direct)
 
     def delay(self, name):
         return self.delays.get(name, 150)
@@ -236,6 +237,16 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.api.select_calls, [])
         self.assertGreater(self.helper.manual_until, time.time())
         self.assertIn("external_selection_change", [row["event"] for row in self.events()])
+
+    def test_old_path_failures_cannot_bypass_protection_for_a_new_client_choice(self):
+        self.helper.observed_selection = ("Main", "JP old")
+        self.helper.failures = 2
+        self.api.proxies["Main"]["now"] = "JP manual"
+        self.helper.scan()
+        self.assertEqual(self.helper.failures, 0)
+        self.assertGreater(self.helper.manual_until, time.time())
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+        self.assertEqual(self.api.select_calls, [])
 
     def test_http_403_candidate_is_rolled_back_and_quarantined(self):
         self.verify.return_value = {"ok": False, "reason": "Codex 探测返回 HTTP 403", "http_status": 403}

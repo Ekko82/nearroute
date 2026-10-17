@@ -896,9 +896,10 @@ class Dashboard:
             stale = status_age > STATUS_STALE_SECONDS
         except ValueError:
             stale = bool(status)
-        connected = bool(status.get("controller_available", False)) and not stale
         phase = str(status.get("phase", "starting"))
-        running = bool(status.get("pid")) and phase not in ("stopped", "stopping") and not stale
+        stopped = phase in ("stopped", "stopping")
+        connected = bool(status.get("controller_available", False)) and not stale and not stopped
+        running = bool(status.get("pid")) and not stopped and not stale
         self.enable_button.state(["disabled"] if self.restore_busy or (enabled and running) else ["!disabled"])
         self.pause_button.state(["!disabled"] if enabled and not self.restore_busy else ["disabled"])
         self.scan_button.state(["disabled"] if self.restore_busy else ["!disabled"])
@@ -912,26 +913,27 @@ class Dashboard:
             badge, color = "正在手动切换", "#1b66b0"
         elif stale:
             badge, color = "后台状态未更新", "#8b6508"
+        elif stopped:
+            badge, color = "后台已停止", "#8b6508"
         elif not enabled:
             badge, color = "已暂停自动切换", "#8b6508"
         elif not connected:
             badge, color = "等待代理客户端", "#8b6508"
         elif phase in ("scanning", "testing", "measuring"):
             badge, color = "正在测速", "#1b66b0"
-        elif phase in ("stopped", "stopping"):
-            badge, color = "后台已停止", "#8b6508"
         else:
             badge, color = "自动优选已启用", "#267042"
         self.badge.set(badge)
         self.badge_label.configure(foreground=color)
         selected = str(status.get("selected") or "—")
         group = str(status.get("group") or "—")
-        node_label = "上次记录节点" if stale else "当前节点"
+        last_known = stale or stopped or status.get("controller_available") is False
+        node_label = "上次记录节点" if last_known else "当前节点"
         self.current.set(f"{node_label}：{selected}    代理组：{group}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
         usable = sum(bool(item.get("eligible", False)) for item in nodes)
         errors = status.get("network_errors_recent", 0)
-        connection_label = "状态待更新" if stale else ("已连接" if connected else "未连接")
+        connection_label = "状态待更新" if stale or stopped else ("已连接" if connected else "未连接")
         self.health.set(f"控制接口：{connection_label}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
         self.timings.set(
             f"最近测速：{display_time(status.get('last_scan_at'))}    "
