@@ -21,6 +21,7 @@ from tkinter import messagebox, ttk
 
 import optimizer as core
 from tray_icon import ICON_PATH, TrayIcon, request_restore
+from windows_app import clear_window, configure_taskbar, configure_window
 
 
 ROOT = Path(__file__).resolve().parent
@@ -502,6 +503,13 @@ class Dashboard:
         self.notice_until = 0.0
         self.node_signature = ""
         self.restore_busy = False
+        self.manual_busy = False
+        self.manual_results: queue.SimpleQueue = queue.SimpleQueue()
+        self.manual_request_id = None
+        self.manual_request_name = ""
+        self.manual_request_started = 0.0
+        self.manual_attempt = None
+        self.window_properties_configured = False
         self.exiting = False
         self.hidden_to_tray = False
         self.tray = None
@@ -609,25 +617,34 @@ class Dashboard:
         horizontal = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
         horizontal.grid(row=1, column=0, sticky="ew")
         self.table.configure(yscrollcommand=vertical.set, xscrollcommand=horizontal.set)
+        self.node_menu = tk.Menu(root, tearoff=False)
+        self.node_menu.add_command(label="切换到此节点", command=self.switch_selected_node)
+        self.table.bind("<Double-1>", self.switch_clicked_node)
+        self.table.bind("<Return>", self.switch_selected_node)
+        self.table.bind("<Button-3>", self.show_node_menu)
 
         footer_label = ttk.Label(
             container,
-            text="延迟为 HTTP 线路探测结果，不是模型首字时间。切换作用于当前主代理组；已建立连接不主动关闭。\n点击 × 收起到右下角托盘，双击托盘图标重新打开；退出程序会停止后台优选。",
+            text="双击节点、按 Enter 或右键可手动切换；暂停自动优选时也可使用。延迟为 HTTP 线路探测结果。\n点击 × 收起到右下角托盘，双击托盘图标重新打开；退出程序会停止后台优选。",
             style="Muted.TLabel", wraplength=1010,
         )
         footer_label.grid(row=6, column=0, sticky="ew", pady=(14, 0))
         self.wrapping_labels.append(footer_label)
         container.bind("<Configure>", self.resize_text)
-        if start_service:
-            self.service_after_id = root.after(100, self.ensure_service)
-        if enable_tray and os.name == "nt":
-            self.tray = TrayIcon(WINDOW_TITLE, str(ROOT), self.tray_actions.put)
-            if not self.tray.start():
-                self.tray.stop()
-                self.tray = None
-                self.notify("系统托盘暂不可用，点击 × 将最小化到任务栏。", 15)
-        self.poll_tray()
-        self.refresh()
+        try:
+            if start_service:
+                self.service_after_id = root.after(100, self.ensure_service)
+            if enable_tray and os.name == "nt":
+                self.tray = TrayIcon(WINDOW_TITLE, str(ROOT), self.tray_actions.put)
+                if not self.tray.start():
+                    self.tray.stop()
+                    self.tray = None
+                    self.notify("系统托盘暂不可用，点击 × 将最小化到任务栏。", 15)
+            self.poll_tray()
+            self.refresh()
+        except Exception:
+            self.close()
+            raise
 
     def notify(self, text: str, duration: float = 8.0) -> None:
         self.message.set(text)
@@ -707,8 +724,109 @@ class Dashboard:
         except OSError as error:
             messagebox.showerror("未能开始测速", str(error), parent=self.root)
 
+    def switch_selected_node(self, _event=None) -> str:
+        selected = self.table.selection()
+        if selected:
+            self.switch_node(selected[0])
+        return "break"
+
+    def switch_clicked_node(self, event) -> str:
+        name = self.table.identify_row(event.y)
+        if name:
+            self.table.selection_set(name)
+            self.table.focus(name)
+            self.switch_node(name)
+        return "break"
+
+    def show_node_menu(self, event) -> str:
+        name = self.table.identify_row(event.y)
+        if not name:
+            return "break"
+        self.table.selection_set(name)
+        self.table.focus(name)
+        self.table.focus_set()
+        blocked = self.closed or self.exiting or self.restore_busy or self.manual_busy
+        self.node_menu.entryconfigure(0, state="disabled" if blocked else "normal")
+        try:
+            self.node_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.node_menu.grab_release()
+        return "break"
+
+    def switch_node(self, name: str) -> None:
+        if self.closed or self.exiting or self.restore_busy or self.manual_busy:
+            return
+        self.manual_busy = True
+        self.manual_request_name = name
+        self.manual_request_started = time.monotonic()
+        self.manual_request_id = None
+        attempt = self.manual_attempt = object()
+        if not self.ensure_service():
+            self.manual_busy = False
+            self.manual_attempt = None
+            self.notify("后台未启动，未提交手动切换；可重试。", 20)
+            return
+        self.notify(f"正在切换到“{name}”…", 30)
+
+        def worker() -> None:
+            try:
+                request_id = core.request_manual_selection(name)
+                self.manual_results.put((attempt, True, request_id))
+            except (OSError, ValueError) as error:
+                self.manual_results.put((attempt, False, str(error)))
+
+        try:
+            threading.Thread(target=worker, name="manual-node-request", daemon=True).start()
+        except RuntimeError:
+            self.manual_busy = False
+            self.manual_attempt = None
+            self.notify("无法启动手动切换请求，可重试。", 20)
+
+    def poll_manual_selection(self, status: dict) -> None:
+        try:
+            while True:
+                attempt, success, result = self.manual_results.get_nowait()
+                if attempt is not self.manual_attempt:
+                    if success:
+                        try:
+                            core.cancel_manual_selection(result)
+                        except OSError:
+                            self.notify("旧切换请求清理未完成，请留意当前节点。", 20)
+                    continue
+                if success:
+                    self.manual_request_id = result
+                else:
+                    self.manual_busy = False
+                    self.manual_attempt = None
+                    self.notify(f"未能请求切换：{result}。可重试。", 20)
+        except queue.Empty:
+            pass
+        result = status.get("manual_selection_result") or {}
+        if self.manual_busy and self.manual_request_id and result.get("request_id") == self.manual_request_id:
+            name = self.manual_request_name
+            self.manual_busy = False
+            self.manual_attempt = None
+            self.manual_request_id = None
+            if result.get("ok") and result.get("name") == name:
+                self.notify(f"已手动切换到“{name}”。暂时尊重手动选择。", 20)
+            elif result.get("ok"):
+                self.notify("返回的节点与请求不一致，请查看当前节点后重试。", 20)
+            else:
+                self.notify(f"手动切换失败：{result.get('message') or '请检查客户端连接'}。可重试。", 20)
+        if self.manual_busy and time.monotonic() - self.manual_request_started >= 30:
+            request_id = self.manual_request_id
+            self.manual_busy = False
+            self.manual_attempt = None
+            self.manual_request_id = None
+            try:
+                cancelled = bool(request_id and core.cancel_manual_selection(request_id))
+                description = "已取消未处理请求，可重试。" if cancelled else "可重试；已开始的切换可能仍会完成。"
+            except OSError:
+                description = "请求清理未完成，请查看当前节点后重试。"
+            self.notify("手动切换等待超时，" + description, 20)
+
     def restore(self) -> None:
-        if self.restore_busy or self.exiting:
+        if self.restore_busy or self.exiting or getattr(self, "manual_busy", False):
             return
         try:
             update_enabled(False)
@@ -761,6 +879,7 @@ class Dashboard:
             status = read_json(STATUS)
         except (OSError, ValueError):
             status = {}
+        self.poll_manual_selection(status)
         try:
             config = read_json(CONFIG)
             enabled = bool(config.get("enabled", True))
@@ -775,12 +894,14 @@ class Dashboard:
         self.pause_button.state(["!disabled"] if enabled and not self.restore_busy else ["disabled"])
         self.scan_button.state(["disabled"] if self.restore_busy else ["!disabled"])
         self.settings_button.state(["disabled"] if self.restore_busy else ["!disabled"])
-        self.restore_button.state(["disabled"] if self.restore_busy or self.exiting else ["!disabled"])
-        self.exit_button.state(["disabled"] if self.restore_busy or self.exiting else ["!disabled"])
+        self.restore_button.state(["disabled"] if self.restore_busy or self.exiting or self.manual_busy else ["!disabled"])
+        self.exit_button.state(["disabled"] if self.restore_busy or self.exiting or self.manual_busy else ["!disabled"])
         if self.exiting:
             for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button, self.settings_button):
                 button.state(["disabled"])
-        if not enabled:
+        if self.manual_busy:
+            badge, color = "正在手动切换", "#1b66b0"
+        elif not enabled:
             badge, color = "已暂停自动切换", "#8b6508"
         elif not connected:
             badge, color = "等待代理客户端", "#8b6508"
@@ -804,7 +925,9 @@ class Dashboard:
             f"下次测速：{display_time(status.get('next_scan_at'))}    "
             f"最近切换：{display_time(status.get('last_switch_at'))}"
         )
-        if time.monotonic() >= self.notice_until:
+        if self.manual_busy:
+            self.message.set(f"正在切换到“{self.manual_request_name}”…")
+        elif time.monotonic() >= self.notice_until:
             description = status.get("message") or "等待服务状态…"
             last_error = status.get("last_error")
             if last_error:
@@ -812,26 +935,50 @@ class Dashboard:
             if not status and time.monotonic() - self.started_at > 60:
                 description = "暂未收到服务状态，可点击“立即测速”重试。"
             self.message.set(str(description)[:800])
+        self.render_nodes(selected, nodes)
+        self.after_id = self.root.after(2000, self.refresh)
+
+    def render_nodes(self, selected: str, nodes: list[dict]) -> None:
+        nodes = list(nodes)
+        if selected != "—" and not any(row.get("name") == selected for row in nodes):
+            nodes.insert(0, {"name": selected, "eligible": False, "reason": "当前节点不在本轮测速列表中"})
         signature = json.dumps([selected, nodes], ensure_ascii=False, sort_keys=True)
         if signature != self.node_signature:
-            old_position = self.table.yview()[0]
-            self.table.delete(*self.table.get_children())
-            for node in nodes:
+            old_selection = self.table.selection()
+            old_focus = self.table.focus()
+            old_y, old_x = self.table.yview()[0], self.table.xview()[0]
+            existing = set(self.table.get_children())
+            visible = set()
+            for index, node in enumerate(nodes):
                 name = str(node.get("name") or "—")
+                if name in visible:
+                    continue
+                visible.add(name)
                 eligible = bool(node.get("eligible", False))
                 reason = str(node.get("reason") or ("可选" if eligible else "暂不可选"))
                 if name == selected:
                     reason = f"当前使用 · {reason}"
                 samples = node.get("samples")
                 sample_count = len(samples) if isinstance(samples, list) else samples
-                self.table.insert("", "end", values=(
+                values = (
                     name, number(node.get("score_ms")), number(node.get("median_ms")),
                     percentage(node.get("success_rate")), number(node.get("jitter_ms")),
                     "—" if sample_count is None else sample_count, reason,
-                ), tags=("selected",) if name == selected else (() if eligible else ("unavailable",)))
-            self.table.yview_moveto(old_position)
+                )
+                tags = ("selected",) if name == selected else (() if eligible else ("unavailable",))
+                if name in existing:
+                    self.table.item(name, values=values, tags=tags)
+                    self.table.move(name, "", index)
+                else:
+                    self.table.insert("", index, iid=name, values=values, tags=tags)
+            for name in existing - visible:
+                self.table.delete(name)
+            self.table.selection_set([name for name in old_selection if name in visible])
+            if old_focus in visible:
+                self.table.focus(old_focus)
+            self.table.yview_moveto(old_y)
+            self.table.xview_moveto(old_x)
             self.node_signature = signature
-        self.after_id = self.root.after(2000, self.refresh)
 
     def hide_to_tray(self) -> None:
         if self.closed or self.exiting:
@@ -894,6 +1041,10 @@ class Dashboard:
             self.show_window()
             self.notify("正在恢复原节点，请等待恢复操作完成后再退出。", 15)
             return
+        if getattr(self, "manual_busy", False):
+            self.show_window()
+            self.notify("正在手动切换节点，请等待结果后再退出。", 15)
+            return
         self.exiting = True
         self.cancel_service_start()
         self.show_window()
@@ -948,6 +1099,11 @@ class Dashboard:
                 self.tray.stop()
         finally:
             try:
+                if getattr(self, "window_properties_configured", False):
+                    try:
+                        clear_window(self.root)
+                    except OSError:
+                        pass
                 self.root.destroy()
             except tk.TclError:
                 pass
@@ -957,15 +1113,35 @@ def main() -> None:
     instance = WindowInstance()
     if not instance.acquire():
         return
+    root = None
+    dashboard = None
     try:
+        taskbar_error = None
+        try:
+            configure_taskbar()
+        except OSError as error:
+            taskbar_error = str(error)
         root = tk.Tk()
         dashboard = Dashboard(root)
         try:
-            root.mainloop()
-        finally:
-            dashboard.close()
+            configure_window(root)
+            dashboard.window_properties_configured = True
+        except OSError as error:
+            taskbar_error = str(error)
+        if taskbar_error:
+            dashboard.notify(f"任务栏图标设置未完成：{taskbar_error}", 20)
+        root.mainloop()
     finally:
-        instance.close()
+        try:
+            if dashboard is not None:
+                dashboard.close()
+            elif root is not None:
+                try:
+                    root.destroy()
+                except tk.TclError:
+                    pass
+        finally:
+            instance.close()
 
 
 if __name__ == "__main__":

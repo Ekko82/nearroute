@@ -96,6 +96,114 @@ class RuntimeTests(unittest.TestCase):
         path = self.state / "events.jsonl"
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()] if path.exists() else []
 
+    def test_scan_keeps_nodes_visible_and_publishes_progress_samples(self):
+        self.cfg["enabled"] = False
+        self.helper.add_sample("JP old", 320)
+        statuses = []
+        write = self.helper.write_status
+        def capture(**updates):
+            write(**updates)
+            statuses.append(copy.deepcopy(self.helper.status))
+        with patch.object(self.helper, "write_status", side_effect=capture):
+            self.helper.scan()
+        scanning = [s for s in statuses if s["phase"] == "scanning"]
+        self.assertTrue(scanning)
+        self.assertTrue(all(s["nodes"] for s in scanning))
+        initial = next(r for r in scanning[0]["nodes"] if r["name"] == "JP old")
+        self.assertEqual(initial["median_ms"], 320)
+        self.assertTrue(any(s.get("progress_done") and any(r["samples"] > 0 for r in s["nodes"]) for s in scanning[1:]))
+
+    def test_paused_manual_switch_is_confirmed_and_survives_helper_restart(self):
+        self.cfg["enabled"] = False
+        request_id = optimizer.request_manual_selection("JP manual")
+        self.assertTrue(self.helper.process_manual_selection())
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+        self.assertEqual(self.helper.status["manual_selection_result"]["request_id"], request_id)
+        self.assertTrue(self.helper.status["manual_selection_result"]["ok"])
+        self.assertEqual(self.helper.status["phase"], "paused")
+        self.assertGreater(self.helper.manual_until, time.time())
+        restarted = optimizer.Optimizer()
+        self.assertEqual(restarted.manual_until, self.helper.manual_until)
+
+    def test_forced_scan_respects_manual_switch_grace_period(self):
+        optimizer.request_manual_selection("JP manual")
+        self.assertTrue(self.helper.process_manual_selection())
+        self.helper.scan(forced=True)
+        self.assertEqual(self.api.select_calls, [("Main", "JP manual")])
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+
+    def test_manual_request_during_scan_takes_priority_over_auto_switch(self):
+        optimizer.request_manual_selection("JP manual")
+        self.helper.scan(forced=True)
+        self.assertEqual(self.api.select_calls, [("Main", "JP manual")])
+        self.assertEqual(self.helper.status["selected"], "JP manual")
+        self.assertTrue(self.helper.status["manual_selection_result"]["ok"])
+
+    def test_manual_request_interrupts_candidate_validation_then_selects_user_choice(self):
+        def request_during_verification(*args, **kwargs):
+            optimizer.request_manual_selection("JP manual")
+            self.assertTrue(args[2]())
+            return {"ok": False, "cancelled": True, "reason": "验证已取消"}
+        self.verify.side_effect = request_during_verification
+        self.assertFalse(self.helper.change_candidate(self.api.general, "Main", "JP old", "JP fast"))
+        self.assertTrue(self.helper.process_manual_selection())
+        self.assertEqual(self.api.select_calls, [("Main", "JP fast"), ("Main", "JP old"), ("Main", "JP manual")])
+        self.assertNotIn("JP fast", self.helper.quarantine)
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+
+    def test_deleted_manual_node_reports_failure_without_changing_selection(self):
+        request_id = optimizer.request_manual_selection("deleted node")
+        self.assertFalse(self.helper.process_manual_selection())
+        result = self.helper.status["manual_selection_result"]
+        self.assertEqual(result["request_id"], request_id)
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.api.select_calls, [])
+
+    def test_changed_controller_rejects_stale_manual_request(self):
+        optimizer.request_manual_selection("JP manual")
+        self.cfg["controller"] = "http://127.0.0.1:9999"
+        self.assertFalse(self.helper.process_manual_selection())
+        self.assertFalse(self.helper.status["manual_selection_result"]["ok"])
+        self.assertEqual(self.api.select_calls, [])
+
+    def test_dry_run_leaves_manual_request_for_the_real_helper(self):
+        self.helper.dry_run = True
+        optimizer.request_manual_selection("JP manual")
+        self.helper.scan(forced=True)
+        self.assertEqual(self.api.select_calls, [])
+        self.assertTrue((self.state / "select.request.json").exists())
+
+    def test_unconfirmed_manual_put_keeps_journal_for_recovery(self):
+        optimizer.request_manual_selection("JP manual")
+        self.api.lose_next_put_response = True
+        self.assertFalse(self.helper.process_manual_selection())
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP manual")
+        self.assertTrue((self.state / "pending-selection.json").exists())
+        self.api.offline = False
+        self.helper.recover_pending()
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
+        self.assertFalse((self.state / "pending-selection.json").exists())
+
+    def test_failed_manual_request_with_new_probe_does_not_mix_old_measurements(self):
+        optimizer.request_manual_selection("deleted node")
+        def change_probe(name):
+            self.cfg.update(probe_url="https://example.com/health", probe_expected_statuses=[204])
+            return 123
+        with patch.object(self.api, "delay", side_effect=change_probe):
+            self.helper.scan(forced=True)
+        self.assertEqual(self.helper.history, {})
+        self.assertEqual(self.helper.history_probe, optimizer.probe_identity(self.cfg))
+        self.assertEqual(self.helper.next_scan, 0)
+        self.assertEqual(self.api.select_calls, [])
+
+    def test_cancelling_old_request_preserves_newer_choice(self):
+        older = optimizer.request_manual_selection("JP old")
+        newer = optimizer.request_manual_selection("JP manual")
+        self.assertFalse(optimizer.cancel_manual_selection(older))
+        self.assertEqual(optimizer.read_json(self.state / "select.request.json", {})["request_id"], newer)
+        self.assertTrue(optimizer.cancel_manual_selection(newer))
+        self.assertFalse((self.state / "select.request.json").exists())
+
     def test_http_403_candidate_is_rolled_back_and_quarantined(self):
         self.verify.return_value = {"ok": False, "reason": "Codex 探测返回 HTTP 403", "http_status": 403}
         switched = self.helper.change_candidate(self.api.general, "Main", "JP old", "JP fast")

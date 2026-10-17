@@ -94,6 +94,29 @@ def load_config():
     return validate_config(raw)
 
 
+def request_manual_selection(name):
+    """Queue a user choice for the helper, which serializes all controller PUTs."""
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("请选择要切换的节点")
+    cfg = load_config()
+    request_id = uuid.uuid4().hex
+    STATE.mkdir(parents=True, exist_ok=True)
+    atomic_json(STATE / "select.request.json", {
+        "request_id": request_id, "name": name,
+        "controller": cfg["controller"], "group": cfg["group"],
+    })
+    return request_id
+
+
+def cancel_manual_selection(request_id):
+    """Remove only this request if the helper has not consumed it yet."""
+    path = STATE / "select.request.json"
+    if read_json(path, {}).get("request_id") != request_id:
+        return False
+    path.unlink(missing_ok=True)
+    return True
+
+
 def validate_config(raw):
     if not isinstance(raw, dict):
         raise ValueError("config.json 不是有效的 JSON 对象，自动切换已停止")
@@ -541,7 +564,9 @@ class Optimizer:
         self.dry_run = dry_run
         self.next_scan = 0.0
         self.last_scan = 0.0
-        self.manual_until = 0.0
+        self.manual_until = self.record.get("manual_until", 0.0)
+        self.manual_revision = 0
+        self.scan_display_names = []
         self.last_health = 0.0
         self.last_signal_scan = 0.0
         self.observed_selection = None
@@ -589,6 +614,61 @@ class Optimizer:
         return verify_current_path(general, idle_seconds, cancel,
                                    probe_url=self.cfg["probe_url"], expected_statuses=self.cfg["probe_expected_statuses"])
 
+    def process_manual_selection(self):
+        if self.dry_run:
+            return False
+        path = STATE / "select.request.json"
+        if not path.exists():
+            return False
+        request = read_json(path, {})
+        path.unlink(missing_ok=True)
+        result = {"request_id": request.get("request_id"), "name": request.get("name"), "ok": False}
+        try:
+            self.reload_config()
+            if (request.get("controller") != self.cfg["controller"] or request.get("group") != self.cfg["group"]):
+                raise ValueError("代理设置已改变，请重新选择节点")
+            self.recover_pending()
+            _, proxies, group = self.api.snapshot(self.cfg)
+            name = request.get("name")
+            if not isinstance(name, str) or name not in proxies[group].get("all", []) or name not in flatten_candidates(proxies, group):
+                raise ValueError("该节点已失效或不能由当前主代理组直接选择，请刷新后重试")
+            previous = proxies[group].get("now")
+            self.protect_original(group, previous)
+            transaction_id = uuid.uuid4().hex
+            atomic_json(STATE / "pending-selection.json", {
+                "group": group, "previous": previous, "candidate": name,
+                "at": iso(), "transaction_id": transaction_id,
+                "controller": self.cfg["controller"], "controller_secret_env": self.cfg["controller_secret_env"],
+            })
+            if previous != name:
+                self.api.select(group, name)
+            latest = self.api.request("/proxies")["proxies"]
+            if latest.get(group, {}).get("now") != name:
+                raise ControllerError("客户端未确认该节点，请重新选择")
+            now = time.time()
+            self.manual_until = now + self.cfg["manual_selection_grace_seconds"]
+            owned = dict(self.record.get("groups", {}))
+            owned[group] = {"name": name, "last_switch_at": now, "transaction_id": transaction_id}
+            self.record = {"group": group, "name": name, "last_switch_at": now,
+                           "manual_until": self.manual_until, "groups": owned, "source": "manual", "transaction_id": transaction_id}
+            atomic_json(STATE / "selection.json", self.record)
+            self.recover_pending()
+            self.manual_revision += 1
+            self.observed_selection = (group, name)
+            self.failures = 0
+            self.next_scan = now + self.cfg["scan_interval_seconds"]
+            result.update(ok=True, message="已手动切换；暂时尊重此选择")
+            self.write_status(selected=name, group=group, controller_available=True, last_error=None,
+                              phase="monitoring" if self.cfg["enabled"] else "paused",
+                              last_switch_at=iso(now), manual_until=iso(self.manual_until),
+                              next_scan_at=iso(self.next_scan), manual_selection_result=result, message=result["message"])
+            event("manual_selection", group=group, previous=previous, selected=name)
+            return True
+        except (ControllerError, ValueError, OSError) as error:
+            result["message"] = str(error)
+            self.write_status(manual_selection_result=result, message="手动切换失败：" + str(error))
+            return False
+
     def add_sample(self, name, delay):
         now = time.time()
         data = self.history.setdefault(name, [])
@@ -607,6 +687,7 @@ class Optimizer:
         return sorted(result, key=lambda row: (not row["eligible"], row["score_ms"] if row["score_ms"] is not None else float("inf"), row["name"]))
 
     def measure_round(self, names, title):
+        policy = selection_policy(self.cfg)
         results = {}
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(self.cfg["concurrency"]))
         pending = {executor.submit(self.api.delay, name): name for name in names}
@@ -618,8 +699,11 @@ class Optimizer:
                 delay = future.result()
                 results[name] = delay
                 self.add_sample(name, delay)
+                if self.process_manual_selection() or selection_policy(self.cfg) != policy:
+                    break
                 if len(results) % 5 == 0 or len(results) == len(names):
-                    self.write_status(phase="scanning", message=f"{title}：{len(results)}/{len(names)}", progress_done=len(results), progress_total=len(names))
+                    self.write_status(phase="scanning", message=f"{title}：{len(results)}/{len(names)}", progress_done=len(results), progress_total=len(names),
+                                      nodes=self.statistics(self.scan_display_names or names))
         finally:
             for future in pending:
                 future.cancel()
@@ -655,20 +739,21 @@ class Optimizer:
         committed = False
         try:
             self.reload_config()
-            if (not self.cfg["enabled"] or self.stopping() or selection_policy(self.cfg) != policy
+            if (not self.cfg["enabled"] or self.stopping() or (STATE / "select.request.json").exists() or selection_policy(self.cfg) != policy
                     or not scan_candidates([candidate], self.cfg)):
                 return False
             latest = self.api.request("/proxies")["proxies"]
             if latest.get(group, {}).get("now") != previous:
                 return False
             self.api.select(group, candidate)
-            result = self.verify_path(general, self.cfg["verification_idle_seconds"], cancel=self.stopping)
+            result = self.verify_path(general, self.cfg["verification_idle_seconds"],
+                                      cancel=lambda: self.stopping() or (STATE / "select.request.json").exists())
             latest = self.api.request("/proxies")["proxies"]
             self.reload_config()
             if latest.get(group, {}).get("now") != candidate:
                 event("selection_changed_during_validation", group=group)
                 return False
-            if (result["ok"] and self.cfg["enabled"] and not self.stopping()
+            if (result["ok"] and self.cfg["enabled"] and not self.stopping() and not (STATE / "select.request.json").exists()
                     and selection_policy(self.cfg) == policy
                     and bool(scan_candidates([candidate], self.cfg))):
                 now = time.time()
@@ -722,6 +807,7 @@ class Optimizer:
 
     def scan(self, forced=False):
         self.reload_config()
+        revision = self.manual_revision
         policy = selection_policy(self.cfg)
         general, proxies, group = self.api.snapshot(self.cfg)
         self.recover_pending()
@@ -730,6 +816,9 @@ class Optimizer:
         current = resolve_leaf(proxies, previous)
         all_names = flatten_candidates(proxies, group)
         names = scan_candidates(all_names, self.cfg)
+        self.scan_display_names = list(names)
+        if current and current not in names and current in all_names:
+            self.scan_display_names.insert(0, current)
         if not names:
             self.write_status(nodes=[], scan_regions=self.cfg["scan_regions"], scan_node_count=0,
                               excluded_node_count=len(all_names))
@@ -737,17 +826,19 @@ class Optimizer:
         self.observed_selection = (group, previous)
         self.write_status(controller_available=True, group=group, selected=current or previous,
                           phase="scanning", message="开始对所选范围测速", last_error=None,
-                          nodes=[], scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
+                          nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
                           scan_node_count=len(names), excluded_node_count=len(all_names) - len(names),
                           region_counts=dict(collections.Counter(node_region(name) for name in names)))
         fresh = self.measure_round(names, "所选节点初测")
-        if self.stopping():
+        if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
             return
         shortlist = select_shortlist(fresh, current, int(self.cfg["shortlist_size"]), self.cfg["prefer_japan"])
         for round_no in range(int(self.cfg["confirmation_rounds"])):
-            if self.stopping():
+            if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
                 return
             self.measure_round(shortlist, f"候选复测 {round_no + 1}/{int(self.cfg['confirmation_rounds'])}")
+        if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
+            return
         def ranking():
             rows = self.statistics(names)
             for row in rows:
@@ -761,7 +852,8 @@ class Optimizer:
         stats = ranking()
         self.last_scan = time.time()
         self.next_scan = self.last_scan + self.cfg["scan_interval_seconds"]
-        self.write_status(nodes=stats, last_scan_at=iso(self.last_scan), next_scan_at=iso(self.next_scan), phase="monitoring")
+        display_stats = stats + self.statistics([current]) if current and current not in names else stats
+        self.write_status(nodes=display_stats, last_scan_at=iso(self.last_scan), next_scan_at=iso(self.next_scan), phase="monitoring")
         self.reload_config()
         if selection_policy(self.cfg) != policy:
             self.next_scan = 0
@@ -770,7 +862,7 @@ class Optimizer:
         if self.dry_run or not self.cfg["enabled"]:
             self.write_status(phase="paused" if not self.cfg["enabled"] else "monitoring", message="测速完成；本轮仅测量，未切换")
             return
-        if time.time() < self.manual_until and not forced and self.failures < 2:
+        if time.time() < self.manual_until and self.failures < 2:
             self.write_status(message="检测到手动选点，暂时尊重手动选择")
             return
         # A short active-path check detects 403/5xx hidden by old delay APIs.
@@ -786,6 +878,8 @@ class Optimizer:
         reason = "测速完成"
         for _ in range(int(self.cfg["max_candidate_attempts"])):
             self.reload_config()
+            if self.process_manual_selection():
+                return
             if not self.cfg["enabled"] or selection_policy(self.cfg) != policy:
                 self.next_scan = 0
                 self.write_status(nodes=[], phase="monitoring" if self.cfg["enabled"] else "paused",
@@ -805,6 +899,8 @@ class Optimizer:
                 self.recover_pending()
                 break
             self.recover_pending()
+            if self.process_manual_selection():
+                return
             tried.add(candidate)
             stats = ranking()
             self.reload_config()
@@ -817,7 +913,8 @@ class Optimizer:
         latest = self.api.request("/proxies")["proxies"]
         selected = resolve_leaf(latest, latest.get(group, {}).get("now"))
         self.write_status(phase="monitoring" if self.cfg["enabled"] else "paused", selected=selected,
-                          nodes=stats, message=reason, enabled=self.cfg["enabled"])
+                          nodes=stats + self.statistics([selected]) if selected and selected not in names else stats,
+                          message=reason, enabled=self.cfg["enabled"])
         event("scan_completed", candidates=len(names), selected=selected, message=reason,
               scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"])
 
@@ -851,6 +948,8 @@ class Optimizer:
         while not self.stopping():
             try:
                 self.reload_config()
+                if self.process_manual_selection():
+                    continue
                 requested = STATE / "scan.request"
                 forced = requested.exists()
                 if forced:

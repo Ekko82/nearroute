@@ -35,7 +35,7 @@ function Test-OwnedShortcut {
     finally { if ($null -ne $link) { $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($link) } }
 }
 
-foreach ($name in @('optimizer.py', 'dashboard.py', 'tray_icon.py', 'launch.ps1', 'config.example.json')) {
+foreach ($name in @('optimizer.py', 'dashboard.py', 'tray_icon.py', 'windows_app.py', 'launch.ps1', 'config.example.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $applicationRoot $name) -PathType Leaf)) { throw "安装文件不完整：缺少 $name" }
 }
 $PythonExe = & $launchPath -ResolveOnly -PythonExe $PythonExe
@@ -79,6 +79,15 @@ try {
     $shortcut.Description = '近舟 NearRoute：线路探测、范围设置和自动优选'
     $shortcut.IconLocation = (Join-Path $applicationRoot 'assets\nearroute.ico') + ',0'
     $shortcut.Save()
+    # Set shell properties only on this newly created temporary shortcut. The
+    # existing desktop link has already passed the ownership/hash checks above.
+    $null = [Runtime.InteropServices.Marshal]::FinalReleaseComObject($shortcut)
+    $shortcut = $null
+    $identityArguments = @('-B', ('"' + (Join-Path $applicationRoot 'windows_app.py') + '"'), '--shortcut', ('"' + $temporaryShortcut + '"'))
+    $identityProcess = Start-Process -FilePath $PythonExe -ArgumentList $identityArguments -WorkingDirectory $applicationRoot -WindowStyle Hidden -Wait -PassThru
+    try {
+        if ($identityProcess.ExitCode -ne 0) { throw '未能写入近舟快捷方式的任务栏标识，原快捷方式保持不变。' }
+    } finally { $identityProcess.Dispose() }
     $installState = [ordered]@{
         schema_version = 2; installed = $true; root = $applicationRoot
         installed_at = [DateTimeOffset]::Now.ToString('o'); python_exe = $PythonExe
