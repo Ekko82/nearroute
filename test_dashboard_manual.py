@@ -150,9 +150,12 @@ class ManualSelectionTests(unittest.TestCase):
         self.assertIn("不一致", self.app.notify.call_args.args[0])
 
     def test_timeout_cancels_only_own_request_and_releases_busy(self):
-        self.app.switch_node("JP A")
-        self.publish_id()
-        with patch.object(dashboard.time, "monotonic", return_value=self.app.manual_request_started + 30):
+        # Use exactly representable times for the inclusive 30-second boundary;
+        # adding 30 to a live fractional clock can subtract back to 29.9999999.
+        with patch.object(dashboard.time, "monotonic", return_value=100.0) as clock:
+            self.app.switch_node("JP A")
+            self.publish_id()
+            clock.return_value = 130.0
             self.app.poll_manual_selection({})
         self.cancel.assert_called_once_with("request-1")
         self.assertFalse(self.app.manual_busy)
