@@ -75,6 +75,9 @@ class RuntimeTests(unittest.TestCase):
         self.stack.enter_context(patch.object(optimizer, "CONFIG", Path(self.temp.name) / "config.json"))
         self.stack.enter_context(patch.object(optimizer, "load_config", side_effect=lambda: dict(self.cfg)))
         self.stack.enter_context(patch.object(optimizer, "Controller", return_value=self.api))
+        self.instance_lock = MagicMock()
+        self.instance_lock.acquire.return_value = True
+        self.stack.enter_context(patch.object(optimizer, "InstanceLock", return_value=self.instance_lock))
         self.stack.enter_context(patch.object(optimizer, "LogSignals", return_value=self.signals))
         self.stack.enter_context(
             patch.object(optimizer.urllib.request, "build_opener", side_effect=AssertionError("real network forbidden"))

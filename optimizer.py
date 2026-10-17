@@ -1218,6 +1218,16 @@ def stop_daemon():
 def restore_original():
     if not stop_daemon():
         raise RuntimeError("后台程序尚在退出，暂未恢复节点")
+    lock = InstanceLock()
+    if not lock.acquire():
+        raise RuntimeError("后台已重新启动，暂未恢复节点，请稍后重试")
+    try:
+        return _restore_original_locked()
+    finally:
+        lock.close()
+
+
+def _restore_original_locked():
     cfg = load_config()
     cfg["enabled"] = False
     atomic_json(CONFIG, cfg)
