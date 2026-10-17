@@ -84,11 +84,43 @@ class InstallLifecycleTests(unittest.TestCase):
         result = subprocess.run(command, capture_output=True, text=True, errors="replace",
                                 timeout=45, creationflags=subprocess.CREATE_NO_WINDOW,
                                 env=environment)
-        if success:
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        else:
-            self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        expected_result = result.returncode == 0 if success else result.returncode != 0
+        if not expected_result:
+            self.fail(result.stdout + result.stderr + "\nFixture shortcut: " +
+                      json.dumps(self.shortcut_diagnostics(), ensure_ascii=True))
         return result
+
+    def shortcut_diagnostics(self):
+        """Read this test's .lnk only; never inspect real desktop shortcuts."""
+        def literal(value):
+            return "'" + str(value).replace("'", "''") + "'"
+        source = (
+            "[Console]::OutputEncoding=[Text.UTF8Encoding]::new($false);"
+            "$shell=$null; $link=$null;"
+            "try { $shell=New-Object -ComObject WScript.Shell;"
+            "$link=$shell.CreateShortcut(" + literal(self.shortcut) + ");"
+            "[pscustomobject]@{target=$link.TargetPath;arguments=$link.Arguments;"
+            "expected_target=" + literal(self.powershell) + ";expected_file=" + literal(self.app / "launch.ps1") +
+            ";shortcut=" + literal(self.shortcut) + "} | ConvertTo-Json -Compress }"
+            "catch { [pscustomobject]@{error=$_.Exception.GetType().FullName} | ConvertTo-Json -Compress }"
+            "finally { if($null -ne $link){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($link)};"
+            "if($null -ne $shell){[void][Runtime.InteropServices.Marshal]::FinalReleaseComObject($shell)} }"
+        )
+        environment = {key: value for key, value in os.environ.items()
+                       if key.lower() != "psmodulepath"}
+        result = subprocess.run([self.powershell, "-NoProfile", "-Command", source],
+                                capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=15, creationflags=subprocess.CREATE_NO_WINDOW, env=environment)
+        try:
+            return json.loads(result.stdout)
+        except ValueError:
+            return {"diagnostic_exit_code": result.returncode, "fixture": str(self.app)}
+
+    def assert_owned_shortcut(self):
+        details = self.shortcut_diagnostics()
+        diagnostic = json.dumps(details, ensure_ascii=True)
+        self.assertEqual(details.get("target", "").casefold(), self.powershell.casefold(), diagnostic)
+        self.assertIn('"' + str(self.app / "launch.ps1") + '"', details.get("arguments", ""), diagnostic)
 
     def run_value(self):
         try:
@@ -130,13 +162,18 @@ class InstallLifecycleTests(unittest.TestCase):
 
     def test_failed_install_without_record_leaves_no_startup_or_false_record(self):
         self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python)
+        # Establish that the installer recognizes the metadata it just wrote.
+        # Otherwise a rejection while locked would not exercise rollback at all.
+        self.assert_owned_shortcut()
         # An installer-owned shortcut may remain after an interrupted old setup.
         self.state.unlink()
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, self.reg_key, 0, winreg.KEY_SET_VALUE) as key:
             winreg.DeleteValue(key, "CodexNodeOptimizer")
         before_shortcut = self.shortcut.read_bytes()
         with self.lock_shortcut_against_replacement():
-            self.run_script("install.ps1", "-NoStart", "-PythonExe", self.pythonw, success=False)
+            failure = self.run_script("install.ps1", "-NoStart", "-PythonExe", self.pythonw, success=False)
+        self.assertIn("MoveItemCommand", failure.stderr, failure.stdout + failure.stderr + "\n" +
+                      json.dumps(self.shortcut_diagnostics(), ensure_ascii=True))
         self.assertFalse(self.state.exists())
         self.assertIsNone(self.run_value())
         self.assertEqual(self.shortcut.read_bytes(), before_shortcut)
