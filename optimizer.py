@@ -84,8 +84,18 @@ def atomic_json(path, value):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + "." + str(os.getpid()) + ".tmp")
-    tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
-    os.replace(tmp, path)
+    try:
+        tmp.write_text(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False), encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                break
+            except PermissionError:
+                if attempt == 4:
+                    raise
+                time.sleep(0.05)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def load_config():
@@ -703,7 +713,15 @@ class Optimizer:
     def write_status(self, **updates):
         self.status.update(updates)
         self.status["updated_at"] = iso()
-        atomic_json(STATE / "status.json", self.status)
+        self.status.pop("storage_error", None)
+        try:
+            atomic_json(STATE / "status.json", self.status)
+        except OSError as error:
+            # The UI snapshot can be retried on the next update. Durable selection
+            # journals use atomic_json directly and must still fail on write errors.
+            self.status["storage_error"] = str(error)
+            return False
+        return True
 
     def reload_config(self):
         previous = self.cfg
