@@ -99,12 +99,12 @@ class SwitchPolicyTests(unittest.TestCase):
         stats = [self.node("current", 500), self.node("backup", 350)]
         self.assertEqual(self.choose(stats), "backup")
 
-    def test_exact_sixty_ms_and_fifteen_percent_boundaries_allow_switch(self):
-        stats = [self.node("current", 400), self.node("backup", 340)]
+    def test_exact_sixty_ms_and_twenty_five_percent_boundaries_allow_switch(self):
+        stats = [self.node("current", 240), self.node("backup", 180)]
         self.assertEqual(self.choose(stats), "backup")
 
     def test_relative_improvement_alone_does_not_allow_switch(self):
-        stats = [self.node("current", 200), self.node("backup", 165)]
+        stats = [self.node("current", 200), self.node("backup", 145)]
         self.assertIsNone(self.choose(stats))
 
     def test_absolute_improvement_alone_does_not_allow_switch(self):
@@ -117,7 +117,8 @@ class SwitchPolicyTests(unittest.TestCase):
 
     def test_exact_cooldown_boundary_allows_switch(self):
         stats = [self.node("current", 500), self.node("backup", 350)]
-        self.assertEqual(self.choose(stats, last_switch_at=1000, now=1600), "backup")
+        self.assertIsNone(self.choose(stats, last_switch_at=1000, now=2799))
+        self.assertEqual(self.choose(stats, last_switch_at=1000, now=2800), "backup")
 
     def test_explicit_current_failure_bypasses_cooldown(self):
         stats = [self.node("current", 500), self.node("backup", 350)]

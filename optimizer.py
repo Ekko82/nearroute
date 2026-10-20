@@ -56,9 +56,9 @@ DEFAULTS = {
     "concurrency": 6,
     "shortlist_size": 12,
     "confirmation_rounds": 2,
-    "min_improvement_ms": 25,
-    "min_improvement_ratio": 0.15,
-    "switch_cooldown_seconds": 600,
+    "min_improvement_ms": 60,
+    "min_improvement_ratio": 0.25,
+    "switch_cooldown_seconds": 1800,
     "manual_selection_grace_seconds": 600,
     "max_candidate_attempts": 3,
     "node_quarantine_seconds": 1800,
@@ -430,7 +430,7 @@ def summarize_samples(name, samples, min_samples=3):
 
 
 def choose_candidate(stats, current, last_switch_at, now, min_improvement_ms=60,
-                     min_improvement_ratio=0.15, cooldown_seconds=600, current_failed=False):
+                     min_improvement_ratio=0.25, cooldown_seconds=1800, current_failed=False):
     viable = [s for s in stats if s.get("eligible") and s.get("score_ms") is not None
               and math.isfinite(s["score_ms"])]
     if current_failed:
@@ -656,28 +656,88 @@ def event(kind, **details):
 
 
 class LogSignals:
-    """Counts only new transport retry messages. Never copies logs or prompts."""
+    """Counts recent transport errors without retaining log bodies."""
     def __init__(self, path):
         self.enabled = bool(path)
         self.path = Path(path)
         self.last_id = None
+        self.last_new_error_at = None
         self.recent = collections.deque()
+        self._unpaired = {}
+
+    @staticmethod
+    def _responses_request(body):
+        method = re.search(r'\bmethod\s*=\s*[\"\']?([A-Za-z]+)\b', body)
+        if method and method.group(1).upper() != "POST":
+            return False
+        failed_url = re.search(r'error sending request for url \((https?://[^\s)]+)\)', body, re.I)
+        structured_url = re.search(r'\burl\s*=\s*[\"\']?(https?://[^\s\"\']+)', body, re.I)
+        match = failed_url or structured_url
+        if not match:
+            return False
+        try:
+            url = urllib.parse.urlsplit(match.group(1).rstrip(',)}]'))
+            return (url.scheme == "https" and url.hostname == "chatgpt.com"
+                    and url.path == "/backend-api/codex/responses")
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _error_key(process, thread, body, kind):
+        turn = re.search(r'\bturn_id\s*=\s*[\"\']?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b', body)
+        retry = re.search(r'\bretries\s*=\s*(\d+)\b', body)
+        if process and thread and turn and retry:
+            return process, thread, turn.group(1), int(retry.group(1)), kind
+        return None
+
     def poll(self):
+        self.last_new_error_at = None
         if not self.enabled:
             return 0
         now = time.time()
+        cutoff = now - 180
+        self.recent = collections.deque(stamp for stamp in self.recent if stamp >= cutoff)
+        self._unpaired = {key: [item for item in pending if item[0] >= cutoff]
+                          for key, pending in self._unpaired.items() if any(item[0] >= cutoff for item in pending)}
+        db = None
         try:
-            uri = self.path.as_uri() + "?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=0.15) as db:
-                highest = db.execute("SELECT MAX(id) FROM logs").fetchone()[0] or 0
-                if self.last_id is not None and highest >= self.last_id:
-                    rows = db.execute("SELECT ts FROM logs WHERE id>? AND target LIKE '%responses_retry%' AND (feedback_log_body LIKE '%error sending request%' OR feedback_log_body LIKE '%error decoding response body%')", (self.last_id,)).fetchall()
-                    self.recent.extend(float(r[0]) for r in rows if r[0] >= now - 180)
-                self.last_id = highest
+            uri = self.path.absolute().as_uri() + "?mode=ro"
+            db = sqlite3.connect(uri, uri=True, timeout=0.15)
+            highest = db.execute("SELECT MAX(id) FROM logs").fetchone()[0] or 0
+            if self.last_id is not None and highest > self.last_id:
+                rows = db.execute("""SELECT ts,process_uuid,thread_id,target,feedback_log_body FROM logs
+                    WHERE id>? AND id<=? AND
+                    ((target LIKE '%responses_retry%' AND
+                      (feedback_log_body LIKE '%error sending request%' OR feedback_log_body LIKE '%error decoding response body%'))
+                     OR (target='codex_http_client::client' AND feedback_log_body LIKE '%error sending request%'))
+                    ORDER BY id""", (self.last_id, highest)).fetchall()
+                for stamp, process, thread, target, raw in rows:
+                    body = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw or '')
+                    source = "client" if target == "codex_http_client::client" else "retry"
+                    if source == "client" and not self._responses_request(body):
+                        continue
+                    kind = "decode" if "error decoding response body" in body.lower() else "send"
+                    stamp = float(stamp)
+                    key = self._error_key(process, thread, body, kind)
+                    if key is not None:
+                        pending = self._unpaired.setdefault(key, [])
+                        duplicate = next((i for i, item in enumerate(pending)
+                                          if item[1] != source and abs(stamp - item[0]) <= 2), None)
+                        if duplicate is not None:
+                            pending.pop(duplicate)
+                            if not pending:
+                                del self._unpaired[key]
+                            continue
+                        pending.append((stamp, source))
+                    if stamp >= cutoff:
+                        self.recent.append(stamp)
+                    self.last_new_error_at = max(stamp, self.last_new_error_at or stamp)
+            self.last_id = highest
         except (OSError, sqlite3.Error):
             pass
-        while self.recent and self.recent[0] < now - 180:
-            self.recent.popleft()
+        finally:
+            if db is not None:
+                db.close()
         return len(self.recent)
 
 
@@ -701,7 +761,9 @@ class Optimizer:
         self.manual_revision = 0
         self.scan_display_names = []
         self.last_health = 0.0
-        self.last_signal_scan = 0.0
+        self.last_signal_poll = 0.0
+        self.recovery_until = 0.0
+        self.recovery_scan_pending = False
         self.observed_selection = None
         self.tentative = False
         self.sync_probe_history()
@@ -744,9 +806,12 @@ class Optimizer:
             self.observed_selection = None
             self.failures = 0
             self.scan_display_names = []
-            self.next_scan = self.last_scan = self.last_health = self.last_signal_scan = 0
+            self.next_scan = self.last_scan = self.last_health = self.last_signal_poll = 0
+            self.recovery_until = 0.0
+            self.recovery_scan_pending = False
             self.status.update(selected=None, health=None, nodes=[], manual_until=None,
-                               last_switch_at=None, last_health_at=None, consecutive_health_failures=0)
+                               last_switch_at=None, last_health_at=None, consecutive_health_failures=0,
+                               transport_recovery_until=None)
             self.state_context = context
         self.sync_probe_history()
 
@@ -768,6 +833,33 @@ class Optimizer:
     def verify_path(self, general, idle_seconds=0, cancel=None):
         return verify_current_path(general, idle_seconds, cancel,
                                    probe_url=self.cfg["probe_url"], expected_statuses=self.cfg["probe_expected_statuses"])
+
+    def poll_transport_signals(self, *, force=False):
+        now = time.time()
+        if not force and now - self.last_signal_poll < 5:
+            return
+        self.last_signal_poll = now
+        errors = self.signals.poll()
+        self.status["network_errors_recent"] = errors
+        new_error = self.signals.last_new_error_at
+        deadline = min(now, new_error) + 60 if new_error is not None else 0
+        if now < deadline:
+            self.recovery_until = max(self.recovery_until, deadline)
+            self.recovery_scan_pending = True
+        self.status["transport_recovery_until"] = iso(self.recovery_until) if now < self.recovery_until else None
+
+    def transport_recovery_active(self, *, force=False):
+        self.poll_transport_signals(force=force)
+        return self.cfg["enabled"] and self.failures < 2 and time.time() < self.recovery_until
+
+    def defer_recovery_scan(self, *, force=False):
+        if not self.transport_recovery_active(force=force):
+            return False
+        self.next_scan = max(self.next_scan, self.recovery_until)
+        self.recovery_scan_pending = True
+        self.write_status(phase="monitoring", next_scan_at=iso(self.recovery_until),
+                          message="Codex 正在恢复连接，暂缓后台测速和自动换点")
+        return True
 
     def publish_active_path(self, general, proxies, group, **updates):
         selected = resolve_leaf(proxies, proxies[group].get("now")) if group else "DIRECT"
@@ -904,14 +996,16 @@ class Optimizer:
             result.append(row)
         return sorted(result, key=lambda row: (not row["eligible"], row["score_ms"] if row["score_ms"] is not None else float("inf"), row["name"]))
 
-    def measure_round(self, names, title):
+    def measure_round(self, names, title, *, forced=False):
         policy = selection_policy(self.cfg)
         results = {}
+        if not forced and self.transport_recovery_active():
+            return results
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(self.cfg["concurrency"]))
         pending = {executor.submit(self.api.delay, name): name for name in names}
         try:
             for future in concurrent.futures.as_completed(pending):
-                if self.stopping():
+                if self.stopping() or (not forced and self.transport_recovery_active()):
                     break
                 name = pending[future]
                 delay = future.result()
@@ -960,6 +1054,8 @@ class Optimizer:
 
     def change_candidate(self, general, group, previous, candidate, *, expected_path=None):
         self.recover_pending()
+        if self.defer_recovery_scan(force=True):
+            return False
         policy = selection_policy(self.cfg)
         mode = active_mode(general, group)
         self.protect_original(group, previous)
@@ -979,14 +1075,19 @@ class Optimizer:
             general, latest, _ = self.require_active_mode(mode, expected_path)
             if latest.get(group, {}).get("now") != previous:
                 return False
+            if self.defer_recovery_scan(force=True):
+                return False
             self.api.select(group, candidate)
             result = self.verify_path(general, self.cfg["verification_idle_seconds"],
-                                      cancel=lambda: self.stopping() or (STATE / "select.request.json").exists())
+                                      cancel=lambda: self.stopping() or (STATE / "select.request.json").exists()
+                                      or self.transport_recovery_active())
             _, latest, _ = self.require_active_mode(mode)
             self.reload_config()
             if latest.get(group, {}).get("now") != candidate:
                 event("selection_changed_during_validation", group=group)
                 return False
+            if result["ok"] and self.transport_recovery_active(force=True):
+                result = {"ok": False, "cancelled": True, "reason": "Codex 正在恢复连接，已取消普通自动换点"}
             if (result["ok"] and self.cfg["enabled"] and not self.stopping() and not (STATE / "select.request.json").exists()
                     and selection_policy(self.cfg) == policy
                     and bool(scan_candidates([candidate], self.cfg))):
@@ -1055,6 +1156,10 @@ class Optimizer:
 
     def _scan(self, forced=False):
         self.reload_config()
+        if not forced and self.defer_recovery_scan(force=True):
+            return
+        if not self.transport_recovery_active():
+            self.recovery_scan_pending = False
         revision = self.manual_revision
         policy = selection_policy(self.cfg)
         general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
@@ -1087,15 +1192,19 @@ class Optimizer:
                           nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
                           scan_node_count=len(names), excluded_node_count=len(all_names) - len(names),
                           region_counts=dict(collections.Counter(node_region(name) for name in names)))
-        fresh = self.measure_round(names, "所选节点初测")
+        fresh = self.measure_round(names, "所选节点初测", forced=forced)
         if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
+            return
+        if not forced and self.defer_recovery_scan():
             return
         self.require_active_mode(mode, path)
         shortlist = select_shortlist(fresh, current, int(self.cfg["shortlist_size"]), self.cfg["prefer_japan"])
         for round_no in range(int(self.cfg["confirmation_rounds"])):
             if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
                 return
-            self.measure_round(shortlist, f"候选复测 {round_no + 1}/{int(self.cfg['confirmation_rounds'])}")
+            self.measure_round(shortlist, f"候选复测 {round_no + 1}/{int(self.cfg['confirmation_rounds'])}", forced=forced)
+            if not forced and self.defer_recovery_scan():
+                return
             self.require_active_mode(mode, path)
         if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return
@@ -1124,6 +1233,8 @@ class Optimizer:
         if self.dry_run or not self.cfg["enabled"]:
             self.write_status(phase="paused" if not self.cfg["enabled"] else "monitoring", message="测速完成；本轮仅测量，未切换")
             return
+        if self.defer_recovery_scan():
+            return
         if time.time() < self.manual_until and self.failures < 2:
             self.write_status(message="检测到手动选点，暂时尊重手动选择")
             return
@@ -1133,9 +1244,10 @@ class Optimizer:
         self.write_status(health=health)
         if not health["ok"]:
             confirmation = self.verify_path(general)
-            if not confirmation["ok"]:
-                self.failures += 1
+            self.failures = 0 if confirmation["ok"] else self.failures + 1
         self.require_active_mode(mode, path)
+        if self.defer_recovery_scan():
+            return
         stats = ranking()
         tried = set()
         reason = "测速完成"
@@ -1163,6 +1275,8 @@ class Optimizer:
                 break
             self.recover_pending()
             if self.process_manual_selection():
+                return
+            if self.defer_recovery_scan():
                 return
             tried.add(candidate)
             stats = ranking()
@@ -1205,12 +1319,8 @@ class Optimizer:
         self.failures = 0 if result["ok"] else self.failures + 1
         if self.failures >= 2 and time.time() - self.last_scan >= 30:
             self.next_scan = 0
-        errors = self.signals.poll()
-        # Transport error signals expedite measurement, not blind node rotation.
-        if errors >= 2 and time.time() - self.last_signal_scan > 120 and time.time() - self.last_scan > 60:
-            self.next_scan = 0
-            self.last_signal_scan = time.time()
-            event("transport_errors_recheck", errors_recent=errors)
+        self.poll_transport_signals()
+        errors = self.status.get("network_errors_recent", 0)
         self.write_status(controller_available=True, mode=latest_path[0], group=group, selected=latest_path[3],
                           health=result, network_errors_recent=errors, consecutive_health_failures=self.failures,
                           last_health_at=iso(), next_scan_at=iso(self.next_scan) if self.next_scan else iso(),
@@ -1222,13 +1332,15 @@ class Optimizer:
         while not self.stopping():
             try:
                 self.reload_config()
+                self.poll_transport_signals()
                 if self.process_manual_selection():
                     continue
                 requested = STATE / "scan.request"
                 forced = requested.exists()
                 if forced:
                     requested.unlink(missing_ok=True)
-                if forced or (self.cfg["enabled"] and time.time() >= self.next_scan):
+                recovery_scan_due = self.recovery_scan_pending and time.time() >= self.recovery_until
+                if forced or (self.cfg["enabled"] and (time.time() >= self.next_scan or recovery_scan_due)):
                     self.scan(forced=forced)
                 elif self.cfg["enabled"] and time.time() - self.last_health >= self.cfg["health_interval_seconds"]:
                     self.tick_health()

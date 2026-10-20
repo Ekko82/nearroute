@@ -69,6 +69,7 @@ class RuntimeTests(unittest.TestCase):
         self.api = FakeController()
         self.signals = MagicMock()
         self.signals.poll.return_value = 0
+        self.signals.last_new_error_at = None
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.stack.enter_context(patch.object(optimizer, "STATE", self.state))
@@ -454,8 +455,8 @@ class RuntimeTests(unittest.TestCase):
     def test_policy_changed_during_measurements_schedules_new_scan_without_switching(self):
         self.region_nodes()
         original_measure = self.helper.measure_round
-        def measure_then_change_policy(names, title):
-            result = original_measure(names, title)
+        def measure_then_change_policy(names, title, **kwargs):
+            result = original_measure(names, title, **kwargs)
             self.cfg["prefer_japan"] = False
             return result
         with patch.object(self.helper, "measure_round", side_effect=measure_then_change_policy):
