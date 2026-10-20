@@ -6,6 +6,6 @@
 - 更新保留用户配置、节点记录和启动设置，安装失败会还原旧版程序。
 - 保留日本优先、附近地区扫描、手动选点及 Codex 连接恢复保护。
 
-下载 `NearRoute-0.1.0-windows.zip` 并解压，使用带 tkinter 的 Python 3.10+ 运行 `install.ps1`。已有用户请先退出旧版，将包内程序文件覆盖到原目录，保留自己的 `config.json` 和 `state/`。
+下载 `NearRoute-0.1.1-windows.zip` 并解压，使用带 tkinter 的 Python 3.10+ 运行 `install.ps1`。已有用户请先退出旧版，将包内程序文件覆盖到原目录，保留自己的 `config.json` 和 `state/`。
 
 Git 源码检出目录支持版本提醒与 Release 下载页，使用 `git pull --ff-only` 更新源码。安装包目录支持应用内安装。

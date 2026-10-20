@@ -2,6 +2,7 @@
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -46,6 +47,7 @@ class UpdateWorkerTests(unittest.TestCase):
         shutil.copy2(self.base / "dist" / metadata["asset"], self.prepared / "package.zip")
         (self.prepared / "release.json").write_text(json.dumps(asdict(self.release)), encoding="utf-8")
 
+    @unittest.skipUnless(os.name == "nt", "Installer handoff uses the Windows helper mutex")
     def test_detached_worker_waits_for_parent_updates_and_restarts_without_a_gui(self):
         gate = self.base / "parent-can-exit"
         parent_code = (
@@ -98,7 +100,7 @@ class UpdateWorkerTests(unittest.TestCase):
         self.assertEqual(updater.current_version(self.root), "0.0.0")
         self.assertFalse(updater.read_update_result(self.root)["success"])
         self.assertEqual(stop.call_args.args[0][-1], "stop")
-        self.assertEqual(restart.call_args.args[0][-1], str(self.root / "dashboard.py"))
+        self.assertEqual(Path(restart.call_args.args[0][-1]).resolve(), (self.root / "dashboard.py").resolve())
         self.assertFalse(updater.is_installing(self.root))
 
 

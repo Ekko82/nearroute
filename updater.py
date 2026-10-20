@@ -521,7 +521,7 @@ def main():
         _run_installer(args.apply, args.root, args.parent, args.python)
     finally:
         # This CLI runs from its own temporary copy, never from the installation.
-        if ROOT.name.startswith("nearroute-updater-") and ROOT.parent == Path(tempfile.gettempdir()):
+        if ROOT.name.startswith("nearroute-updater-") and ROOT.parent == Path(tempfile.gettempdir()).resolve():
             os.chdir(tempfile.gettempdir())
             shutil.rmtree(ROOT)
 
