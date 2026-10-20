@@ -55,7 +55,7 @@ class InstallLifecycleTests(unittest.TestCase):
                                 "'" + str(self.desktop).replace("'", "''") + "'")
             self.assertNotIn(RUN_KEY, text, "the real startup key must never enter the fixture")
             (self.app / name).write_text(text, encoding="utf-8-sig")
-        for name in ("windows_app.py", "config.example.json"):
+        for name in ("windows_app.py", "updater.py", "VERSION", "config.example.json"):
             shutil.copy2(ROOT / name, self.app / name)
         (self.app / "assets").mkdir()
         shutil.copy2(ROOT / "assets/nearroute.ico", self.app / "assets/nearroute.ico")

@@ -1463,6 +1463,9 @@ def main():
     if args.command == "restore":
         restore_original()
         return
+    from updater import is_installing
+    if is_installing(ROOT):
+        return
     lock = InstanceLock()
     if not lock.acquire():
         if args.command == "scan":

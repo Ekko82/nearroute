@@ -17,6 +17,7 @@ from ctypes import wintypes
 import hashlib
 import os
 from pathlib import Path
+import queue
 import threading
 from typing import Callable
 
@@ -32,15 +33,19 @@ WM_DPICHANGED = 0x02E0
 WM_USER = 0x0400
 WM_APP = 0x8000
 WM_TRAY = WM_APP + 71
+WM_NOTIFICATION = WM_APP + 72
 NIN_SELECT = WM_USER
 NIN_KEYSELECT = WM_USER + 1
+NIN_BALLOONUSERCLICK = WM_USER + 5
 NIM_ADD = 0
+NIM_MODIFY = 1
 NIM_DELETE = 2
 NIM_SETFOCUS = 3
 NIM_SETVERSION = 4
 NIF_MESSAGE = 0x01
 NIF_ICON = 0x02
 NIF_TIP = 0x04
+NIF_INFO = 0x10
 NIF_SHOWTIP = 0x80
 NOTIFYICON_VERSION_4 = 4
 ICON_ID = 1
@@ -232,6 +237,7 @@ class TrayIcon:
         self._available = threading.Event()
         self._stop_requested = threading.Event()
         self._lifecycle_lock = threading.Lock()
+        self._notifications = queue.SimpleQueue()
         self.last_error = None
 
     @property
@@ -265,6 +271,33 @@ class TrayIcon:
                 api.PostThreadMessageW(self._native_thread_id, WM_QUIT, 0, 0)
         if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=5)
+
+    def show_notification(self, title: str, text: str) -> bool:
+        """Queue a shell notification without touching tray data from the GUI thread."""
+        if not self.available or self._stop_requested.is_set():
+            return False
+        self._notifications.put((str(title), str(text)))
+        return bool(self._api.PostMessageW(self._hwnd, WM_NOTIFICATION, 0, 0))
+
+    def _show_notification(self):
+        pending = None
+        try:
+            while True:
+                pending = self._notifications.get_nowait()
+        except queue.Empty:
+            pass
+        if pending is None or not self.available or self._stop_requested.is_set():
+            return
+        data = NOTIFYICONDATAW()
+        data.cbSize = ctypes.sizeof(data)
+        data.hWnd = self._hwnd
+        data.uID = ICON_ID
+        data.uFlags = NIF_INFO
+        title, text = pending
+        data.szInfoTitle = title.replace("\0", " ").encode("utf-16-le", errors="replace")[:126].decode("utf-16-le", errors="ignore")
+        data.szInfo = text.replace("\0", " ").encode("utf-16-le", errors="replace")[:510].decode("utf-16-le", errors="ignore")
+        data.dwInfoFlags = 0x01 | 0x80  # NIIF_INFO | NIIF_RESPECT_QUIET_TIME
+        self._api.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data))
 
     def _emit(self, action: str) -> None:
         # All call sites are reached by the tray thread or its native window proc.
@@ -366,6 +399,9 @@ class TrayIcon:
             self._api.Shell_NotifyIconW(NIM_SETFOCUS, ctypes.byref(self._data))
 
     def _window_message(self, hwnd, message, wparam, lparam):
+        if message == WM_NOTIFICATION:
+            self._show_notification()
+            return 0
         if message == WM_CLOSE:
             if self._in_menu:
                 self._api.EndMenu()
@@ -390,7 +426,7 @@ class TrayIcon:
             event, icon_id = _decode_event(int(wparam), int(lparam), self._version4)
             if icon_id != ICON_ID or self._stop_requested.is_set():
                 return 0
-            if event in (WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT):
+            if event in (WM_LBUTTONDBLCLK, NIN_SELECT, NIN_KEYSELECT, NIN_BALLOONUSERCLICK):
                 self._emit("open")
             elif event == WM_CONTEXTMENU or (not self._version4 and event == WM_RBUTTONUP):
                 self._show_menu(hwnd)

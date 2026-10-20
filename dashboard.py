@@ -14,12 +14,14 @@ import sys
 import tempfile
 import threading
 import time
+import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 
 import optimizer as core
+import updater
 from tray_icon import ICON_PATH, TrayIcon, request_restore
 from windows_app import clear_window, configure_taskbar, configure_window
 
@@ -497,8 +499,87 @@ class SettingsDialog:
             self.owner.settings_dialog = None
 
 
+class UpdateDialog:
+    """Release notes and preferences; all network work belongs to the owner."""
+
+    def __init__(self, owner: Dashboard):
+        self.owner = owner
+        self.closed = False
+        self.window = tk.Toplevel(owner.root)
+        self.window.title("近舟更新")
+        self.window.geometry("660x530")
+        self.window.minsize(520, 420)
+        self.window.transient(owner.root)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        form = ttk.Frame(self.window, padding=20)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(0, weight=1)
+        form.rowconfigure(2, weight=1)
+        self.summary = tk.StringVar()
+        ttk.Label(form, textvariable=self.summary, wraplength=610).grid(row=0, column=0, sticky="ew")
+        ttk.Label(form, text="更新说明", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(14, 5))
+        notes_frame = ttk.Frame(form)
+        notes_frame.grid(row=2, column=0, sticky="nsew")
+        notes_frame.columnconfigure(0, weight=1)
+        notes_frame.rowconfigure(0, weight=1)
+        self.notes = tk.Text(notes_frame, wrap="word", height=8, font=("Microsoft YaHei UI", 10))
+        self.notes.grid(row=0, column=0, sticky="nsew")
+        scrollbar = ttk.Scrollbar(notes_frame, command=self.notes.yview)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        self.notes.configure(yscrollcommand=scrollbar.set)
+        self.auto_check = tk.BooleanVar(value=owner.update_preferences["auto_check"])
+        self.mode = tk.StringVar(value=owner.update_preferences["mode"])
+        ttk.Checkbutton(form, text="自动检查新版本（每 6 小时）", variable=self.auto_check).grid(row=3, column=0, sticky="w", pady=(14, 4))
+        modes = ttk.Frame(form)
+        modes.grid(row=4, column=0, sticky="w")
+        for label, value in (("提醒后由我安装", "notify"), ("自动下载，提醒安装", "download"), ("空闲时自动安装并重启", "install")):
+            button = ttk.Radiobutton(modes, text=label, value=value, variable=self.mode)
+            button.pack(anchor="w", pady=2)
+            if value != "notify" and not owner.update_can_install:
+                button.state(["disabled"])
+        if not owner.update_can_install:
+            ttk.Label(form, text="当前从源码运行，可查看版本并打开下载页；安装包支持应用内更新。", style="Muted.TLabel", wraplength=610).grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        actions = ttk.Frame(form)
+        actions.grid(row=6, column=0, sticky="ew", pady=(16, 0))
+        self.check_button = ttk.Button(actions, text="立即检查", command=lambda: owner.check_updates(manual=True))
+        self.check_button.pack(side="left")
+        self.install_button = ttk.Button(actions, command=owner.request_update_install)
+        self.install_button.pack(side="left", padx=8)
+        ttk.Button(actions, text="保存设置", command=self.save).pack(side="right")
+        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=8)
+        self.refresh()
+
+    def refresh(self) -> None:
+        owner = self.owner
+        self.summary.set(owner.update_text.get())
+        release = owner.update_release
+        self.notes.configure(state="normal")
+        self.notes.delete("1.0", tk.END)
+        self.notes.insert("1.0", release.notes if release else "检查后将在这里显示新版本的更新说明。")
+        self.notes.configure(state="disabled")
+        busy = bool(owner.update_busy) or owner.exiting
+        self.check_button.state(["disabled"] if busy else ["!disabled"])
+        self.install_button.configure(text=("打开下载页" if not owner.update_can_install else "安装并重启" if owner.update_prepared else "下载并安装"))
+        self.install_button.state(["disabled"] if busy or release is None else ["!disabled"])
+
+    def save(self) -> None:
+        try:
+            self.owner.update_preferences = updater.save_preferences(self.auto_check.get(), self.mode.get(), root=ROOT)
+        except (updater.UpdateError, OSError, ValueError) as error:
+            messagebox.showerror("未能保存更新设置", str(error), parent=self.window)
+            return
+        self.owner.update_next_check = 0.0
+        self.owner.notify("更新设置已保存。", 10)
+        self.close()
+
+    def close(self) -> None:
+        self.closed = True
+        self.owner.update_dialog = None
+        self.window.destroy()
+
+
 class Dashboard:
-    def __init__(self, root: tk.Tk, *, start_service: bool = True, enable_tray: bool = True):
+    def __init__(self, root: tk.Tk, *, start_service: bool = True, enable_tray: bool = True, enable_updates: bool = True):
         self.root = root
         self.closed = False
         self.results: queue.SimpleQueue[tuple[bool, str]] = queue.SimpleQueue()
@@ -522,6 +603,16 @@ class Dashboard:
         self.settings_dialog: SettingsDialog | None = None
         self.started_at = time.monotonic()
         self.after_id = None
+        self.updates_enabled = enable_updates and start_service
+        self.update_results: queue.SimpleQueue = queue.SimpleQueue()
+        self.update_busy = None
+        self.update_release = updater.cached_release(root=ROOT)
+        self.update_prepared = None
+        self.update_requested_install = False
+        self.update_dialog = None
+        self.update_next_check = 0.0
+        self.update_can_install = updater.can_install(root=ROOT)
+        self.update_preferences = updater.load_preferences(root=ROOT)
 
         root.title(WINDOW_TITLE)
         if os.name == "nt":
@@ -632,6 +723,18 @@ class Dashboard:
         )
         footer_label.grid(row=6, column=0, sticky="ew", pady=(14, 0))
         self.wrapping_labels.append(footer_label)
+        update_row = ttk.Frame(container)
+        update_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
+        update_row.columnconfigure(0, weight=1)
+        self.update_text = tk.StringVar(value=f"版本 {updater.current_version(root=ROOT)}")
+        if self.update_release is not None:
+            action = "查看并安装" if self.update_can_install else "查看更新与下载页"
+            self.update_text.set(f"发现新版本 {self.update_release.version}，点击“版本与更新”{action}。")
+        self.update_label = ttk.Label(update_row, textvariable=self.update_text, style="Muted.TLabel", wraplength=790)
+        self.update_label.grid(row=0, column=0, sticky="w")
+        self.wrapping_labels.append(self.update_label)
+        self.update_button = ttk.Button(update_row, text="版本与更新", command=self.open_updates)
+        self.update_button.grid(row=0, column=1, sticky="e")
         container.bind("<Configure>", self.resize_text)
         try:
             if start_service:
@@ -643,6 +746,10 @@ class Dashboard:
                     self.tray = None
                     self.notify("系统托盘暂不可用，点击 × 将最小化到任务栏。", 15)
             self.poll_tray()
+            if self.updates_enabled:
+                result = updater.read_update_result(root=ROOT)
+                if result and self.update_release is None:
+                    self.update_text.set(str(result.get("message") or "更新已完成。"))
             self.refresh()
         except Exception:
             self.close()
@@ -651,6 +758,159 @@ class Dashboard:
     def notify(self, text: str, duration: float = 8.0) -> None:
         self.message.set(text)
         self.notice_until = time.monotonic() + duration
+
+    def open_updates(self) -> None:
+        if self.exiting:
+            return
+        if self.update_dialog is not None and not self.update_dialog.closed:
+            self.update_dialog.window.lift()
+            return
+        self.update_dialog = UpdateDialog(self)
+
+    def update_worker(self, operation: str, work) -> None:
+        """Workers publish plain values; only refresh is allowed to touch Tk."""
+        self.update_busy = operation
+
+        def worker() -> None:
+            try:
+                self.update_results.put((operation, True, work()))
+            except (updater.UpdateError, OSError, ValueError, subprocess.SubprocessError) as error:
+                self.update_results.put((operation, False, str(error)))
+
+        try:
+            threading.Thread(target=worker, name=f"nearroute-update-{operation}", daemon=True).start()
+        except RuntimeError as error:
+            self.update_results.put((operation, False, str(error)))
+        if self.update_dialog is not None:
+            self.update_dialog.refresh()
+
+    def check_updates(self, *, manual: bool = False) -> None:
+        if self.closed or self.exiting or self.update_busy:
+            return
+        if not manual and not updater.check_due(root=ROOT):
+            return
+        self.update_text.set("正在检查新版本…")
+        self.update_worker("check", lambda: updater.check_for_update(root=ROOT))
+
+    def request_update_install(self) -> None:
+        if self.closed or self.exiting or self.update_busy or self.update_release is None:
+            return
+        if not self.update_can_install:
+            webbrowser.open(self.update_release.url)
+            return
+        if self.restore_busy or self.manual_busy:
+            self.notify("正在处理节点操作，请完成后再安装更新。", 15)
+            return
+        if not messagebox.askyesno("安装近舟更新", "安装更新会停止后台优选并重启近舟。保留现有设置和当前代理节点，是否继续？", parent=self.root):
+            return
+        self.update_requested_install = True
+        if self.update_prepared is not None:
+            self.begin_update_install()
+        else:
+            release = self.update_release
+            self.update_text.set(f"正在下载并校验版本 {release.version}…")
+            self.update_worker("prepare", lambda: updater.prepare_update(release, root=ROOT))
+
+    def begin_update_install(self) -> None:
+        if self.closed or self.exiting or self.update_busy or self.restore_busy or self.manual_busy:
+            return
+        if self.update_prepared is None or not self.update_can_install:
+            return
+        self.exiting = True  # Also blocks daemon starts and all conflicting node actions.
+        self.cancel_service_start()
+        self.update_text.set("正在准备安装，近舟即将重新启动…")
+        prepared = self.update_prepared
+        helpers = list(self.started_helpers)
+
+        def handoff():
+            if not wait_for_helper_startup(helpers):
+                raise updater.UpdateError("后台仍在启动，请稍后重试安装。")
+            updater.start_installer(prepared, parent_pid=os.getpid(), python_exe=python_executable(), root=ROOT)
+
+        self.update_worker("install", handoff)
+
+    def automatic_install_ready(self, status: dict) -> bool:
+        if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.update_busy:
+            return False
+        if self.settings_dialog is not None and not self.settings_dialog.closed:
+            return False
+        if status.get("phase") not in ("monitoring", "paused", "waiting", "stopped"):
+            return False
+        recovery = status.get("transport_recovery_until")
+        if recovery:
+            try:
+                until = datetime.fromisoformat(str(recovery).replace("Z", "+00:00"))
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=CHINA_TIME)
+                if until > datetime.now(CHINA_TIME):
+                    return False
+            except ValueError:
+                return False
+        return True
+
+    def poll_updates(self, status: dict) -> None:
+        if not getattr(self, "updates_enabled", False) or self.closed:
+            return
+        try:
+            while True:
+                operation, success, result = self.update_results.get_nowait()
+                self.update_busy = None
+                if not success:
+                    if operation == "install":
+                        self.exiting = False
+                    self.update_requested_install = False
+                    self.update_text.set(f"更新未完成：{result}")
+                    self.update_next_check = time.monotonic() + 1800
+                elif operation == "check":
+                    previous = self.update_release
+                    self.update_release = result
+                    if result is None:
+                        self.update_text.set(f"当前已是最新版本 {updater.current_version(root=ROOT)}")
+                    else:
+                        if previous is None or previous.tag != result.tag:
+                            self.update_prepared = None
+                        action = "查看并安装" if self.update_can_install else "查看更新与下载页"
+                        self.update_text.set(f"发现新版本 {result.version}，点击“版本与更新”{action}。")
+                        if (previous is None or previous.tag != result.tag) and self.tray is not None:
+                            self.tray.show_notification("近舟发现新版本", f"{result.version} 已发布，打开近舟的“版本与更新”{action}。")
+                elif operation == "prepare":
+                    self.update_prepared = result
+                    suffix = "等待节点操作结束后安装并重启。" if self.update_requested_install else "可安装并重启。"
+                    self.update_text.set(f"新版本 {self.update_release.version} 已下载并校验，{suffix}")
+                elif operation == "install":
+                    self.close()
+                    return
+                if self.update_dialog is not None:
+                    self.update_dialog.refresh()
+        except queue.Empty:
+            pass
+        if self.exiting or self.update_busy:
+            return
+        now = time.monotonic()
+        if self.update_preferences["auto_check"] and now >= self.update_next_check:
+            self.update_next_check = now + 300
+            try:
+                self.check_updates()
+            except (updater.UpdateError, OSError, ValueError) as error:
+                self.update_text.set(f"更新检查未完成：{error}")
+                self.update_next_check = now + 1800
+            if self.update_busy:
+                return
+        mode = self.update_preferences["mode"]
+        release = self.update_release
+        if release is None or not self.update_can_install:
+            return
+        auto_prepare = self.update_preferences["auto_check"] and mode in ("download", "install")
+        if self.update_prepared is None and auto_prepare and getattr(self, "update_auto_prepare_attempted", None) != release.tag:
+            self.update_auto_prepare_attempted = release.tag
+            self.update_text.set(f"正在下载并校验版本 {release.version}…")
+            self.update_worker("prepare", lambda: updater.prepare_update(release, root=ROOT))
+        elif self.update_prepared is not None:
+            auto_install = self.update_preferences["auto_check"] and mode == "install" and getattr(self, "update_auto_install_attempted", None) != release.tag
+            if self.update_requested_install or auto_install:
+                if self.automatic_install_ready(status):
+                    self.update_auto_install_attempted = release.tag
+                    self.begin_update_install()
 
     def resize_text(self, event: tk.Event) -> None:
         for label in self.wrapping_labels:
@@ -881,6 +1141,9 @@ class Dashboard:
             status = read_json(STATUS)
         except (OSError, ValueError):
             status = {}
+        self.poll_updates(status)
+        if self.closed:
+            return
         self.poll_manual_selection(status)
         try:
             config = read_json(CONFIG)
@@ -1008,6 +1271,9 @@ class Dashboard:
                 if self.settings_dialog is not None and not self.settings_dialog.closed:
                     self.settings_dialog.window.grab_release()
                     self.settings_dialog.window.withdraw()
+                update_dialog = getattr(self, "update_dialog", None)
+                if update_dialog is not None and not update_dialog.closed:
+                    update_dialog.window.withdraw()
                 self.root.withdraw()
                 self.hidden_to_tray = True
                 return
@@ -1028,6 +1294,10 @@ class Dashboard:
             window.deiconify()
             window.lift()
             window.grab_set()
+        update_dialog = getattr(self, "update_dialog", None)
+        if update_dialog is not None and not update_dialog.closed:
+            update_dialog.window.deiconify()
+            update_dialog.window.lift()
 
     def poll_tray(self) -> None:
         if self.closed:
@@ -1103,6 +1373,12 @@ class Dashboard:
         if self.closed:
             return
         self.closed = True
+        update_dialog = getattr(self, "update_dialog", None)
+        if update_dialog is not None and not update_dialog.closed:
+            try:
+                update_dialog.close()
+            except tk.TclError:
+                pass
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             try:
                 self.settings_dialog.close()
@@ -1130,6 +1406,8 @@ class Dashboard:
 
 
 def main() -> None:
+    if updater.is_installing(root=ROOT):
+        return
     instance = WindowInstance()
     if not instance.acquire():
         return

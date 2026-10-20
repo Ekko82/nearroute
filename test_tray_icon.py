@@ -20,6 +20,31 @@ import tray_icon as tray
 
 
 class TrayUnitTests(unittest.TestCase):
+    def test_update_notification_is_queued_then_shown_by_the_tray_thread(self):
+        icon, api = self.native_icon_fixture()
+        self.assertFalse(icon.show_notification("new version", "open NearRoute"))
+        self.assertTrue(icon._add_icon())
+        api.Shell_NotifyIconW.reset_mock()
+        original_flags = icon._data.uFlags
+        self.assertTrue(icon.show_notification("船🌊" * 80, "更新\0说明🌊" * 100))
+        api.Shell_NotifyIconW.assert_not_called()
+        api.PostMessageW.assert_called_once_with(123, tray.WM_NOTIFICATION, 0, 0)
+        icon._window_message(123, tray.WM_NOTIFICATION, 0, 0)
+        operation, argument = api.Shell_NotifyIconW.call_args.args
+        data = argument._obj
+        self.assertEqual(operation, tray.NIM_MODIFY)
+        self.assertEqual(data.uFlags, tray.NIF_INFO)
+        self.assertEqual(icon._data.uFlags, original_flags)
+        self.assertLessEqual(len(data.szInfoTitle.encode("utf-16-le")), 126)
+        self.assertLessEqual(len(data.szInfo.encode("utf-16-le")), 510)
+        self.assertNotIn("\0", data.szInfo)
+        self.assertTrue(data.dwInfoFlags & 0x80)
+        icon._window_message(123, tray.WM_TRAY, 0, (tray.ICON_ID << 16) | tray.NIN_BALLOONUSERCLICK)
+        icon.on_action.assert_called_once_with("open")
+        icon._stop_requested.set()
+        self.assertFalse(icon.show_notification("newer version", "ignored after exit"))
+        icon._delete_icon()
+
     def native_icon_fixture(self):
         icon = tray.TrayIcon("NearRoute unit icon", "mock-icon-owner", Mock())
         api = Mock()

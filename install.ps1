@@ -39,7 +39,7 @@ function Test-OwnedShortcut {
     finally { if ($null -ne $process) { $process.Dispose() } }
 }
 
-foreach ($name in @('optimizer.py', 'dashboard.py', 'tray_icon.py', 'windows_app.py', 'launch.ps1', 'config.example.json')) {
+foreach ($name in @('VERSION', 'optimizer.py', 'dashboard.py', 'updater.py', 'tray_icon.py', 'windows_app.py', 'launch.ps1', 'config.example.json')) {
     if (-not (Test-Path -LiteralPath (Join-Path $applicationRoot $name) -PathType Leaf)) { throw "安装文件不完整：缺少 $name" }
 }
 $PythonExe = & $launchPath -ResolveOnly -PythonExe $PythonExe
