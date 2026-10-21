@@ -6,6 +6,7 @@ import ctypes
 import hashlib
 import json
 import os
+import platform
 import queue
 import re
 import shutil
@@ -231,6 +232,105 @@ def status_is_stale(status: dict) -> bool:
         return (datetime.now(CHINA_TIME) - updated).total_seconds() > STATUS_STALE_SECONDS
     except ValueError:
         return True
+
+
+def diagnostic_summary(root=None) -> str:
+    """Build a shareable whitelist from local records without changing the installation."""
+    root = ROOT if root is None else Path(root)
+
+    def document(name):
+        try:
+            return "ok", read_json(root / name)
+        except FileNotFoundError:
+            return "missing", {}
+        except (ValueError, UnicodeError):
+            return "invalid", {}
+        except OSError:
+            return "unreadable", {}
+
+    def timestamp(value):
+        if not isinstance(value, str):
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=CHINA_TIME)
+            return parsed.isoformat()
+        except ValueError:
+            return None
+
+    version, version_file = None, "ok"
+    try:
+        version = updater.current_version(root=root)
+    except FileNotFoundError:
+        version_file = "missing"
+    except (ValueError, UnicodeError, updater.UpdateError):
+        version_file = "invalid"
+    except OSError:
+        version_file = "unreadable"
+    config_file, raw_config = document("config.json")
+    cfg = None
+    if config_file == "ok":
+        try:
+            cfg = core.validate_config(raw_config)
+        except (TypeError, ValueError):
+            config_file = "invalid"
+    config = {"file": config_file}
+    if cfg is not None:
+        keys = ("enabled", "health_interval_seconds", "scan_interval_seconds", "switch_cooldown_seconds",
+                "manual_selection_grace_seconds", "concurrency", "scan_mode", "scan_regions")
+        config.update({key: cfg[key] for key in keys})
+        config["codex_log_configured"] = bool(cfg["codex_log_db"])
+
+    status_file, record = document("state/status.json")
+    recorded_at = timestamp(record.get("updated_at"))
+    phases = {"starting", "monitoring", "paused", "waiting", "scanning", "testing", "measuring",
+              "verifying", "stopping", "stopped", "error"}
+    phase = record.get("phase") if isinstance(record.get("phase"), str) and record["phase"] in phases else None
+    stale = status_is_stale({"updated_at": recorded_at}) if status_file == "ok" else None
+    context_matches = record.get("controller_context") == list(core.state_context(cfg)) if cfg is not None else None
+    current = (status_file == "ok" and context_matches is True and stale is False
+               and phase is not None and phase not in ("starting", "stopping", "stopped"))
+    available = record.get("controller_available")
+    health = record.get("health")
+    errors = record.get("network_errors_recent")
+    status = {
+        "file": status_file, "recorded_at": recorded_at, "phase": phase, "stale": stale,
+        "context_matches": context_matches, "current": current,
+        "controller_available": available if current and type(available) is bool else None,
+        "health_ok": health.get("ok") if current and available is True and isinstance(health, dict) and type(health.get("ok")) is bool else None,
+        "network_errors_recent": errors if current and type(errors) is int and errors >= 0 else None,
+        "recorded_last_switch_at": timestamp(record.get("last_switch_at")),
+        "transport_recovery_until": timestamp(record.get("transport_recovery_until")) if current else None,
+    }
+    event_types = {"started", "stopped", "manual_selection", "external_selection_change", "switched", "rollback",
+                   "selection_changed_during_validation", "candidate_rejected", "scan_completed", "restore", "error"}
+    event_files, events = {}, []
+    for name in ("events.previous.jsonl", "events.jsonl"):
+        try:
+            with (root / "state" / name).open("r", encoding="utf-8-sig", errors="replace") as stream:
+                for line in stream:
+                    try:
+                        item = json.loads(line)
+                    except ValueError:
+                        continue
+                    if not isinstance(item, dict) or not isinstance(item.get("event"), str) or item["event"] not in event_types:
+                        continue
+                    at = timestamp(item.get("at"))
+                    if at is not None:
+                        events.append({"type": item["event"], "time": at})
+            event_files[name] = "ok"
+        except FileNotFoundError:
+            event_files[name] = "missing"
+        except OSError:
+            event_files[name] = "unreadable"
+    events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
+    return json.dumps({
+        "generated_at": datetime.now(CHINA_TIME).isoformat(), "version": version, "version_file": version_file,
+        "runtime": {"python": platform.python_version(), "os": platform.system(), "os_version": platform.version()},
+        "config": config, "status": status,
+        "events": {"files": event_files, "installation_recent_events": events[-8:]},
+    }, ensure_ascii=False, indent=2)
 
 
 def display_time(value: object) -> str:
@@ -702,12 +802,61 @@ class ClientDialog:
             self.owner.client_dialog = None
 
 
+class DiagnosticDialog:
+    def __init__(self, owner, *, visible=True):
+        self.owner, self.closed = owner, False
+        self.summary = diagnostic_summary()
+        self.window = tk.Toplevel(owner.window)
+        self.window.title("诊断信息 · 近舟 NearRoute")
+        self.window.geometry("700x560")
+        self.window.transient(owner.window)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        if not visible:
+            self.window.withdraw()
+        form = ttk.Frame(self.window, padding=18)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(0, weight=1)
+        form.rowconfigure(1, weight=1)
+        ttk.Label(form, text="可预览后手动复制。事件为本安装的历史；摘要不会自动发送。", wraplength=650).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+        self.text = tk.Text(form, wrap="word", font=("Consolas", 10))
+        self.text.grid(row=1, column=0, sticky="nsew")
+        self.text.insert("1.0", self.summary)
+        self.text.configure(state="disabled")
+        scrollbar = ttk.Scrollbar(form, command=self.text.yview)
+        scrollbar.grid(row=1, column=1, sticky="ns")
+        self.text.configure(yscrollcommand=scrollbar.set)
+        actions = ttk.Frame(form)
+        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self.copy_message = tk.StringVar(value="")
+        ttk.Label(actions, textvariable=self.copy_message).pack(side="left")
+        ttk.Button(actions, text="复制摘要", command=self.copy_summary).pack(side="right")
+        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=8)
+
+    def copy_summary(self):
+        self.copy_message.set("")
+        try:
+            self.window.clipboard_clear()
+            self.window.clipboard_append(self.summary)
+        except tk.TclError:
+            messagebox.showerror("复制失败", "无法访问系统剪贴板，请稍后重试。", parent=self.window)
+            return
+        self.copy_message.set("已复制诊断摘要。")
+
+    def close(self):
+        if self.closed:
+            return
+        self.closed = True
+        self.owner.diagnostic_dialog = None
+        self.window.destroy()
+
+
 class UpdateDialog:
     """Release notes and preferences; all network work belongs to the owner."""
 
     def __init__(self, owner: Dashboard):
         self.owner = owner
         self.closed = False
+        self.diagnostic_dialog = None
         self.window = tk.Toplevel(owner.root)
         self.window.title("近舟更新")
         self.window.geometry("660x530")
@@ -750,7 +899,14 @@ class UpdateDialog:
         self.install_button.pack(side="left", padx=8)
         ttk.Button(actions, text="保存设置", command=self.save).pack(side="right")
         ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=8)
+        ttk.Button(form, text="诊断信息", command=self.open_diagnostics).grid(row=7, column=0, sticky="w", pady=(12, 0))
         self.refresh()
+
+    def open_diagnostics(self):
+        if self.diagnostic_dialog is not None and not self.diagnostic_dialog.closed:
+            self.diagnostic_dialog.window.lift()
+            return
+        self.diagnostic_dialog = DiagnosticDialog(self)
 
     def refresh(self) -> None:
         owner = self.owner
@@ -777,6 +933,9 @@ class UpdateDialog:
 
     def close(self) -> None:
         self.closed = True
+        diagnostic = getattr(self, "diagnostic_dialog", None)
+        if diagnostic is not None:
+            diagnostic.close()
         self.owner.update_dialog = None
         self.window.destroy()
 
