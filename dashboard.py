@@ -1464,12 +1464,19 @@ class Dashboard:
         node_label = "上次记录节点" if last_known else "当前节点"
         self.current.set(f"{node_label}：{selected}    代理组：{group}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
+        try:
+            scores_match = status.get("nodes_probe_identity") == core.probe_identity(core.validate_config(config))
+        except (TypeError, ValueError):
+            scores_match = False
+        if not scores_match:
+            nodes = [{"name": item.get("name"), "eligible": False,
+                      "reason": "等待按当前测试目标重新测速"} for item in nodes]
         usable = sum(bool(item.get("eligible", False)) for item in nodes)
         errors = status.get("network_errors_recent", 0)
         connection_label = "状态待更新" if stale or stopped or starting else ("已连接" if connected else "未连接")
         self.health.set(f"控制接口：{connection_label}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
         self.timings.set(
-            f"最近测速：{display_time(status.get('last_scan_at'))}    "
+            f"最近测速：{display_time(status.get('last_scan_at') if scores_match else None)}    "
             f"下次测速：{display_time(status.get('next_scan_at'))}    "
             f"最近切换：{display_time(status.get('last_switch_at'))}    "
             f"状态更新：{display_time(status.get('updated_at'))}"

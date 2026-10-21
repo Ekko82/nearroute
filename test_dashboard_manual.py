@@ -289,6 +289,7 @@ class StatusFreshnessTests(unittest.TestCase):
             "pid": 12345, "phase": "monitoring", "controller_available": True,
             "selected": "JP last-known", "nodes": self.nodes,
             "controller_context": list(CLIENT_CONTEXT),
+            "nodes_probe_identity": dashboard.core.probe_identity(dashboard.core.DEFAULTS),
             "mode": DISPLAYED_MODE[0], "group": DISPLAYED_MODE[1],
             "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(),
         }

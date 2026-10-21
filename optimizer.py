@@ -851,6 +851,11 @@ class Optimizer:
         return (STATE / "stop.request").exists()
 
     def write_status(self, **updates):
+        if "nodes" in updates:
+            # Only newly computed rows can establish their probe provenance.
+            if self.status.get("nodes_probe_identity") != self.history_probe:
+                self.status["last_scan_at"] = None
+            self.status["nodes_probe_identity"] = self.history_probe
         self.status.update(updates)
         self.status["controller_context"] = list(self.state_context)
         self.status["updated_at"] = iso()
@@ -1483,6 +1488,11 @@ class Optimizer:
                 reason = "选择已被用户更改，停止本轮切换"
                 break
             stats = ranking()
+        if selection_policy(self.cfg) != policy:
+            self.next_scan = 0
+            self.write_status(nodes=[], phase="monitoring" if self.cfg["enabled"] else "paused",
+                              next_scan_at=iso(), message="测速设置已更新，等待重新测速")
+            return
         final_general, latest, _ = self.require_active_mode(mode)
         final_path = active_path(final_general, latest, group)
         if final_path != self.observed_selection:

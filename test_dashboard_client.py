@@ -288,7 +288,8 @@ class ClientContextTests(unittest.TestCase):
                 self.app.switch_node("old node")
             request.assert_not_called()
             self.app.ensure_service.assert_not_called()
-            old_status = old_status | {"controller_context": list(self.context), "mode": "global", "group": "GLOBAL", "selected": "new node", "nodes": [{"name": "new node"}]}
+            old_status = old_status | {"controller_context": list(self.context), "mode": "global", "group": "GLOBAL", "selected": "new node", "nodes": [{"name": "new node"}],
+                                      "nodes_probe_identity": dashboard.core.probe_identity(dashboard.core.DEFAULTS)}
             self.app.refresh()
             self.assertEqual(self.app.node_context, self.context)
             self.assertEqual(self.app.node_mode, ("global", "GLOBAL"))
@@ -308,6 +309,7 @@ class ClientContextTests(unittest.TestCase):
         cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context)) | {"enabled": False}
         nodes = [{"name": "old node", "eligible": True}]
         status = {"controller_context": list(self.context), "selected": "old node", "nodes": nodes,
+                  "nodes_probe_identity": dashboard.core.probe_identity(dashboard.core.DEFAULTS),
                   "phase": "starting", "pid": 12345, "controller_available": True,
                   "mode": "rule", "group": self.context[2],
                   "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
@@ -349,6 +351,7 @@ class ClientContextTests(unittest.TestCase):
     def test_status_without_actual_selector_mode_cannot_submit_visible_node(self):
         cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context))
         status = {"controller_context": list(self.context), "selected": "visible node", "nodes": [{"name": "visible node"}],
+                  "nodes_probe_identity": dashboard.core.probe_identity(dashboard.core.DEFAULTS),
                   "phase": "monitoring", "controller_available": True,
                   "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
         with patch.object(dashboard, "read_json", side_effect=lambda path: status if path == dashboard.STATUS else cfg), \
