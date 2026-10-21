@@ -753,6 +753,8 @@ class Optimizer:
         self.signals = LogSignals(self.cfg["codex_log_db"])
         self.status = read_json(STATE / "status.json", {})
         self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接猫猫云", "last_error": None})
+        self._published_status = {}
+        self._last_status_at = 0.0
         self.failures = 0
         self.dry_run = dry_run
         self.next_scan = 0.0
@@ -783,7 +785,15 @@ class Optimizer:
             # journals use atomic_json directly and must still fail on write errors.
             self.status["storage_error"] = str(error)
             return False
+        self._published_status = self.status.copy()
+        self._last_status_at = time.time()
         return True
+
+    def write_idle_status(self, **updates):
+        # Coalesce idle heartbeats only; changed state is still published at once.
+        self.status.update(updates)
+        if self.status != self._published_status or time.time() - self._last_status_at >= 15:
+            self.write_status()
 
     def reload_config(self):
         previous = self.cfg
@@ -1366,9 +1376,9 @@ class Optimizer:
                     if time.time() - self.last_health >= self.cfg["health_interval_seconds"]:
                         self.observe_paused_path()
                     else:
-                        self.write_status(phase="paused", message="已暂停自动测速和切换")
+                        self.write_idle_status(phase="paused", message="已暂停自动测速和切换")
                 else:
-                    self.write_status(phase="monitoring")
+                    self.write_idle_status(phase="monitoring")
             except (ControllerError, ValueError, OSError) as exc:
                 self.write_status(phase="waiting", controller_available=False, message=str(exc), last_error=str(exc))
                 self.next_scan = time.time() + 15

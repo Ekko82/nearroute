@@ -35,6 +35,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\install.ps1
 
 Windows 短暂占用状态文件时，后台会重试更新。持续占用期间后台继续运行，界面保留上次记录，文件可写后恢复更新；选点和回滚记录写入失败仍会中止相应操作。
 
+空闲时合并内容未变化的状态写入，最长每 15 秒更新一次心跳；测速进度、节点操作及连接恢复状态的变化仍及时保存。
+
 不安装启动项也可以运行：
 
 ```powershell
