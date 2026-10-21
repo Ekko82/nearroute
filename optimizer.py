@@ -144,11 +144,12 @@ def _manual_request_lock():
     return _file_lock(STATE / "manual-request.lock")
 
 
-def request_manual_selection(name):
+def request_manual_selection(name, expected_context=None):
     """Queue a user choice for the helper, which serializes all controller PUTs."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("请选择要切换的节点")
     cfg = load_config()
+    _check_expected_context(cfg, expected_context)
     request_id = uuid.uuid4().hex
     with _manual_request_lock():
         atomic_json(STATE / "select.request.json", {
@@ -172,9 +173,23 @@ def validate_config(raw):
     if not isinstance(raw, dict):
         raise ValueError("config.json 不是有效的 JSON 对象，自动切换已停止")
     cfg = DEFAULTS | raw
-    parsed = urllib.parse.urlsplit(cfg["controller"])
-    if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1") or parsed.username:
-        raise ValueError("控制接口必须为本机 HTTP 地址")
+    try:
+        url = cfg["controller"]
+        if not isinstance(url, str) or not url or any(ord(char) <= 32 or ord(char) >= 127 for char in url) or "\\" in url:
+            raise ValueError
+        parsed = urllib.parse.urlsplit(url)
+        if (parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost", "::1")
+                or parsed.username is not None or parsed.password is not None or "?" in url or "#" in url
+                or parsed.netloc.endswith(":")
+                or (parsed.port is not None and not 1 <= parsed.port <= 65535)):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ValueError("控制接口必须为本机 HTTP 地址，不能含账号密码、查询参数、片段或无效端口") from None
+    secret_env = cfg["controller_secret_env"]
+    if not isinstance(secret_env, str) or (secret_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env)):
+        raise ValueError("密钥环境变量须为合法变量名或留空，不要填写密钥本身")
+    if not isinstance(cfg["group"], str) or not cfg["group"].strip():
+        raise ValueError("请选择非空的代理组名称")
     if type(cfg["enabled"]) is not bool:
         raise ValueError("enabled 必须为 true 或 false")
     if type(cfg["prefer_japan"]) is not bool:
@@ -315,6 +330,18 @@ def same_controller(record, cfg):
 
 def state_context(cfg):
     return (cfg["controller"], cfg["controller_secret_env"], cfg["group"])
+
+
+def _check_expected_context(cfg, expected_context):
+    if expected_context is not None and (
+            not isinstance(expected_context, (list, tuple)) or tuple(expected_context) != state_context(cfg)):
+        raise ValueError("代理客户端设置已改变，请刷新后重试")
+
+
+def _check_client_environment(cfg):
+    name = cfg["controller_secret_env"]
+    if name and not os.environ.get(name):
+        raise ValueError("当前进程未找到非空的密钥环境变量 " + name + "，请设置后重新启动近舟")
 
 
 def owned_records(data):
@@ -515,6 +542,11 @@ def active_path(general, proxies, group):
     return (*active_mode(general, group), selection, leaf)
 
 
+class _NoControllerRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 class Controller:
     def __init__(self, cfg):
         self.base = cfg["controller"].rstrip("/")
@@ -529,7 +561,7 @@ class Controller:
         data = json.dumps(body).encode() if body is not None else None
         req = urllib.request.Request(self.base + path, data=data, headers=headers, method=method)
         # Each worker has an independent opener. Local controller calls bypass system proxies.
-        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoControllerRedirect())
         try:
             with opener.open(req, timeout=timeout) as res:
                 content = res.read(4 * 1024 * 1024)
@@ -537,7 +569,7 @@ class Controller:
         except urllib.error.HTTPError as exc:
             raise ControllerError("控制接口 HTTP " + str(exc.code)) from None
         except (OSError, ValueError, http.client.HTTPException):
-            raise ControllerError("无法连接猫猫云控制接口") from None
+            raise ControllerError("无法连接代理客户端控制接口") from None
 
     def snapshot(self, cfg, *, allow_direct=False):
         general = self.request("/configs")
@@ -546,7 +578,7 @@ class Controller:
         if mode == "direct":
             if allow_direct:
                 return general, proxies, None
-            raise ControllerError("猫猫云当前为直连模式，请切换回规则或全局模式")
+            raise ControllerError("代理客户端当前为直连模式，请切换回规则或全局模式")
         group = "GLOBAL" if mode == "global" else cfg["group"]
         if proxies.get(group, {}).get("type") != "Selector":
             raise ControllerError("未找到可控制的主代理组: " + group)
@@ -564,6 +596,33 @@ class Controller:
 
     def select(self, group, name):
         self.request("/proxies/" + urllib.parse.quote(group, safe=""), "PUT", {"name": name})
+
+
+def inspect_controller(fields):
+    """Read a local Clash-compatible client's groups without changing its state."""
+    cfg = validate_config(fields)
+    _check_client_environment(cfg)
+    api = Controller(cfg)
+    general = api.request("/configs")
+    proxy_response = api.request("/proxies")
+    if not isinstance(general, dict) or not isinstance(proxy_response, dict):
+        raise ControllerError("控制接口未返回有效的代理配置")
+    proxies = proxy_response.get("proxies")
+    if not isinstance(proxies, dict):
+        raise ControllerError("控制接口未返回有效的代理组列表")
+    mode = general.get("mode", "rule")
+    if not isinstance(mode, str) or mode.lower() not in ("rule", "global", "direct"):
+        raise ControllerError("代理客户端返回了不支持的代理模式")
+    mode = mode.lower()
+    port = general.get("mixed-port") or general.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ControllerError("代理客户端须开启本机 HTTP 或 mixed 代理端口，近舟才能验证实际线路")
+    groups = sorted(name for name, item in proxies.items()
+                    if isinstance(item, dict) and item.get("type") == "Selector")
+    active_group = None if mode == "direct" else ("GLOBAL" if mode == "global" else cfg["group"])
+    if active_group not in groups:
+        active_group = None
+    return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port}
 
 
 def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE_URL, expected_statuses=(405,)):
@@ -752,7 +811,9 @@ class Optimizer:
         self.quarantine = read_json(STATE / "quarantine.json", {})
         self.signals = LogSignals(self.cfg["codex_log_db"])
         self.status = read_json(STATE / "status.json", {})
-        self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接猫猫云", "last_error": None})
+        if self.status.get("controller_context") != list(self.state_context):
+            self.status = {}
+        self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接代理客户端", "last_error": None})
         self._published_status = {}
         self._last_status_at = 0.0
         self.failures = 0
@@ -776,6 +837,7 @@ class Optimizer:
 
     def write_status(self, **updates):
         self.status.update(updates)
+        self.status["controller_context"] = list(self.state_context)
         self.status["updated_at"] = iso()
         self.status.pop("storage_error", None)
         try:
@@ -1410,6 +1472,54 @@ def stop_daemon():
     return False
 
 
+def configure_client(fields, expected_context=None):
+    """Save connection fields after ending transactions on the old controller.
+
+    Discovery is a separate read-only action. This function validates local
+    settings, serializes updates, and never sends controller requests.
+    """
+    allowed = {"controller", "controller_secret_env", "group"}
+    if not isinstance(fields, dict) or set(fields) - allowed:
+        raise ValueError("连接设置仅接受控制接口、密钥环境变量名和代理组")
+    load_config()  # First-run creation must happen before the non-reentrant lock.
+    with config_update_lock():
+        current = load_config()
+        _check_expected_context(current, expected_context)
+        candidate = validate_config(current | fields)
+        _check_client_environment(candidate)
+        if state_context(candidate) == state_context(current):
+            atomic_json(CONFIG, candidate)
+            return candidate
+
+    if not stop_daemon():
+        raise RuntimeError("后台程序尚在退出，代理客户端设置未修改，请稍后重试")
+    lock = InstanceLock()
+    if not lock.acquire():
+        raise RuntimeError("后台已重新启动，代理客户端设置未修改，请稍后重试")
+    try:
+        if (STATE / "pending-selection.json").exists():
+            raise RuntimeError("原代理客户端仍有未完成的回滚记录；请先恢复原节点，再修改连接设置")
+        with config_update_lock():
+            current = load_config()
+            _check_expected_context(current, expected_context)
+            candidate = validate_config(current | fields)
+            _check_client_environment(candidate)
+            changed = state_context(candidate) != state_context(current)
+            if changed:
+                candidate["enabled"] = False
+                atomic_json(STATE / "status.json", {
+                    "controller_context": list(state_context(candidate)),
+                    "enabled": False, "phase": "stopped", "pid": None,
+                    "controller_available": False, "mode": None, "group": None,
+                    "selected": None, "nodes": [], "health": None, "last_error": None,
+                    "message": "代理客户端设置已保存，自动优选保持暂停", "updated_at": iso(),
+                })
+            atomic_json(CONFIG, candidate)
+        return candidate
+    finally:
+        lock.close()
+
+
 def restore_original():
     if not stop_daemon():
         raise RuntimeError("后台程序尚在退出，暂未恢复节点")
@@ -1475,7 +1585,7 @@ def _restore_original_locked():
 def main():
     if sys.stdout:
         sys.stdout.reconfigure(encoding="utf-8")
-    parser = argparse.ArgumentParser(description="猫猫云 Codex 线路优选")
+    parser = argparse.ArgumentParser(description="近舟 NearRoute 代理线路优选")
     parser.add_argument("command", choices=["run", "scan", "status", "stop", "restore"])
     parser.add_argument("--dry-run", action="store_true", help="只测速，不切换")
     args = parser.parse_args()

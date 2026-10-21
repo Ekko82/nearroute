@@ -11,10 +11,15 @@ from unittest.mock import Mock, patch
 import dashboard
 
 
+CLIENT_CONTEXT = dashboard.core.state_context(dashboard.core.DEFAULTS)
+
+
 def dashboard_state():
     app = dashboard.Dashboard.__new__(dashboard.Dashboard)
     app.root = Mock()
-    app.closed = app.exiting = app.restore_busy = app.manual_busy = False
+    app.closed = app.exiting = app.restore_busy = app.manual_busy = app.client_busy = False
+    app.client_dialog = None
+    app.node_context = CLIENT_CONTEXT
     app.manual_results = queue.SimpleQueue()
     app.manual_request_id = app.manual_attempt = None
     app.manual_request_name = ""
@@ -48,7 +53,7 @@ class ManualSelectionTests(unittest.TestCase):
         self.app.poll_manual_selection({})
 
     def acknowledgement(self, *, request_id="request-1", name="JP A", ok=True):
-        return {"enabled": False, "manual_selection_result": {
+        return {"enabled": False, "controller_context": list(CLIENT_CONTEXT), "manual_selection_result": {
             "request_id": request_id, "name": name, "ok": ok, "message": "mock result",
         }}
 
@@ -60,7 +65,7 @@ class ManualSelectionTests(unittest.TestCase):
         self.request.assert_not_called()
         self.app.notify.reset_mock()
         self.workers[0]()
-        self.request.assert_called_once_with("JP A")
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
         self.app.notify.assert_not_called()  # worker only posts to its queue
         self.app.poll_manual_selection(self.acknowledgement())
         self.assertFalse(self.app.manual_busy)
@@ -73,20 +78,20 @@ class ManualSelectionTests(unittest.TestCase):
         self.assertEqual(len(self.workers), 1)
         self.app.ensure_service.assert_called_once()
         self.publish_id()
-        self.request.assert_called_once_with("JP A")
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
 
     def test_auto_ineligible_node_can_be_selected_manually(self):
         self.app.table.selection.return_value = ("node not auto eligible",)
         self.assertEqual(self.app.switch_selected_node(), "break")
         self.publish_id()
-        self.request.assert_called_once_with("node not auto eligible")
+        self.request.assert_called_once_with("node not auto eligible", expected_context=CLIENT_CONTEXT)
 
     def test_double_click_uses_row_under_pointer_and_heading_click_does_nothing(self):
         self.app.table.identify_row.return_value = "JP A"
         self.app.switch_clicked_node(SimpleNamespace(y=25))
         self.app.table.selection_set.assert_called_once_with("JP A")
         self.publish_id()
-        self.request.assert_called_once_with("JP A")
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
         self.app.table.identify_row.return_value = ""
         self.app.switch_clicked_node(SimpleNamespace(y=0))
         self.assertEqual(len(self.workers), 1)
@@ -274,18 +279,20 @@ class StatusFreshnessTests(unittest.TestCase):
         self.app.notice_until = 0
         self.app.started_at = 0
         for name in ("policy", "badge", "badge_label", "current", "health", "timings", "message",
-                     "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button"):
+                     "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button", "client_button"):
             setattr(self.app, name, Mock())
         self.app.render_nodes = Mock()
         self.nodes = [{"name": "JP last-known", "median_ms": 100, "eligible": True}]
         self.status = {
             "pid": 12345, "phase": "monitoring", "controller_available": True,
             "selected": "JP last-known", "nodes": self.nodes,
+            "controller_context": list(CLIENT_CONTEXT),
             "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(),
         }
 
     def refresh(self, enabled=True):
-        with patch.object(dashboard, "read_json", side_effect=lambda path: self.status if path == dashboard.STATUS else {"enabled": enabled}):
+        config = dict(zip(("controller", "controller_secret_env", "group"), CLIENT_CONTEXT)) | {"enabled": enabled}
+        with patch.object(dashboard, "read_json", side_effect=lambda path: self.status if path == dashboard.STATUS else config):
             self.app.refresh()
 
     def test_stale_status_is_not_presented_as_live_and_enable_is_available(self):

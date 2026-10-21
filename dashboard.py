@@ -509,6 +509,184 @@ class SettingsDialog:
             self.owner.settings_dialog = None
 
 
+class ClientDialog:
+    """Connect a local Mihomo/Clash API without changing proxy selections."""
+
+    def __init__(self, owner: "Dashboard", *, visible: bool = True):
+        self.owner = owner
+        cfg = core.DEFAULTS | (read_json(CONFIG) if CONFIG.exists() else {})
+        self.original_context = core.state_context(cfg)
+        self.closed = self.loading = self.applying = False
+        self.verified_identity = None
+        self.selector_groups = []
+        self.results = queue.SimpleQueue()
+        self.after_id = None
+        self.window = tk.Toplevel(owner.root)
+        self.window.title("客户端连接 · 近舟 NearRoute")
+        self.window.geometry("720x480")
+        self.window.minsize(650, 440)
+        self.window.transient(owner.root)
+        self.window.protocol("WM_DELETE_WINDOW", self.close)
+        if not visible:
+            self.window.withdraw()
+        self.controller = tk.StringVar(value=cfg["controller"])
+        self.secret_env = tk.StringVar(value=cfg["controller_secret_env"])
+        self.group = tk.StringVar(value=cfg["group"])
+        self.message = tk.StringVar(value="填写客户端的外部控制地址，然后读取可选择的代理组。")
+        form = ttk.Frame(self.window, padding=22)
+        form.pack(fill="both", expand=True)
+        form.columnconfigure(1, weight=1)
+        help_text = ("支持 Clash Verge Rev、Clash Party（原 Mihomo Party）等本机 Mihomo/Clash 客户端。"
+                     "在客户端中开启 HTTP 外部控制，并提供 HTTP 或 mixed 代理端口。")
+        ttk.Label(form, text=help_text, wraplength=650, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
+        ttk.Label(form, text="控制地址").grid(row=1, column=0, sticky="w", padx=(0, 12))
+        self.address_entry = ttk.Entry(form, textvariable=self.controller)
+        self.address_entry.grid(row=1, column=1, sticky="ew")
+        ttk.Label(form, text="例如 http://127.0.0.1:9090；填写外部控制端口，不是代理端口。", style="Muted.TLabel", wraplength=650).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 14))
+        ttk.Label(form, text="密钥环境变量").grid(row=3, column=0, sticky="w", padx=(0, 12))
+        self.secret_entry = ttk.Entry(form, textvariable=self.secret_env)
+        self.secret_entry.grid(row=3, column=1, sticky="ew")
+        ttk.Label(form, text="无需认证时留空。需要认证时填写已有环境变量的名称（如 CLASH_SECRET），不填写密钥本身；设置后重新打开近舟。", wraplength=650, style="Muted.TLabel").grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 14))
+        ttk.Label(form, text="规则模式代理组").grid(row=5, column=0, sticky="w", padx=(0, 12))
+        self.groups = ttk.Combobox(form, textvariable=self.group, state="readonly")
+        self.groups.grid(row=5, column=1, sticky="ew")
+        self.inspect_button = ttk.Button(form, text="测试连接并读取代理组", command=self.inspect_connection)
+        self.inspect_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 10))
+        ttk.Label(form, textvariable=self.message, wraplength=650, style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="ew")
+        form.rowconfigure(7, weight=1)
+        actions = ttk.Frame(form)
+        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        ttk.Label(actions, text="更换连接会停止后台并暂停自动优选。", style="Muted.TLabel").pack(side="left")
+        self.save_button = ttk.Button(actions, text="保存连接", command=self.save)
+        self.save_button.pack(side="right")
+        self.cancel_button = ttk.Button(actions, text="取消", command=self.close)
+        self.cancel_button.pack(side="right", padx=8)
+        self.controller.trace_add("write", self.invalidate_connection)
+        self.secret_env.trace_add("write", self.invalidate_connection)
+        self.group.trace_add("write", lambda *_: self.update_buttons())
+        self.update_buttons()
+        self.after_id = self.window.after(150, self.poll_results)
+        if visible:
+            self.window.grab_set()
+
+    def fields(self) -> dict:
+        return {"controller": self.controller.get().strip().rstrip("/"),
+                "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get().strip()}
+
+    def identity(self):
+        fields = self.fields()
+        return fields["controller"], fields["controller_secret_env"]
+
+    def invalidate_connection(self, *_args) -> None:
+        self.verified_identity = None
+        self.selector_groups = []
+        self.groups.configure(values=())
+        self.message.set("连接参数已改变，请重新测试连接。")
+        self.update_buttons()
+
+    def update_buttons(self) -> None:
+        busy = self.loading or self.applying
+        self.inspect_button.state(["disabled"] if busy else ["!disabled"])
+        ready = not busy and self.verified_identity == self.identity() and self.group.get().strip() in self.selector_groups
+        self.save_button.state(["!disabled"] if ready else ["disabled"])
+        for widget in (self.address_entry, self.secret_entry, self.cancel_button):
+            widget.state(["disabled"] if self.applying else ["!disabled"])
+        self.groups.configure(state="disabled" if self.applying else "readonly")
+
+    def start_worker(self, operation, identity, work) -> None:
+        def worker():
+            try:
+                self.results.put((operation, identity, True, work()))
+            except (OSError, ValueError, RuntimeError) as error:
+                self.results.put((operation, identity, False, str(error)))
+        try:
+            threading.Thread(target=worker, name="nearroute-client-" + operation, daemon=True).start()
+        except RuntimeError as error:
+            self.results.put((operation, identity, False, str(error)))
+
+    def inspect_connection(self) -> None:
+        if self.closed or self.loading or self.applying:
+            return
+        fields = self.fields()
+        fields["group"] = fields["group"] or core.DEFAULTS["group"]
+        self.loading = True
+        self.verified_identity = None
+        self.message.set("正在读取控制接口；只读检查，不测速或切换节点…")
+        self.update_buttons()
+        identity = self.identity()
+        self.start_worker("inspect", identity, lambda: core.inspect_controller(fields))
+
+    def save(self) -> None:
+        if (self.closed or self.loading or self.applying or self.owner.exiting
+                or self.owner.restore_busy or self.owner.manual_busy):
+            return
+        fields = self.fields()
+        if self.verified_identity != self.identity() or fields["group"] not in self.selector_groups:
+            self.message.set("请先测试当前连接，并选择读取到的代理组。")
+            return
+        self.applying = self.owner.client_busy = True
+        self.owner.cancel_service_start()
+        self.message.set("正在停止后台并保存连接…")
+        self.update_buttons()
+        helpers = list(self.owner.started_helpers)
+
+        def apply_connection():
+            if not wait_for_helper_startup(helpers):
+                raise RuntimeError("后台仍在启动，请稍后重试保存连接。")
+            return core.configure_client(fields, expected_context=self.original_context)
+
+        self.start_worker("save", self.identity(), apply_connection)
+
+    def poll_results(self) -> None:
+        if self.closed:
+            return
+        try:
+            while True:
+                operation, identity, success, result = self.results.get_nowait()
+                if operation == "inspect":
+                    self.loading = False
+                    if identity != self.identity():
+                        self.message.set("连接参数已改变，请重新测试连接。")
+                    elif success:
+                        self.verified_identity = identity
+                        self.selector_groups = result["groups"]
+                        self.groups.configure(values=self.selector_groups)
+                        if self.group.get() not in self.selector_groups:
+                            active = result.get("active_group")
+                            self.group.set(active if active in self.selector_groups else "")
+                        note = ("当前为全局模式，实际控制 GLOBAL。" if result["mode"] == "global" else
+                                "当前为直连模式，优选前请改为规则或全局模式。" if result["mode"] == "direct" else "规则模式使用所选代理组。")
+                        self.message.set(f"连接成功，HTTP 代理端口 {result['proxy_port']}，读取 {len(self.selector_groups)} 个代理组。{note}")
+                    else:
+                        self.verified_identity = None
+                        self.message.set("连接未通过：" + result)
+                else:
+                    self.applying = self.owner.client_busy = False
+                    if success:
+                        self.owner.client_saved(result)
+                        self.close()
+                        return
+                    self.message.set("连接未保存：" + result)
+                self.update_buttons()
+        except queue.Empty:
+            pass
+        self.after_id = self.window.after(150, self.poll_results)
+
+    def close(self) -> None:
+        if self.applying:
+            return
+        self.closed = True
+        if self.after_id is not None:
+            self.window.after_cancel(self.after_id)
+        try:
+            self.window.grab_release()
+        except tk.TclError:
+            pass
+        self.window.destroy()
+        if getattr(self.owner, "client_dialog", None) is self:
+            self.owner.client_dialog = None
+
+
 class UpdateDialog:
     """Release notes and preferences; all network work belongs to the owner."""
 
@@ -596,6 +774,9 @@ class Dashboard:
         self.notice_until = 0.0
         self.node_signature = ""
         self.restore_busy = False
+        self.client_busy = False
+        self.client_dialog = None
+        self.node_context = None
         self.manual_busy = False
         self.manual_results: queue.SimpleQueue = queue.SimpleQueue()
         self.manual_request_id = None
@@ -661,6 +842,7 @@ class Dashboard:
         self.badge = tk.StringVar(value="正在读取状态")
         self.badge_label = ttk.Label(header, textvariable=self.badge, style="Status.TLabel")
         self.badge_label.grid(row=0, column=1, sticky="e")
+        ttk.Button(header, text="客户端连接", command=self.open_client).grid(row=0, column=2, padx=(14, 0))
         self.policy = tk.StringVar(value="正在读取测速设置…")
         policy_label = ttk.Label(
             container,
@@ -813,7 +995,7 @@ class Dashboard:
         if not self.update_can_install:
             webbrowser.open(self.update_release.url)
             return
-        if self.restore_busy or self.manual_busy:
+        if self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             self.notify("正在处理节点操作，请完成后再安装更新。", 15)
             return
         if not messagebox.askyesno("安装近舟更新", "安装更新会停止后台优选并重启近舟。保留现有设置和当前代理节点，是否继续？", parent=self.root):
@@ -827,7 +1009,7 @@ class Dashboard:
             self.update_worker("prepare", lambda: updater.prepare_update(release, root=ROOT))
 
     def begin_update_install(self) -> None:
-        if self.closed or self.exiting or self.update_busy or self.restore_busy or self.manual_busy:
+        if self.closed or self.exiting or self.update_busy or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             return
         if self.update_prepared is None or not self.update_can_install:
             return
@@ -845,9 +1027,12 @@ class Dashboard:
         self.update_worker("install", handoff)
 
     def automatic_install_ready(self, status: dict) -> bool:
-        if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.update_busy:
+        if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.update_busy or getattr(self, "client_busy", False):
             return False
         if self.settings_dialog is not None and not self.settings_dialog.closed:
+            return False
+        client_dialog = getattr(self, "client_dialog", None)
+        if client_dialog is not None and not client_dialog.closed:
             return False
         if status_is_stale(status) or status.get("phase") not in ("monitoring", "paused", "waiting", "stopped"):
             return False
@@ -937,7 +1122,7 @@ class Dashboard:
             label.configure(wraplength=max(400, event.width - 48))
 
     def ensure_service(self) -> bool:
-        if self.closed or self.exiting or self.restore_busy:
+        if self.closed or self.exiting or self.restore_busy or getattr(self, "client_busy", False):
             return False
         try:
             process = start_daemon()
@@ -948,8 +1133,33 @@ class Dashboard:
             self.notify(f"服务启动失败：{error}", 30)
             return False
 
+    def open_client(self) -> None:
+        if self.exiting or self.restore_busy or self.manual_busy or self.client_busy:
+            return
+        if self.client_dialog is not None and not self.client_dialog.closed:
+            self.client_dialog.window.lift()
+            return
+        try:
+            self.client_dialog = ClientDialog(self)
+        except (OSError, ValueError) as error:
+            messagebox.showerror("无法打开客户端连接", str(error), parent=self.root)
+
+    def client_saved(self, saved: dict) -> None:
+        if tuple(core.state_context(saved)) != self.node_context:
+            self.node_context = None
+            self.manual_attempt = None
+            self.manual_request_id = None
+            self.node_signature = ""
+            self.render_nodes("—", [])
+            self.current.set("当前节点：等待客户端状态")
+            self.health.set("控制接口：等待检测")
+        self.policy.set(policy_summary(saved))
+        message = ("客户端连接已保存，自动优选保持暂停。可点击“立即测速”检查，再启用自动优选。"
+                   if not saved["enabled"] else "客户端连接设置已保存，原有优选开关保持。")
+        self.notify(message, 25)
+
     def open_settings(self) -> None:
-        if self.restore_busy or self.exiting:
+        if self.restore_busy or self.exiting or getattr(self, "client_busy", False):
             return
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             self.settings_dialog.window.lift()
@@ -961,7 +1171,7 @@ class Dashboard:
             messagebox.showerror("无法打开设置", str(error), parent=self.root)
 
     def settings_saved(self, saved: dict) -> None:
-        if self.closed or self.exiting:
+        if self.closed or self.exiting or getattr(self, "client_busy", False):
             return
         self.policy.set(policy_summary(saved))
         try:
@@ -976,7 +1186,7 @@ class Dashboard:
             self.notify(f"设置已保存，但未能请求测速：{error}", 20)
 
     def enable(self) -> None:
-        if self.restore_busy or self.exiting:
+        if self.restore_busy or self.exiting or getattr(self, "client_busy", False):
             return
         try:
             update_enabled(True)
@@ -986,7 +1196,7 @@ class Dashboard:
             messagebox.showerror("未能启用", str(error), parent=self.root)
 
     def pause(self) -> None:
-        if self.restore_busy or self.exiting:
+        if self.restore_busy or self.exiting or getattr(self, "client_busy", False):
             return
         try:
             update_enabled(False)
@@ -995,7 +1205,7 @@ class Dashboard:
             messagebox.showerror("未能暂停", str(error), parent=self.root)
 
     def scan(self) -> None:
-        if self.restore_busy or self.exiting:
+        if self.restore_busy or self.exiting or getattr(self, "client_busy", False):
             return
         try:
             if not self.ensure_service():
@@ -1027,7 +1237,7 @@ class Dashboard:
         self.table.selection_set(name)
         self.table.focus(name)
         self.table.focus_set()
-        blocked = self.closed or self.exiting or self.restore_busy or self.manual_busy
+        blocked = self.closed or self.exiting or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False)
         self.node_menu.entryconfigure(0, state="disabled" if blocked else "normal")
         try:
             self.node_menu.tk_popup(event.x_root, event.y_root)
@@ -1036,7 +1246,11 @@ class Dashboard:
         return "break"
 
     def switch_node(self, name: str) -> None:
-        if self.closed or self.exiting or self.restore_busy or self.manual_busy:
+        if self.closed or self.exiting or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
+            return
+        context = self.node_context
+        if context is None:
+            self.notify("客户端状态尚未确认，请刷新节点后再切换。", 15)
             return
         self.manual_busy = True
         self.manual_request_name = name
@@ -1052,7 +1266,7 @@ class Dashboard:
 
         def worker() -> None:
             try:
-                request_id = core.request_manual_selection(name)
+                request_id = core.request_manual_selection(name, expected_context=context)
                 self.manual_results.put((attempt, True, request_id))
             except (OSError, ValueError) as error:
                 self.manual_results.put((attempt, False, str(error)))
@@ -1108,7 +1322,7 @@ class Dashboard:
             self.notify("手动切换等待超时，" + description, 20)
 
     def restore(self) -> None:
-        if self.restore_busy or self.exiting or getattr(self, "manual_busy", False):
+        if self.restore_busy or self.exiting or getattr(self, "manual_busy", False) or getattr(self, "client_busy", False):
             return
         try:
             update_enabled(False)
@@ -1161,32 +1375,43 @@ class Dashboard:
             status = read_json(STATUS)
         except (OSError, ValueError):
             status = {}
-        self.poll_updates(status)
-        if self.closed:
-            return
-        self.poll_manual_selection(status)
         try:
             config = read_json(CONFIG)
             enabled = bool(config.get("enabled", True))
             self.policy.set(policy_summary(config))
         except (OSError, ValueError):
+            config = {}
             enabled = bool(status.get("enabled", True))
             self.policy.set(policy_summary({}))
+        context = tuple(core.state_context(core.DEFAULTS | config))
+        if status.get("controller_context") != list(context):
+            status = {}
+            self.node_context = None
+        else:
+            self.node_context = context
+        self.poll_updates(status)
+        if self.closed:
+            return
+        self.poll_manual_selection(status)
         stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))
         stopped = phase in ("stopped", "stopping")
         connected = bool(status.get("controller_available", False)) and not stale and not stopped
         running = bool(status.get("pid")) and not stopped and not stale
-        self.enable_button.state(["disabled"] if self.restore_busy or (enabled and running) else ["!disabled"])
-        self.pause_button.state(["!disabled"] if enabled and not self.restore_busy else ["disabled"])
-        self.scan_button.state(["disabled"] if self.restore_busy else ["!disabled"])
-        self.settings_button.state(["disabled"] if self.restore_busy else ["!disabled"])
-        self.restore_button.state(["disabled"] if self.restore_busy or self.exiting or self.manual_busy else ["!disabled"])
-        self.exit_button.state(["disabled"] if self.restore_busy or self.exiting or self.manual_busy else ["!disabled"])
+        client_busy = getattr(self, "client_busy", False)
+        busy = self.restore_busy or client_busy
+        self.enable_button.state(["disabled"] if busy or (enabled and running) else ["!disabled"])
+        self.pause_button.state(["!disabled"] if enabled and not busy else ["disabled"])
+        self.scan_button.state(["disabled"] if busy else ["!disabled"])
+        self.settings_button.state(["disabled"] if busy else ["!disabled"])
+        self.restore_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
+        self.exit_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
         if self.exiting:
             for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button, self.settings_button):
                 button.state(["disabled"])
-        if self.manual_busy:
+        if client_busy:
+            badge, color = "正在保存客户端连接", "#1b66b0"
+        elif self.manual_busy:
             badge, color = "正在手动切换", "#1b66b0"
         elif stale:
             badge, color = "后台状态未更新", "#8b6508"
@@ -1284,6 +1509,10 @@ class Dashboard:
                 if self.settings_dialog is not None and not self.settings_dialog.closed:
                     self.settings_dialog.window.grab_release()
                     self.settings_dialog.window.withdraw()
+                client_dialog = getattr(self, "client_dialog", None)
+                if client_dialog is not None and not client_dialog.closed:
+                    client_dialog.window.grab_release()
+                    client_dialog.window.withdraw()
                 update_dialog = getattr(self, "update_dialog", None)
                 if update_dialog is not None and not update_dialog.closed:
                     update_dialog.window.withdraw()
@@ -1302,6 +1531,11 @@ class Dashboard:
         self.root.lift()
         self.root.focus_force()
         self.hidden_to_tray = False
+        client_dialog = getattr(self, "client_dialog", None)
+        if client_dialog is not None and not client_dialog.closed:
+            client_dialog.window.deiconify()
+            client_dialog.window.lift()
+            client_dialog.window.grab_set()
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             window = self.settings_dialog.window
             window.deiconify()
@@ -1339,6 +1573,10 @@ class Dashboard:
 
     def request_exit(self) -> None:
         if self.closed or self.exiting:
+            return
+        if getattr(self, "client_busy", False):
+            self.show_window()
+            self.notify("正在保存客户端连接，请完成后再退出。", 15)
             return
         if self.restore_busy:
             self.show_window()
@@ -1386,6 +1624,12 @@ class Dashboard:
         if self.closed:
             return
         self.closed = True
+        client_dialog = getattr(self, "client_dialog", None)
+        if client_dialog is not None and not client_dialog.closed:
+            try:
+                client_dialog.close()
+            except tk.TclError:
+                pass
         update_dialog = getattr(self, "update_dialog", None)
         if update_dialog is not None and not update_dialog.closed:
             try:

@@ -29,7 +29,8 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.app = dashboard.Dashboard.__new__(dashboard.Dashboard)
         self.app.root = Mock()
-        self.app.closed = self.app.exiting = self.app.restore_busy = self.app.manual_busy = False
+        self.app.closed = self.app.exiting = self.app.restore_busy = self.app.manual_busy = self.app.client_busy = False
+        self.app.client_dialog = None
         self.app.settings_dialog = self.app.update_dialog = None
         self.app.tray = None
         self.app.updates_enabled = self.app.update_can_install = True

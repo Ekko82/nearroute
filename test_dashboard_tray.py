@@ -50,6 +50,8 @@ class DashboardTrayTests(unittest.TestCase):
         self.app.root.after.return_value = "next-tray-poll"
         self.app.closed = False
         self.app.restore_busy = False
+        self.app.client_busy = False
+        self.app.client_dialog = None
         self.app.exiting = False
         self.app.hidden_to_tray = False
         self.app.settings_dialog = None
@@ -61,7 +63,7 @@ class DashboardTrayTests(unittest.TestCase):
         self.app.tray_actions = queue.SimpleQueue()
         self.app.message = MagicMock(name="status_message")
         self.app.notice_until = 0
-        for name in ("enable_button", "pause_button", "scan_button", "restore_button", "settings_button", "exit_button"):
+        for name in ("enable_button", "pause_button", "scan_button", "restore_button", "settings_button", "exit_button", "client_button"):
             setattr(self.app, name, MagicMock(name=name))
         self.app.tray = FakeTray("NearRoute test", "offline-instance", self.app.tray_actions.put)
         self.threads = []
