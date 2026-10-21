@@ -11,7 +11,7 @@ import stat
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import urllib.error
 import urllib.request
 import zipfile
@@ -49,6 +49,7 @@ class UpdaterTests(unittest.TestCase):
                 content = b"new packaged file\n"
             self.files[name] = content
         self.release = self.package()
+        self.real_open_url = updater._open_url
         stack = ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(patch.object(updater, "_open_url", side_effect=AssertionError("real network forbidden")))
@@ -234,8 +235,15 @@ class UpdaterTests(unittest.TestCase):
                     "https://github.com@evil.invalid/file", "https://user:password@github.com/file", "https://github.com:444/file"]
         request = urllib.request.Request(self.release.asset_url)
         for url in rejected:
-            with self.subTest(url=url), self.assertRaises(updater.UpdateError):
-                updater.SafeRedirect().redirect_request(request, None, 302, "Found", {}, url)
+            with self.subTest(url=url), io.BytesIO(b"fixture redirect response") as response:
+                with self.assertRaises(updater.UpdateError):
+                    updater.SafeRedirect().redirect_request(request, response, 302, "Found", {}, url)
+                self.assertTrue(response.closed)
+        for url in accepted:
+            with self.subTest(url=url), io.BytesIO(b"fixture redirect response") as response:
+                redirected = updater.SafeRedirect().redirect_request(request, response, 302, "Found", {}, url)
+                self.assertEqual(redirected.full_url, url)
+                self.assertFalse(response.closed)  # urllib closes it when following the approved redirect.
 
     def test_metadata_reader_limits_bytes_and_closes_response(self):
         response = Response(b"12345", updater.RELEASES_URL)
@@ -248,6 +256,48 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(updater.UpdateError):
                 updater._read_url(updater.RELEASES_URL, 16)
         self.assertTrue(response.closed)
+
+    def test_http_error_responses_close_and_allow_a_successful_retry(self):
+        metadata, manifest, manifest_url = self.metadata()
+        for stage, code in (("release", 404), ("release", 403), ("manifest", 403), ("package", 403)):
+            with self.subTest(stage=stage, http_status=code):
+                response = io.BytesIO(b"synthetic HTTP error")
+                error_url = {"release": updater.RELEASES_URL, "manifest": manifest_url,
+                             "package": self.release.asset_url}[stage]
+                error = urllib.error.HTTPError(error_url, code, "fixture error", {}, response)
+                self.addCleanup(error.close)
+                opener = Mock()
+                opener.open.side_effect = (
+                    [Response(json.dumps(metadata).encode(), updater.RELEASES_URL), error]
+                    if stage == "manifest" else [error]
+                )
+                with patch.object(updater, "_open_url", self.real_open_url), \
+                     patch.object(updater.urllib.request, "build_opener", return_value=opener):
+                    if code == 404:
+                        self.assertIsNone(updater.check_for_update(self.root))
+                    else:
+                        with self.assertRaises(updater.UpdateError) as failure:
+                            if stage == "package":
+                                updater.prepare_update(self.release, self.root)
+                            else:
+                                updater.check_for_update(self.root)
+                        self.assertIs(failure.exception.__cause__, error)
+                    self.assertTrue(response.closed)
+
+                    if stage == "package":
+                        updates = self.root / "state" / "updates"
+                        self.assertEqual(list(updates.iterdir()), [])
+                        retry_responses = [Response(self.archive.read_bytes(), self.release.asset_url)]
+                        opener.open.side_effect = retry_responses
+                        prepared = updater.prepare_update(self.release, self.root)
+                        self.assertEqual((prepared / "package.zip").read_bytes(), self.archive.read_bytes())
+                        self.assertEqual(list(updates.iterdir()), [prepared])
+                    else:
+                        retry_responses = [Response(json.dumps(metadata).encode(), updater.RELEASES_URL),
+                                           Response(json.dumps(manifest).encode(), manifest_url)]
+                        opener.open.side_effect = retry_responses
+                        self.assertEqual(updater.check_for_update(self.root), self.release)
+                    self.assertTrue(all(item.closed for item in retry_responses))
 
     def test_prepare_downloads_validates_and_reuses_completed_cache(self):
         response = Response(self.archive.read_bytes(), self.release.asset_url)

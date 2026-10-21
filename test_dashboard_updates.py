@@ -1,10 +1,11 @@
 """Offline update UI behavior; no network, real helper, or installation runs."""
 
 from contextlib import ExitStack
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import http.client
+import hashlib
 import io
 import queue
 import json
@@ -12,6 +13,7 @@ import tempfile
 import tkinter as tk
 from types import SimpleNamespace
 import unittest
+import zipfile
 from unittest.mock import Mock, patch
 
 import dashboard
@@ -58,6 +60,8 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.due = self.patches.enter_context(patch.object(updater, "check_due", return_value=True))
         self.real_check = updater.check_for_update
         self.check = self.patches.enter_context(patch.object(updater, "check_for_update", return_value=RELEASE))
+        self.real_prepare = updater.prepare_update
+        self.real_start_installer = updater.start_installer
         self.prepare = self.patches.enter_context(patch.object(updater, "prepare_update", return_value=self.root / "prepared"))
         self.install = self.patches.enter_context(patch.object(updater, "start_installer"))
         self.patches.enter_context(patch.object(updater, "current_version", return_value="1.0.0"))
@@ -334,6 +338,44 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertIsNone(self.app.update_busy)
         self.install.assert_not_called()
         self.app.close.assert_not_called()
+
+    def test_missing_staged_metadata_releases_busy_and_manual_retry_repairs_cache(self):
+        prepared = self.root / "state" / "updates" / RELEASE.tag
+        prepared.mkdir(parents=True)
+        archive = prepared / "package.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as package:
+            for name in sorted(updater.REQUIRED_FILES):
+                content = (RELEASE.version + "\n").encode() if name == "VERSION" else b"VALUE = 1\n"
+                package.writestr(name, content)
+        release = replace(RELEASE, asset_url=f"https://github.com/{updater.REPOSITORY}/releases/download/{RELEASE.tag}/NearRoute-{RELEASE.version}-windows.zip",
+                          size=archive.stat().st_size, sha256=hashlib.sha256(archive.read_bytes()).hexdigest())
+        metadata = prepared / "release.json"
+        metadata.write_text(json.dumps(asdict(release)), encoding="utf-8")
+        metadata.unlink()  # Cache cleanup after a successful download.
+        self.app.update_release = release
+        self.app.update_prepared = prepared
+        self.install.side_effect = self.real_start_installer
+        with patch.object(updater.subprocess, "Popen", side_effect=AssertionError("real installer forbidden")) as popen, \
+             patch.object(updater, "_open_url", side_effect=AssertionError("valid cache needs no network")):
+            self.app.request_update_install()
+            self.finish()
+            self.assertIsNone(self.app.update_busy)
+            self.assertFalse(self.app.exiting)
+            self.assertIsNone(self.app.update_prepared)
+            self.assertFalse(self.app.update_requested_install)
+            self.app.close.assert_not_called()
+            self.assertIn("更新未完成", self.app.update_text.set.call_args.args[0])
+            self.prepare.side_effect = self.real_prepare
+            self.install.side_effect = None
+            self.app.request_update_install()
+            self.assertEqual(self.app.update_busy, "prepare")
+            self.finish()
+            self.prepare.assert_called_once_with(release, root=self.root)
+            self.assertEqual(json.loads(metadata.read_text(encoding="utf-8")), asdict(release))
+            self.assertEqual(self.app.update_busy, "install")
+            self.finish()
+            self.app.close.assert_called_once()
+            popen.assert_not_called()
 
     def test_reopened_failed_version_requires_manual_retry_but_new_release_can_auto_install(self):
         state = self.root / "state"

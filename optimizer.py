@@ -1610,6 +1610,7 @@ def main():
     parser = argparse.ArgumentParser(description="近舟 NearRoute 代理线路优选")
     parser.add_argument("command", choices=["run", "scan", "status", "stop", "restore"])
     parser.add_argument("--dry-run", action="store_true", help="只测速，不切换")
+    parser.add_argument("--ready-token", type=uuid.UUID, help=argparse.SUPPRESS)
     args = parser.parse_args()
     STATE.mkdir(parents=True, exist_ok=True)
     if args.command == "status":
@@ -1632,8 +1633,11 @@ def main():
                 raise SystemExit("后台正在运行；请先暂停后使用界面测速")
             (STATE / "scan.request").touch()
         return
+    ready_file = STATE / f"startup-{args.ready_token.hex}.ready" if args.ready_token else None
     try:
         (STATE / "stop.request").unlink(missing_ok=True)
+        if ready_file is not None:
+            atomic_json(ready_file, {})
         optimizer = Optimizer(args.dry_run)
         if args.command == "scan":
             optimizer.scan(forced=True)
@@ -1644,7 +1648,11 @@ def main():
         else:
             optimizer.run()
     finally:
-        lock.close()
+        try:
+            if ready_file is not None:
+                ready_file.unlink(missing_ok=True)
+        finally:
+            lock.close()
 
 
 if __name__ == "__main__":

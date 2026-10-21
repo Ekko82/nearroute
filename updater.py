@@ -142,7 +142,11 @@ def _https_url(url):
 
 class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        _https_url(newurl)
+        try:
+            _https_url(newurl)
+        except UpdateError:
+            fp.close()
+            raise
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
@@ -150,7 +154,11 @@ def _open_url(url):
     _https_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "NearRoute-Updater",
                                                   "Accept": "application/vnd.github+json"})
-    return urllib.request.build_opener(SafeRedirect()).open(request, timeout=15)
+    try:
+        return urllib.request.build_opener(SafeRedirect()).open(request, timeout=15)
+    except urllib.error.HTTPError as error:
+        error.close()
+        raise
 
 
 def _read_url(url, limit):
@@ -425,7 +433,10 @@ def is_installing(root=ROOT):
 def start_installer(prepared: Path, *, parent_pid: int, python_exe: str, root=ROOT):
     if not can_install(root):
         raise UpdateError("源码检出目录请使用 git pull --ff-only 更新；内置安装适用于发行 ZIP")
-    release = Release(**_read_document(Path(prepared) / "release.json", {}))
+    try:
+        release = Release(**_read_document(Path(prepared) / "release.json", {}))
+    except TypeError as error:
+        raise UpdateError("缓存版本信息已失效，请重新下载更新") from error
     validate_package(Path(prepared) / "package.zip", release)
     worker = Path(tempfile.mkdtemp(prefix="nearroute-updater-"))
     try:

@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import uuid
 import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -183,28 +184,37 @@ def python_executable() -> str:
 def start_daemon() -> subprocess.Popen:
     if not OPTIMIZER.is_file():
         raise FileNotFoundError("未找到 optimizer.py，请先完成安装。")
-    return subprocess.Popen(
-        [python_executable(), str(OPTIMIZER), "run"],
+    token = uuid.uuid4().hex
+    process = subprocess.Popen(
+        [python_executable(), str(OPTIMIZER), "run", "--ready-token", token],
         cwd=ROOT, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL, creationflags=NO_WINDOW,
         close_fds=True,
     )
+    process.nearroute_ready_file = STATE / f"startup-{token}.ready"
+    process.nearroute_started = False
+    return process
 
 
 def wait_for_helper_startup(processes, timeout: float = 10.0) -> bool:
     """Wait until every helper we launched owns the lock or has exited.
 
-    The helper publishes its PID after acquiring the mutex and clearing a stale
-    stop request. Stopping before then could miss a still-starting child.
+    Each launch acknowledges acquiring the mutex and clearing a stale stop
+    request independently of the best-effort status snapshot.
     """
     pending = list(processes)
     deadline = time.monotonic() + timeout
     while pending:
-        try:
-            active_pid = read_json(STATUS).get("pid")
-        except (OSError, ValueError):
-            active_pid = None
-        pending = [p for p in pending if p.poll() is None and p.pid != active_pid]
+        starting = []
+        for process in pending:
+            if process.nearroute_started:
+                continue
+            if process.poll() is not None or process.nearroute_ready_file.is_file():
+                process.nearroute_ready_file.unlink(missing_ok=True)
+                process.nearroute_started = True
+            else:
+                starting.append(process)
+        pending = starting
         if not pending:
             return True
         if time.monotonic() >= deadline:
@@ -1064,6 +1074,7 @@ class Dashboard:
                 if not success:
                     if operation == "install":
                         self.exiting = False
+                        self.update_prepared = None
                     self.update_requested_install = False
                     self.update_text.set(f"更新未完成：{result}")
                     self.update_next_check = time.monotonic() + 1800
