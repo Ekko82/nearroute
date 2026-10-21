@@ -1176,7 +1176,7 @@ class Optimizer:
             save_owned_record(path, {**controller_identity(self.cfg), "group": group,
                                      "name": current, "saved_at": iso()})
 
-    def rollback(self, group, candidate, original, api=None):
+    def rollback(self, group, candidate, original, api=None, *, pending=None):
         # Do not overwrite an intervening manual change in the client.
         api = api or self.api
         proxies = api.request("/proxies")["proxies"]
@@ -1188,6 +1188,9 @@ class Optimizer:
             confirmed = api.request("/proxies")["proxies"]
             if confirmed.get(group, {}).get("now") != original:
                 raise ControllerError("客户端未确认回滚，回滚记录已保留，请重试")
+            path = STATE / "pending-selection.json"
+            if pending is not None and pending_record(read_json(path, {})) == pending:
+                path.unlink(missing_ok=True)
             event("rollback", group=group, previous=candidate, restored=original)
 
     def observe_selection(self, observation):
@@ -1299,14 +1302,14 @@ class Optimizer:
             if not result["ok"] and not result.get("cancelled") and selection_policy(self.cfg) == policy:
                 self.quarantine[candidate] = time.time() + self.cfg["node_quarantine_seconds"]
                 self.prune_probe_history(force_quarantine=True)
-            self.rollback(group, candidate, previous)
+            self.rollback(group, candidate, previous, pending=pending)
             event("candidate_rejected", node=candidate, reason=result.get("reason", "自动切换已暂停"))
             return False
         except Exception as error:
             # If the controller is unreachable, retain the journal for recovery.
             try:
                 if put_attempted and not committed:
-                    self.rollback(group, candidate, previous)
+                    self.rollback(group, candidate, previous, pending=pending)
             finally:
                 if isinstance(error, PathChanged):
                     self.refresh_cancelled_mode(str(error), clear_nodes=isinstance(error, ModeChanged))
