@@ -1277,7 +1277,7 @@ class Dashboard:
         self.manual_request_name = name
         self.manual_request_started = time.monotonic()
         self.manual_request_id = None
-        attempt = self.manual_attempt = object()
+        attempt = self.manual_attempt = {"request_id": None}
         if not self.ensure_service():
             self.manual_busy = False
             self.manual_attempt = None
@@ -1288,6 +1288,13 @@ class Dashboard:
         def worker() -> None:
             try:
                 request_id = core.request_manual_selection(name, expected_context=context, expected_mode=mode)
+                attempt["request_id"] = request_id
+                if attempt is not self.manual_attempt or self.closed or self.exiting:
+                    try:
+                        core.cancel_manual_selection(request_id)
+                    except OSError:
+                        self.manual_results.put((attempt, True, request_id))
+                    return
                 self.manual_results.put((attempt, True, request_id))
             except (OSError, ValueError) as error:
                 self.manual_results.put((attempt, False, str(error)))
@@ -1331,9 +1338,10 @@ class Dashboard:
             else:
                 self.notify(f"手动切换失败：{result.get('message') or '请检查客户端连接'}。可重试。", 20)
         if self.manual_busy and time.monotonic() - self.manual_request_started >= 30:
-            request_id = self.manual_request_id
+            attempt = self.manual_attempt
             self.manual_busy = False
             self.manual_attempt = None
+            request_id = self.manual_request_id or (attempt["request_id"] if attempt is not None else None)
             self.manual_request_id = None
             try:
                 cancelled = bool(request_id and core.cancel_manual_selection(request_id))

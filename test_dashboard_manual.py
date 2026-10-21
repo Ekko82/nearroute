@@ -185,6 +185,37 @@ class ManualSelectionTests(unittest.TestCase):
         self.publish_id()
         self.assertEqual(self.app.manual_request_id, "new-request")
 
+    def test_late_cleanup_error_retries_in_ui_and_preserves_persistent_failure_warning(self):
+        for persistent_failure in (False, True):
+            with self.subTest(persistent_failure=persistent_failure):
+                self.cancel.reset_mock()
+                self.cancel.side_effect = [
+                    OSError("mock worker cleanup failure"),
+                    OSError("mock UI cleanup failure") if persistent_failure else True,
+                ]
+                with patch.object(dashboard.time, "monotonic", return_value=100.0) as clock:
+                    self.app.switch_node("JP A")
+                    clock.return_value = 130.0
+                    self.app.poll_manual_selection({})
+                self.cancel.assert_not_called()  # The producer has not returned its ID yet.
+                self.app.notify.reset_mock()
+
+                self.workers.pop()()
+
+                self.cancel.assert_called_once_with("request-1")
+                self.app.notify.assert_not_called()  # Workers never touch Tk.
+                self.app.poll_manual_selection({})
+                self.assertEqual([call.args for call in self.cancel.call_args_list],
+                                 [("request-1",), ("request-1",)])
+                self.assertFalse(self.app.manual_busy)
+                self.assertIsNone(self.app.manual_attempt)
+                self.assertIsNone(self.app.manual_request_id)
+                self.assertTrue(self.app.manual_results.empty())
+                if persistent_failure:
+                    self.assertIn("旧切换请求清理未完成", self.app.notify.call_args.args[0])
+                else:
+                    self.app.notify.assert_not_called()
+
     def test_manual_busy_blocks_restore_and_exit(self):
         self.app.switch_node("JP A")
         self.app.show_window = Mock()
