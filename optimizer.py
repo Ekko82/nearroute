@@ -636,6 +636,18 @@ def inspect_controller(fields):
     return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port}
 
 
+class ProbeHTTPResponse(http.client.HTTPResponse):
+    def _read_status(self):
+        # http.client skips only 100; other informational responses also
+        # precede the final result. 101 switches protocols and must stop here.
+        for _ in range(100):
+            version, status, reason = super()._read_status()
+            if not (100 <= status < 200) or status == 101:
+                return version, status, reason
+            http.client._read_headers(self.fp)
+        raise http.client.HTTPException("got more than 100 interim responses")
+
+
 def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE_URL, expected_statuses=(405,)):
     """Verify actual HTTP status over the active proxy, optionally reusing one TLS socket.
 
@@ -654,6 +666,7 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
     else:
         conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=7)
         request_path = probe_url
+    conn.response_class = ProbeHTTPResponse
     delays, sock = [], None
     try:
         for index in range(3 if idle_seconds else 1):
