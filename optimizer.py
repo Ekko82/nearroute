@@ -878,6 +878,20 @@ class LogSignals:
             return process, thread, turn.group(1), int(retry.group(1)), kind
         return None
 
+    @staticmethod
+    def _retry_stream_kind(body):
+        field = re.search(r'\bsampling_error\s*=\s*', body)
+        if not field or "stream disconnected - retrying sampling request (" not in body[:field.start()]:
+            return None
+        error = re.split(r'\s+[A-Za-z_][A-Za-z_0-9]*\s*=', body[field.end():], maxsplit=1)[0]
+        error = error.strip().strip('\"\'')
+        prefix = "stream disconnected before completion: "
+        if error == prefix + "websocket closed by server before response.completed":
+            return "websocket"
+        if error.startswith(prefix + "IO error: ") and error.endswith("(os error 10054)"):
+            return "reset"
+        return None
+
     def poll(self):
         self.last_new_error_at = None
         if not self.enabled:
@@ -897,14 +911,22 @@ class LogSignals:
                     WHERE id>? AND id<=? AND
                     ((target LIKE '%responses_retry%' AND
                       (feedback_log_body LIKE '%error sending request%' OR feedback_log_body LIKE '%error decoding response body%'))
-                     OR (target='codex_http_client::client' AND feedback_log_body LIKE '%error sending request%'))
+                     OR (target='codex_http_client::client' AND feedback_log_body LIKE '%error sending request%')
+                     OR (target='codex_core::responses_retry' AND
+                         (feedback_log_body LIKE '%websocket closed by server before response.completed%'
+                          OR feedback_log_body LIKE '%(os error 10054)%')))
                     ORDER BY id""", (self.last_id, highest)).fetchall()
                 for stamp, process, thread, target, raw in rows:
                     body = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw or '')
                     source = "client" if target == "codex_http_client::client" else "retry"
                     if source == "client" and not self._responses_request(body):
                         continue
-                    kind = "decode" if "error decoding response body" in body.lower() else "send"
+                    lower = body.lower()
+                    kind = ("decode" if "error decoding response body" in lower else
+                            "send" if "error sending request" in lower else
+                            self._retry_stream_kind(body) if target == "codex_core::responses_retry" else None)
+                    if kind is None:
+                        continue
                     stamp = float(stamp)
                     key = self._error_key(process, thread, body, kind)
                     if key is not None:

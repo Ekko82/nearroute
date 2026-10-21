@@ -16,10 +16,18 @@ TURN_A = "00000000-0000-0000-0000-000000000001"
 TURN_B = "00000000-0000-0000-0000-000000000002"
 SEND = "error sending request"
 DECODE = "error decoding response body"
+WS_CLOSE = "stream disconnected before completion: websocket closed by server before response.completed"
+RESET_ZH = "stream disconnected before completion: IO error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
+RESET_EN = "stream disconnected before completion: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)"
 
 
 def body(kind=SEND, turn=TURN_A, retry=1, endpoint=ENDPOINT):
     return f'method=POST url={endpoint} turn_id="{turn}" retries={retry} max_retries=5 {kind}'
+
+
+def sampling_retry(error):
+    return ("stream disconnected - retrying sampling request (1/1 in 204ms)... "
+            f"turn_id={TURN_A} retries=1 max_retries=1 sampling_error={error}")
 
 
 class LogSignalsTests(unittest.TestCase):
@@ -79,6 +87,64 @@ class LogSignalsTests(unittest.TestCase):
         self.insert(body(), target="unrelated_http_client")
         self.assertEqual(self.signals.poll(), 4)
         self.assertEqual(self.signals.last_new_error_at, 1000)
+
+    def test_sampling_websocket_close_and_windows_reset_are_new_transport_signals(self):
+        self.prime()
+        for offset, error in enumerate((WS_CLOSE, RESET_ZH, RESET_EN)):
+            text = sampling_retry(error)
+            if offset == 0:
+                text = text.replace("sampling_error", "\x1b[3msampling_error\x1b[0m")
+            self.insert(text, stamp=1000 + offset)
+        self.clock.return_value = 1002
+
+        self.assertEqual(self.signals.poll(), 3)
+        self.assertEqual(self.signals.last_new_error_at, 1002)
+        self.clock.return_value = 1007
+        self.assertEqual(self.signals.poll(), 3)
+        self.assertIsNone(self.signals.last_new_error_at, "a quiet poll must not extend recovery")
+        for error in (WS_CLOSE, RESET_ZH, RESET_EN):
+            self.assertNotIn(error, repr(vars(self.signals)))
+
+    def test_sampling_transport_signals_require_the_actual_error_field_and_source(self):
+        cases = [
+            ("other logger", sampling_retry(WS_CLOSE), "user_transcript"),
+            ("similar logger", sampling_retry(WS_CLOSE), "unrelated_responses_retry"),
+            ("missing retry template", "sampling_error=" + WS_CLOSE, RETRY),
+            ("missing error field", sampling_retry(WS_CLOSE).replace("sampling_error=", "note="), RETRY),
+            ("authentication body", sampling_retry('authentication failed 401: "' + WS_CLOSE + '"'), RETRY),
+            ("service error body", sampling_retry('unexpected status 503 Service Unavailable: "' + WS_CLOSE + '"'), RETRY),
+            ("rate limit body", sampling_retry('stream disconnected before completion: HTTP 429: "' + WS_CLOSE + '"'), RETRY),
+            ("second error field", sampling_retry("authentication failed sampling_error=" + WS_CLOSE), RETRY),
+            ("nested stream text", sampling_retry("stream disconnected before completion: " + WS_CLOSE), RETRY),
+            ("different reset", sampling_retry(RESET_EN.replace("10054", "10053")), RETRY),
+            ("similar reset number", sampling_retry(RESET_EN.replace("10054", "100540")), RETRY),
+            ("bare number", sampling_retry(RESET_EN.replace("(os error 10054)", "10054")), RETRY),
+            ("reset in another field", sampling_retry("stream disconnected before completion: IO error: closed")
+             + ' other_error="(os error 10054)"', RETRY),
+            ("unrelated HTTP endpoint", body(endpoint="https://example.org/health") + " " + WS_CLOSE, CLIENT),
+        ]
+        for label, text, target in cases:
+            with self.subTest(case=label):
+                signals = optimizer.LogSignals(str(self.path))
+                self.assertEqual(signals.poll(), 0)
+                self.insert(text, target=target)
+                self.assertEqual(signals.poll(), 0)
+                self.assertIsNone(signals.last_new_error_at)
+
+    def test_wrapped_stream_errors_keep_existing_send_decode_pairing(self):
+        for legacy in (SEND, DECODE):
+            with self.subTest(kind=legacy):
+                signals = optimizer.LogSignals(str(self.path))
+                self.assertEqual(signals.poll(), 0)
+                # A client send can include an inner decoding failure; keep the
+                # existing classification before considering the new WS suffix.
+                client_error = SEND if legacy == SEND else SEND + ": " + DECODE
+                self.insert(body(client_error), target=CLIENT)
+                self.assertEqual(signals.poll(), 1)
+                self.insert(sampling_retry(legacy + ": " + WS_CLOSE), stamp=1001)
+                self.clock.return_value = 1001
+                self.assertEqual(signals.poll(), 1)
+                self.assertIsNone(signals.last_new_error_at)
 
     def test_complete_cross_logger_duplicates_pair_one_to_one_across_polls(self):
         self.prime()
