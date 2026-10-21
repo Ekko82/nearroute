@@ -498,7 +498,7 @@ def _run_installer(prepared, root, parent_pid, python_exe):
             raise UpdateError("源码检出目录不能使用内置安装")
         result = subprocess.run([python_exe, "-B", str(root / "optimizer.py"), "stop"], cwd=root,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                creationflags=NO_WINDOW, timeout=35, check=False)
+                                creationflags=NO_WINDOW, timeout=45, check=False)
         if result.returncode:
             raise UpdateError("后台尚未退出，已取消更新")
         spec = importlib.util.spec_from_file_location("nearroute_update_core", root / "optimizer.py")

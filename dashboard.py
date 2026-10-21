@@ -1628,7 +1628,7 @@ class Dashboard:
                 result = subprocess.run(
                     [python_executable(), str(OPTIMIZER), "stop"], cwd=ROOT,
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    creationflags=NO_WINDOW, timeout=35, check=False,
+                    creationflags=NO_WINDOW, timeout=45, check=False,
                 )
                 self.tray_actions.put("exited" if result.returncode == 0 else "exit_failed")
             except (OSError, subprocess.TimeoutExpired):

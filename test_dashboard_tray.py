@@ -174,7 +174,7 @@ class DashboardTrayTests(unittest.TestCase):
         self.finish_worker()
         self.app.root.destroy.assert_not_called()
         self.assertEqual(self.run.call_args.args[0][-1], "stop")
-        self.assertEqual(self.run.call_args.kwargs["timeout"], 35)
+        self.assertEqual(self.run.call_args.kwargs["timeout"], 45)
         self.assertFalse(self.run.call_args.kwargs["check"])
         self.app.poll_tray()
         self.assertTrue(self.app.closed)
@@ -196,7 +196,7 @@ class DashboardTrayTests(unittest.TestCase):
         self.assertEqual(len(self.threads), 2)
 
     def test_stop_timeout_keeps_gui_open(self):
-        self.run.side_effect = subprocess.TimeoutExpired(["mock-python", "optimizer.py", "stop"], 35)
+        self.run.side_effect = subprocess.TimeoutExpired(["mock-python", "optimizer.py", "stop"], 45)
         self.app.request_exit()
         self.finish_worker()
         self.app.poll_tray()

@@ -615,6 +615,8 @@ class RuntimeTests(unittest.TestCase):
         self.api.proxies["Main"]["now"] = "JP fast"
         self.api.proxies["Other"] = {"type": "Selector", "all": ["old-other", "fast-other"], "now": "fast-other"}
         self.api.proxies["ManualGroup"] = {"type": "Selector", "all": ["old-manual", "owned-manual", "user-manual"], "now": "user-manual"}
+        for name in ("old-other", "fast-other", "old-manual", "owned-manual", "user-manual"):
+            self.api.proxies[name] = {"type": "Trojan"}
         for group, baseline, selected in (("Main", "JP old", "JP fast"),
                                            ("Other", "old-other", "fast-other"),
                                            ("ManualGroup", "old-manual", "owned-manual")):

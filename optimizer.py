@@ -1173,7 +1173,8 @@ class Optimizer:
         # Do not overwrite an intervening manual change in the client.
         api = api or self.api
         proxies = api.request("/proxies")["proxies"]
-        if proxies.get(group, {}).get("now") == candidate:
+        if (proxies.get(group, {}).get("now") == candidate
+                and candidate in flatten_candidates(proxies, candidate)):
             if original not in proxies.get(group, {}).get("all", []):
                 raise ControllerError("原节点暂不可用，回滚记录已保留，请恢复节点后重试")
             api.select(group, original)
@@ -1257,11 +1258,17 @@ class Optimizer:
 
             result = self.verify_path(general, self.cfg["verification_idle_seconds"],
                                       cancel=cancel_verification)
-            _, latest, _ = self.require_active_mode(mode)
+            general, latest, _ = self.require_active_mode(mode)
             self.reload_config()
             if latest.get(group, {}).get("now") != candidate:
                 event("selection_changed_during_validation", group=group)
                 return False
+            if (candidate not in latest[group].get("all", [])
+                    or candidate not in flatten_candidates(latest, group)
+                    or active_path(general, latest, group) != (*mode, candidate, candidate)):
+                self.failures = 0
+                self.status.update(last_health_at=None, consecutive_health_failures=0)
+                raise PathChanged("候选线路在验证期间已改变，已丢弃旧线路的检查结果")
             if result["ok"] and self.transport_recovery_active(force=True):
                 result = {"ok": False, "cancelled": True, "reason": "Codex 正在恢复连接，已取消普通自动换点"}
             if (result["ok"] and self.cfg["enabled"] and not self.stopping() and not (STATE / "select.request.json").exists()
@@ -1568,7 +1575,8 @@ class Optimizer:
 def stop_daemon():
     STATE.mkdir(parents=True, exist_ok=True)
     (STATE / "stop.request").touch()
-    deadline = time.monotonic() + 25
+    # A supported 15-second probe can keep a controller delay request open for 33 seconds.
+    deadline = time.monotonic() + 40
     while time.monotonic() < deadline:
         lock = InstanceLock()
         if lock.acquire():
@@ -1663,7 +1671,8 @@ def _restore_original_locked():
                      for item in owned_records(controlled))
                  or (pending_matches and pending.get("candidate") == now))
         if now != saved["name"]:
-            if not owned or saved["name"] not in proxies[group].get("all", []):
+            if (not owned or now not in flatten_candidates(proxies, now)
+                    or saved["name"] not in proxies[group].get("all", [])):
                 continue
             api.select(group, saved["name"])
             proxies = api.request("/proxies")["proxies"]
