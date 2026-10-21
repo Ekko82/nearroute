@@ -7,6 +7,7 @@ from pathlib import Path
 import ssl
 import tempfile
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -301,6 +302,49 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
         self.assertEqual(self.api.select_calls, [("Main", "JP fast"), ("Main", "JP old")])
 
+    def test_pause_during_validation_idle_cancels_before_another_request(self):
+        for pause in (True, False):
+            with self.subTest(pause=pause):
+                self.cfg.update(enabled=True, verification_idle_seconds=20)
+                clock = [1000.0]
+                paused_at = []
+                requests = []
+                connection = MagicMock()
+                connection.sock = object()
+                connection.getresponse.return_value = SimpleNamespace(status=405, length=0, read=lambda _limit: b"")
+                connection.request.side_effect = lambda *_args, **_kwargs: requests.append(clock[0])
+
+                def sleep(seconds):
+                    clock[0] = round(clock[0] + seconds, 6)
+                    if pause and not paused_at:
+                        paused_at.append(clock[0])
+                        self.cfg["enabled"] = False  # The configuration saved by the Pause action.
+
+                optimizer.load_config.reset_mock()
+                self.verify.side_effect = REAL_VERIFY
+                start = len(self.api.select_calls)
+                with patch.object(optimizer.time, "monotonic", side_effect=lambda: clock[0]), \
+                     patch.object(optimizer.time, "perf_counter", side_effect=lambda: clock[0]), \
+                     patch.object(optimizer.time, "sleep", side_effect=sleep), \
+                     patch.object(optimizer.http.client, "HTTPSConnection", return_value=connection):
+                    committed = self.helper.change_candidate(self.api.general, "Main", "JP old", "JP fast")
+                connection.close.assert_called_once()
+                if pause:
+                    self.assertFalse(committed)
+                    self.assertEqual(len(requests), 1)
+                    self.assertLessEqual(clock[0] - paused_at[0], 1.0)
+                    self.assertEqual(self.api.select_calls[start:], [("Main", "JP fast"), ("Main", "JP old")])
+                    self.assertEqual(self.helper.quarantine, {})
+                    self.assertFalse((self.state / "selection.json").exists())
+                    self.helper.recover_pending()  # The scan caller retires the completed rollback.
+                    self.assertFalse((self.state / "pending-selection.json").exists())
+                else:
+                    self.assertTrue(committed)
+                    self.assertEqual(len(requests), 3)
+                    self.assertEqual(self.api.select_calls[start:], [("Main", "JP fast")])
+                # Forty seconds of idle verification must not reread config every 0.2 seconds.
+                self.assertLessEqual(optimizer.load_config.call_count, 2 * self.cfg["verification_idle_seconds"] + 4)
+
     def test_ambiguous_put_failure_preserves_journal_and_recovers_later(self):
         self.api.lose_next_put_response = True
         with self.assertRaises(optimizer.ControllerError):
@@ -577,7 +621,7 @@ class RuntimeTests(unittest.TestCase):
 class TLSVerificationTests(unittest.TestCase):
     def test_proxy_tls_verifies_certificates_and_hostname(self):
         conn = MagicMock()
-        response = MagicMock(status=405)
+        response = MagicMock(status=405, length=0)
         conn.getresponse.return_value = response
         with patch.object(optimizer.http.client, "HTTPSConnection", return_value=conn) as make_conn:
             result = REAL_VERIFY({"mixed-port": 10090})
@@ -615,7 +659,7 @@ class TLSVerificationTests(unittest.TestCase):
         sockets = iter([object(), object(), object()])
         def response_with_new_socket():
             conn.sock = next(sockets)
-            return MagicMock(status=405)
+            return MagicMock(status=405, length=0)
         conn.getresponse.side_effect = response_with_new_socket
         clock = iter(range(0, 100, 2))
         with patch.object(optimizer.http.client, "HTTPSConnection", return_value=conn), \

@@ -477,15 +477,16 @@ def choose_candidate(stats, current, last_switch_at, now, min_improvement_ms=60,
     old = next((s for s in stats if s["name"] == current and s.get("eligible")), None)
     if best["name"] == current:
         return None, "当前节点已是本轮最优"
-    if current_failed or old is None:
-        if not current_failed and any(s["name"] == current and s.get("region_standby") for s in stats):
-            if last_switch_at and now - last_switch_at < cooldown_seconds:
-                return None, "等待地区优选切换冷却结束"
+    if current_failed:
+        return best["name"], "当前节点不可用，故障切换"
+    region_standby = old is None and any(s["name"] == current and s.get("region_standby") for s in stats)
+    if last_switch_at and now - last_switch_at < cooldown_seconds:
+        return None, "等待地区优选切换冷却结束" if region_standby else "处于切换冷却期"
+    if old is None:
+        if region_standby:
             reason = "日本线路已符合优先条件，切回日本" if is_japan_node(best["name"]) else "改用符合地区备用条件的节点"
             return best["name"], reason
-        return best["name"], "当前节点不可用，故障切换"
-    if last_switch_at and now - last_switch_at < cooldown_seconds:
-        return None, "处于切换冷却期"
+        return best["name"], "当前节点暂无可比较评分，改用符合稳定性门槛的节点"
     improvement = old["score_ms"] - best["score_ms"]
     ratio = improvement / old["score_ms"] if old["score_ms"] else 0
     if improvement + 1e-9 < min_improvement_ms or ratio + 1e-9 < min_improvement_ratio:
@@ -656,14 +657,14 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
     delays, sock = [], None
     try:
         for index in range(3 if idle_seconds else 1):
-            if cancel and cancel():
-                return {"ok": False, "reason": "验证已取消", "cancelled": True}
             if index:
                 deadline = time.monotonic() + idle_seconds
                 while time.monotonic() < deadline:
                     if cancel and cancel():
                         return {"ok": False, "reason": "验证已取消", "cancelled": True}
                     time.sleep(min(0.2, max(0, deadline - time.monotonic())))
+            if cancel and cancel():
+                return {"ok": False, "reason": "验证已取消", "cancelled": True}
             started = time.perf_counter()
             conn.request("GET", request_path, headers={"Accept": "*/*", "User-Agent": "NearRoute/1.0", "Connection": "keep-alive"})
             response = conn.getresponse()
@@ -673,6 +674,8 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
             body = response.read(65537)
             if len(body) > 65536:
                 return {"ok": False, "reason": "测试响应超过 64 KiB，请选择轻量健康检查链接"}
+            if response.length is not None and response.length > 0:
+                raise http.client.IncompleteRead(body, response.length)
             if idle_seconds:
                 if conn.sock is None or (sock is not None and conn.sock is not sock):
                     return {"ok": False, "reason": "连接未能持续复用"}
@@ -1085,23 +1088,30 @@ class Optimizer:
     def measure_round(self, names, title, *, forced=False):
         policy = selection_policy(self.cfg)
         results = {}
+        if self.stopping() or self.process_manual_selection() or selection_policy(self.cfg) != policy:
+            return results
         if not forced and self.transport_recovery_active():
             return results
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(self.cfg["concurrency"]))
         pending = {executor.submit(self.api.delay, name): name for name in names}
         try:
-            for future in concurrent.futures.as_completed(pending):
-                if self.stopping() or (not forced and self.transport_recovery_active()):
+            while pending:
+                completed, _ = concurrent.futures.wait(pending, timeout=0.1,
+                                                       return_when=concurrent.futures.FIRST_COMPLETED)
+                if self.stopping():
                     break
-                name = pending[future]
-                delay = future.result()
-                results[name] = delay
-                self.add_sample(name, delay)
                 if self.process_manual_selection() or selection_policy(self.cfg) != policy:
                     break
-                if len(results) % 5 == 0 or len(results) == len(names):
-                    self.write_status(phase="scanning", message=f"{title}：{len(results)}/{len(names)}", progress_done=len(results), progress_total=len(names),
-                                      nodes=self.statistics(self.scan_display_names or names))
+                if not forced and self.transport_recovery_active():
+                    break
+                for future in completed:
+                    name = pending.pop(future)
+                    delay = future.result()
+                    results[name] = delay
+                    self.add_sample(name, delay)
+                    if len(results) % 5 == 0 or len(results) == len(names):
+                        self.write_status(phase="scanning", message=f"{title}：{len(results)}/{len(names)}", progress_done=len(results), progress_total=len(names),
+                                          nodes=self.statistics(self.scan_display_names or names))
         finally:
             for future in pending:
                 future.cancel()
@@ -1165,9 +1175,20 @@ class Optimizer:
             if self.defer_recovery_scan(force=True):
                 return False
             self.api.select(group, candidate)
+            last_pause_check = None
+
+            def cancel_verification():
+                nonlocal last_pause_check
+                if self.stopping() or (STATE / "select.request.json").exists() or self.transport_recovery_active():
+                    return True
+                now = time.monotonic()
+                if last_pause_check is None or now - last_pause_check >= 1:
+                    last_pause_check = now
+                    return not load_config()["enabled"]
+                return False
+
             result = self.verify_path(general, self.cfg["verification_idle_seconds"],
-                                      cancel=lambda: self.stopping() or (STATE / "select.request.json").exists()
-                                      or self.transport_recovery_active())
+                                      cancel=cancel_verification)
             _, latest, _ = self.require_active_mode(mode)
             self.reload_config()
             if latest.get(group, {}).get("now") != candidate:

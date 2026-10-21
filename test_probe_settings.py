@@ -124,7 +124,7 @@ class ConfigurableProbeTransportTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.conn = MagicMock()
-        self.response = MagicMock(status=204)
+        self.response = MagicMock(status=204, length=0)
         self.conn.getresponse.return_value = self.response
         self.https = self.stack.enter_context(patch.object(optimizer.http.client, "HTTPSConnection", return_value=self.conn))
         self.http = self.stack.enter_context(patch.object(optimizer.http.client, "HTTPConnection", return_value=self.conn))

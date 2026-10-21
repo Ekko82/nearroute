@@ -89,6 +89,40 @@ class ScanSchedulingTests(unittest.TestCase):
                     self.assertEqual(f.api.proxies["Main"]["now"], "JP fast")
                     self.assertEqual(f.helper.record["name"], "JP fast")
 
+    def test_unscored_current_path_respects_health_and_cooldown_through_real_scan(self):
+        for samples in ("missing", "outside_scope"):
+            for outcome in ("healthy_cooldown", "fault_cooldown", "cooldown_boundary", "first_selection"):
+                with self.subTest(samples=samples, outcome=outcome), self.runtime() as f:
+                    f.clock[0] = 2800 if outcome == "cooldown_boundary" else 1100
+                    if samples == "missing":
+                        f.api.delays["JP old"] = None
+                    else:
+                        f.cfg.update(scan_mode="nodes", scan_nodes=["JP fast"])
+                    if outcome == "first_selection":
+                        f.helper.record = {}
+                    if outcome == "fault_cooldown":
+                        f.verify.side_effect = lambda *_args, **_kwargs: {
+                            "ok": f.api.proxies["Main"]["now"] != "JP old",
+                            "reason": "fake active path failure",
+                        }
+
+                    f.helper.scan()
+
+                    # Candidate eligibility alone does not establish a path failure.
+                    f.verify.assert_called()
+                    self.assertEqual(f.helper.failures, 0)
+                    if outcome == "healthy_cooldown":
+                        self.assertTrue(f.helper.status["health"]["ok"])
+                        self.assertEqual(f.api.select_calls, [])
+                        self.assertEqual(f.verify.call_count, 1)
+                        self.assertEqual(f.api.proxies["Main"]["now"], "JP old")
+                        self.assertEqual(f.helper.record["last_switch_at"], 1000)
+                    else:
+                        self.assertEqual(f.api.select_calls, [("Main", "JP fast")])
+                        self.assertEqual(f.api.proxies["Main"]["now"], "JP fast")
+                        self.assertEqual(f.helper.record["last_switch_at"], f.clock[0])
+                        self.assertEqual(f.verify.call_count, 3 if outcome == "fault_cooldown" else 2)
+
     def test_unqualified_unhealthy_paused_dry_run_and_mismatched_records_keep_normal_interval(self):
         for scenario in ("unqualified", "unhealthy", "paused", "dry_run", "wrong_group", "wrong_name"):
             with self.subTest(scenario=scenario), self.runtime() as f:

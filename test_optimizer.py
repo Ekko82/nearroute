@@ -127,17 +127,22 @@ class SwitchPolicyTests(unittest.TestCase):
             "backup",
         )
 
-    def test_missing_current_measurement_bypasses_cooldown(self):
-        self.assertEqual(
-            self.choose([self.node("backup", 250)], last_switch_at=999), "backup"
-        )
+    def test_missing_current_measurement_respects_cooldown_without_confirmed_failure(self):
+        stats = [self.node("backup", 250)]
+        self.assertIsNone(self.choose(stats, last_switch_at=999))
+        self.assertEqual(self.choose(stats, last_switch_at=999, now=2799), "backup")
+        self.assertEqual(self.choose(stats, last_switch_at=999, current_failed=True), "backup")
+        self.assertEqual(self.choose(stats), "backup")
 
-    def test_ineligible_current_bypasses_cooldown(self):
+    def test_ineligible_current_respects_cooldown_without_confirmed_failure(self):
         stats = [
             summarize_samples("current", [None, None, None]),
             self.node("backup", 250),
         ]
-        self.assertEqual(self.choose(stats, last_switch_at=999), "backup")
+        self.assertIsNone(self.choose(stats, last_switch_at=999))
+        self.assertEqual(self.choose(stats, last_switch_at=999, now=2799), "backup")
+        self.assertEqual(self.choose(stats, last_switch_at=999, current_failed=True), "backup")
+        self.assertEqual(self.choose(stats), "backup")
 
     def test_no_eligible_candidate_means_no_switch_even_after_failure(self):
         stats = [
