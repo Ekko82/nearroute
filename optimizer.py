@@ -1331,6 +1331,10 @@ class Optimizer:
         # Do not overwrite an intervening manual change in the client.
         api = api or self.api
         proxies = api.request("/proxies")["proxies"]
+        current = proxies.get(group, {}).get("now")
+        current_proxy = proxies.get(current, {})
+        if current_proxy and (current != candidate or isinstance(current_proxy.get("all"), list)):
+            return "superseded"
         if (proxies.get(group, {}).get("now") == candidate
                 and candidate in flatten_candidates(proxies, candidate)):
             if original not in proxies.get(group, {}).get("all", []):
@@ -1493,7 +1497,11 @@ class Optimizer:
                     "controller": pending["controller"],
                     "controller_secret_env": pending.get("controller_secret_env", "")})
                 api = Controller(recovery_cfg)
-            self.rollback(pending["group"], pending["candidate"], pending["previous"], api=api)
+            outcome = self.rollback(pending["group"], pending["candidate"], pending["previous"], api=api)
+            if outcome == "superseded":
+                # Retire the old claim before forgetting the unfinished handoff.
+                retire_owned_record(STATE / "selection.json", pending, pending["group"])
+                self.record = current_selection(self.cfg)
         path.unlink(missing_ok=True)
 
     def scan(self, forced=False, *, automatic=None):
