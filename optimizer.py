@@ -1348,10 +1348,10 @@ class Optimizer:
                 path.unlink(missing_ok=True)
             event("rollback", group=group, previous=candidate, restored=original)
 
-    def observe_selection(self, observation):
+    def observe_selection(self, observation, *, external_change=False):
         protection_path = STATE / "external-manual.json"
         context = list(self.state_context)
-        if self.observed_selection is None:
+        if self.observed_selection is None and not external_change:
             data = read_json(protection_path, {})
             records = data.get("records", []) if data.get("schema_version") == 1 else []
             saved = next((item for item in records if item.get("context") == context), {})
@@ -1362,7 +1362,7 @@ class Optimizer:
                     and time.time() < saved.get("manual_until", 0)):
                 self.manual_until = saved["manual_until"]
                 self.status["manual_until"] = iso(self.manual_until)
-        elif observation != self.observed_selection:
+        elif external_change or observation != self.observed_selection:
             self.failures = 0
             self.next_scan = 0
             self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
@@ -1502,6 +1502,10 @@ class Optimizer:
                 # Retire the old claim before forgetting the unfinished handoff.
                 retire_owned_record(STATE / "selection.json", pending, pending["group"])
                 self.record = current_selection(self.cfg)
+                if same_controller(pending, self.cfg):
+                    general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
+                    if group == pending["group"]:
+                        self.observe_selection(active_path(general, proxies, group), external_change=True)
         path.unlink(missing_ok=True)
 
     def scan(self, forced=False, *, automatic=None):

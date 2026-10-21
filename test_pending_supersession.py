@@ -62,6 +62,7 @@ class PendingSupersessionTests(unittest.TestCase):
             self.assertEqual(fixture.api.select_calls, [("Main", "JP manual")])
             self.assertFalse((fixture.state / "pending-selection.json").exists())
             self.assertEqual(optimizer.current_selection(fixture.cfg)["name"], "JP manual")
+            self.assertEqual(fixture.helper.manual_until, 0)
             self.assertEqual(optimizer.restore_original(), ["Main"])
             self.assertEqual(fixture.api.select_calls, [("Main", "JP manual"), ("Main", "JP old")])
 
@@ -80,24 +81,34 @@ class PendingSupersessionTests(unittest.TestCase):
             self.assertEqual(fixture.api.select_calls, [("Main", "JP old")])
 
     def test_retired_ownership_does_not_break_external_grace_after_restart(self):
-        clock = [1000.0]
-        with patch.object(optimizer.time, "time", side_effect=lambda: clock[0]), self.runtime(pending=True) as fixture:
-            clock[0] = 3000.0
-            fixture.api.proxies["Main"]["now"] = "JP old"
-            fixture.helper.scan(forced=True)
-            self.assertEqual(fixture.api.select_calls, [])
-            self.assertEqual(optimizer.current_selection(fixture.cfg), {})
-            self.assertEqual(fixture.helper.manual_until, 3600)
+        for external_choice in ("JP old", "JP manual"):
+            with self.subTest(external_choice=external_choice):
+                clock = [1000.0]
+                with patch.object(optimizer.time, "time", side_effect=lambda: clock[0]), self.runtime(pending=True) as fixture:
+                    clock[0] = 3000.0
+                    fixture.api.proxies["Main"]["now"] = external_choice
+                    fixture.helper.scan(forced=True)
+                    self.assertEqual(fixture.api.select_calls, [])
+                    self.assertEqual(optimizer.current_selection(fixture.cfg), {})
+                    grace_after_recovery = fixture.helper.manual_until
 
-            clock[0] = 3010.0
-            fixture.cfg["enabled"] = True
-            restarted = optimizer.Optimizer()
-            restarted.scan(forced=True)
+                    clock[0] = 3010.0
+                    fixture.cfg["enabled"] = True
+                    fixture.helper.scan(forced=True)
 
-            self.assertEqual(fixture.api.select_calls, [], "restarting must retain the external choice for ten minutes")
-            self.assertEqual(fixture.api.proxies["Main"]["now"], "JP old")
-            self.assertEqual(restarted.manual_until, 3600)
-            self.assertEqual(restarted.status["manual_until"], optimizer.iso(3600))
+                    self.assertEqual(fixture.api.select_calls, [], "enabling must retain the external choice for ten minutes")
+                    self.assertEqual(fixture.api.proxies["Main"]["now"], external_choice)
+                    self.assertEqual(grace_after_recovery, 3600)
+                    self.assertEqual(fixture.helper.manual_until, 3600)
+
+                    clock[0] = 3020.0
+                    restarted = optimizer.Optimizer()
+                    restarted.scan(forced=True)
+
+                    self.assertEqual(fixture.api.select_calls, [], "restarting must retain the external choice for ten minutes")
+                    self.assertEqual(fixture.api.proxies["Main"]["now"], external_choice)
+                    self.assertEqual(restarted.manual_until, 3600)
+                    self.assertEqual(restarted.status["manual_until"], optimizer.iso(3600))
 
     def test_retirement_write_failure_preserves_pending_then_retry_keeps_other_owners(self):
         with self.runtime(pending=True) as fixture:
