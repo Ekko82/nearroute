@@ -245,5 +245,120 @@ class ScanSchedulingTests(unittest.TestCase):
                 self.assertEqual(f.helper.failures, 0)
 
 
+class NewPathHealthSchedulingTests(unittest.TestCase):
+    @contextmanager
+    def external_path_after_scan(self):
+        fixture = test_runtime.RuntimeTests()
+        fixture.clock = [1000.0]
+        try:
+            with patch.object(optimizer.time, "time", side_effect=lambda: fixture.clock[0]):
+                fixture.setUp()
+                fixture.cfg.update(concurrency=1, probe_timeout_ms=15000)
+                fixture.cfg = optimizer.validate_config(fixture.cfg)
+                select = fixture.helper.change_candidate
+
+                def external_choice(*args, **kwargs):
+                    changed = select(*args, **kwargs)
+                    if changed:
+                        fixture.api.proxies["Main"]["now"] = "JP manual"
+                    return changed
+
+                with patch.object(fixture.helper, "change_candidate", side_effect=external_choice):
+                    fixture.helper.scan(forced=True)
+                self.assertEqual(fixture.helper.status["selected"], "JP manual")
+                self.assertIsNone(fixture.helper.status["health"])
+                self.assertEqual(fixture.helper.next_scan, 0)
+                self.assertEqual(fixture.helper.last_health, 0)
+                yield fixture
+        finally:
+            fixture.doCleanups()
+
+    def run_until_next_scan(self, fixture, healthy=True):
+        events, health_statuses, scan_statuses, delays = [], [], [], []
+        stopped = False
+        deadline = fixture.clock[0] + 180
+        scan = fixture.helper.scan
+        tick = fixture.helper.tick_health
+        fixture.verify.return_value = ({"ok": True, "http_status": 405}
+                                       if healthy else {"ok": False, "http_status": 403, "reason": "new path failed"})
+
+        def slow_delay(name):
+            delays.append(name)
+            fixture.clock[0] += 5
+            return 5000
+
+        def record_health():
+            events.append(("health", fixture.clock[0], len(delays)))
+            tick()
+            health_statuses.append(optimizer.read_json(fixture.state / "status.json", {}))
+
+        def record_scan(*args, **kwargs):
+            nonlocal stopped
+            events.append(("scan", fixture.clock[0], kwargs.get("forced", False)))
+            scan_statuses.append(optimizer.read_json(fixture.state / "status.json", {}))
+            scan(*args, **kwargs)
+            stopped = True
+
+        def advance(seconds):
+            fixture.clock[0] += seconds
+
+        with patch.object(fixture.api, "delay", side_effect=slow_delay), \
+             patch.object(fixture.helper, "tick_health", side_effect=record_health), \
+             patch.object(fixture.helper, "scan", side_effect=record_scan), \
+             patch.object(fixture.helper, "stopping", side_effect=lambda: stopped or fixture.clock[0] >= deadline), \
+             patch.object(optimizer.time, "sleep", side_effect=advance):
+            fixture.helper.run()
+        self.assertTrue(stopped, "the next scan must complete without starving behind health checks")
+        self.assertTrue(delays, "run must execute the real candidate measurement path")
+        return events, health_statuses, scan_statuses
+
+    def test_new_external_path_health_is_published_before_another_ordinary_scan(self):
+        for healthy in (True, False):
+            with self.subTest(healthy=healthy), self.external_path_after_scan() as fixture:
+                selected_before = list(fixture.api.select_calls)
+                changed_at = fixture.clock[0]
+
+                events, health_statuses, scan_statuses = self.run_until_next_scan(fixture, healthy)
+
+                self.assertEqual([event[0] for event in events], ["health", "scan"])
+                self.assertEqual(events[0][2], 0, "new-path health must not wait for candidate probes")
+                self.assertLess(events[0][1] - changed_at, fixture.cfg["health_interval_seconds"])
+                status = health_statuses[0]
+                self.assertEqual(status["selected"], "JP manual")
+                self.assertEqual(status["health"]["ok"], healthy)
+                self.assertEqual(status["health"]["http_status"], 405 if healthy else 403)
+                self.assertEqual(status["last_health_at"], optimizer.iso(events[0][1]))
+                self.assertEqual(status["consecutive_health_failures"], 0 if healthy else 1)
+                self.assertEqual(scan_statuses[0]["health"], status["health"])
+                self.assertGreater(fixture.helper.last_scan, changed_at)
+                self.assertEqual(fixture.api.select_calls, selected_before)
+
+    def test_existing_fault_and_transport_recovery_scans_keep_priority(self):
+        for reason in ("fault", "transport_recovery"):
+            with self.subTest(reason=reason), self.external_path_after_scan() as fixture:
+                if reason == "fault":
+                    fixture.helper.failures = 2
+                else:
+                    fixture.helper.recovery_scan_pending = True
+                    fixture.helper.recovery_until = fixture.clock[0]
+
+                events, health_statuses, _ = self.run_until_next_scan(fixture)
+
+                self.assertEqual(events[0][0], "scan")
+                self.assertFalse(events[0][2])
+                self.assertEqual(health_statuses, [])
+
+    def test_forced_scan_keeps_priority_over_unverified_path_health(self):
+        with self.external_path_after_scan() as fixture:
+            (fixture.state / "scan.request").touch()
+
+            events, health_statuses, _ = self.run_until_next_scan(fixture)
+
+            self.assertEqual(events[0][0], "scan")
+            self.assertTrue(events[0][2])
+            self.assertEqual(health_statuses, [])
+            self.assertFalse((fixture.state / "scan.request").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
