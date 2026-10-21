@@ -1619,6 +1619,8 @@ def configure_client(fields, expected_context=None):
             candidate = validate_config(current | fields)
             _check_client_environment(candidate)
             changed = state_context(candidate) != state_context(current)
+            scan_request = STATE / "scan.request"
+            had_pending_scan = False
             if changed:
                 candidate["enabled"] = False
                 atomic_json(STATE / "status.json", {
@@ -1628,7 +1630,14 @@ def configure_client(fields, expected_context=None):
                     "selected": None, "nodes": [], "health": None, "last_error": None,
                     "message": "代理客户端设置已保存，自动优选保持暂停", "updated_at": iso(),
                 })
-            atomic_json(CONFIG, candidate)
+                had_pending_scan = scan_request.exists()
+                scan_request.unlink(missing_ok=True)
+            try:
+                atomic_json(CONFIG, candidate)
+            except OSError:
+                if had_pending_scan:
+                    scan_request.touch()
+                raise
         return candidate
     finally:
         lock.close()
@@ -1658,12 +1667,24 @@ def _restore_original_locked():
     controlled = read_json(STATE / "selection.json", {})
     pending = pending_record(read_json(STATE / "pending-selection.json", {}))
     proxies = api.request("/proxies")["proxies"]
+    superseded_group = None
+    if same_controller(pending, cfg) and isinstance(pending.get("candidate"), str) and pending["candidate"]:
+        pending_group = pending.get("group")
+        current_name = proxies.get(pending_group, {}).get("now")
+        current_proxy = proxies.get(current_name, {})
+        if current_proxy and (current_name != pending["candidate"] or isinstance(current_proxy.get("all"), list)):
+            # The snapshot proves this transaction no longer owns the path.
+            # Retire older ownership first so retrying restore cannot reclaim it.
+            retire_owned_record(STATE / "selection.json", cfg, pending_group)
+            (STATE / "pending-selection.json").unlink(missing_ok=True)
+            superseded_group = pending_group
+            pending = {}
     restored = []
     for saved in owned_records(original):
         if not same_controller(saved, cfg):
             continue
         group = saved["group"]
-        if group not in proxies:
+        if group not in proxies or group == superseded_group:
             continue
         now = proxies.get(group, {}).get("now")
         pending_matches = same_controller(pending, cfg) and pending.get("group") == group

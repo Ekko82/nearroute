@@ -81,7 +81,7 @@ class CandidateValidationTests(unittest.TestCase):
                     fixture.api.offline = False
                 fixture.api.select_calls.clear()
                 saved = {name: (fixture.state / name).read_bytes()
-                         for name in ("original-selection.json", "selection.json", "pending-selection.json")
+                         for name in ("original-selection.json", "selection.json")
                          if (fixture.state / name).exists()}
                 fixture.api.proxies["JP fast"] = {
                     "type": "Selector", "all": ["JP manual"], "now": "JP manual",
@@ -95,6 +95,7 @@ class CandidateValidationTests(unittest.TestCase):
                 status = optimizer.read_json(fixture.state / "status.json", {})
                 self.assertEqual(status["selected"], "JP manual")
                 self.assertIsNone(status["health"])
+                self.assertFalse((fixture.state / "pending-selection.json").exists())
                 for name, contents in saved.items():
                     self.assertEqual((fixture.state / name).read_bytes(), contents)
 

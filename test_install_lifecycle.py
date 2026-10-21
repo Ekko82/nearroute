@@ -125,6 +125,18 @@ class InstallLifecycleTests(unittest.TestCase):
         except FileNotFoundError:
             return None
 
+    def move_application(self):
+        base = Path(self.temp.name).resolve()
+        source = self.app.resolve()
+        destination = (base / "Moved NearRoute app 🚣").resolve()
+        for path in (source, destination):
+            self.assertNotEqual(path, base)
+            self.assertTrue(path.is_relative_to(base), "fixture move must stay inside its temporary directory")
+        source.rename(destination)
+        self.app = destination
+        self.state = destination / "state/install-state.json"
+        return source
+
     @contextmanager
     def lock_shortcut_against_replacement(self):
         api = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -195,6 +207,53 @@ class InstallLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.run_value())
         self.assertTrue((self.app / "state/stop.request").is_file())
         self.assertFalse(json.loads(self.state.read_text(encoding="utf-8-sig"))["installed"])
+
+    def test_uninstalled_application_can_move_and_install_without_losing_configuration(self):
+        self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python)
+        config = self.app / "config.json"
+        original_config = config.read_bytes() + b"\n"
+        config.write_bytes(original_config)
+        old_root = self.app
+        self.assertIn(str(old_root / "launch.ps1"), self.run_value())
+
+        self.run_script("uninstall.ps1", "-NoRestore", "-PythonExe", self.python)
+        self.assertIsNone(self.run_value())
+        self.assertFalse(self.shortcut.exists())
+        self.assertFalse(json.loads(self.state.read_text(encoding="utf-8-sig"))["installed"])
+        self.move_application()
+
+        self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python)
+
+        state = json.loads(self.state.read_text(encoding="utf-8-sig"))
+        self.assertTrue(state["installed"])
+        self.assertEqual(state["root"], str(self.app))
+        self.assertEqual((self.app / "config.json").read_bytes(), original_config)
+        self.assertIn(str(self.app / "launch.ps1"), self.run_value())
+        self.assertNotIn(str(old_root / "launch.ps1"), self.run_value())
+        self.assert_owned_shortcut()
+        self.run_script("uninstall.ps1", "-NoRestore", "-PythonExe", self.python)
+        self.assertIsNone(self.run_value())
+        self.assertFalse(self.shortcut.exists())
+        self.assertEqual((self.app / "config.json").read_bytes(), original_config)
+
+    def test_moved_active_install_cannot_claim_old_startup_or_shortcut(self):
+        self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python)
+        state = json.loads(self.state.read_text(encoding="utf-8-sig"))
+        before_run = self.run_value()
+        before_shortcut = self.shortcut.read_bytes()
+        self.move_application()
+
+        for installed in (True, None, "false", "missing"):
+            with self.subTest(installed=installed):
+                candidate = state | {"installed": installed}
+                if installed == "missing":
+                    candidate.pop("installed")
+                self.state.write_text(json.dumps(candidate), encoding="utf-8")
+                before_state = self.state.read_bytes()
+                self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python, success=False)
+                self.assertEqual(self.state.read_bytes(), before_state)
+                self.assertEqual(self.run_value(), before_run)
+                self.assertEqual(self.shortcut.read_bytes(), before_shortcut)
 
     def test_uninstall_preserves_user_modified_startup_and_shortcut(self):
         self.run_script("install.ps1", "-NoStart", "-PythonExe", self.python)

@@ -48,7 +48,8 @@ $existingStateJson = $null
 if (Test-Path -LiteralPath $installStatePath -PathType Leaf) {
     $existingStateJson = Get-Content -LiteralPath $installStatePath -Raw -Encoding UTF8
     $existing = $existingStateJson | ConvertFrom-Json
-    if ($existing.schema_version -notin @(1, 2) -or $existing.root -ne $applicationRoot) { throw '安装记录与当前目录不匹配，请先从原目录卸载旧安装。' }
+    $explicitlyUninstalled = $existing.installed -is [bool] -and $existing.installed -eq $false
+    if ($existing.schema_version -notin @(1, 2) -or ($existing.root -ne $applicationRoot -and -not $explicitlyUninstalled)) { throw '安装记录与当前目录不匹配，请先从原目录卸载旧安装。' }
 }
 $null = New-Item -ItemType Directory -Path $stateDirectory -Force
 $runArguments = '-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "' + $launchPath + '" -Mode run -PythonExe "' + $PythonExe + '"'

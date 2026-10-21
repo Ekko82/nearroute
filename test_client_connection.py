@@ -241,6 +241,90 @@ class ClientConnectionTests(unittest.TestCase):
         self.stop.assert_not_called()
         self.lock.acquire.assert_not_called()
 
+    def test_new_connection_discards_old_scan_before_paused_helper_restarts(self):
+        self.state.mkdir()
+        request = self.state / "scan.request"
+        request.touch()
+        saved = optimizer.configure_client(
+            self.fields("http://127.0.0.1:2"), expected_context=optimizer.state_context(self.initial),
+        )
+        self.assertFalse(saved["enabled"])
+        self.assertFalse(request.exists())
+        self.lock.close.assert_called_once()
+
+        helper = optimizer.Optimizer()
+        stopped = {"value": False}
+
+        def finish(*_args, **_kwargs):
+            stopped["value"] = True
+
+        with patch.object(helper, "stopping", side_effect=lambda: stopped["value"]), \
+             patch.object(helper, "scan", side_effect=finish) as scan, \
+             patch.object(helper, "observe_paused_path", side_effect=finish) as observe:
+            helper.run()
+        scan.assert_not_called()
+        observe.assert_called_once()
+
+    def test_same_connection_keeps_pending_scan(self):
+        self.state.mkdir()
+        request = self.state / "scan.request"
+        request.touch()
+        optimizer.configure_client(
+            self.fields(self.initial["controller"]), expected_context=optimizer.state_context(self.initial),
+        )
+        self.assertTrue(request.exists())
+        self.assert_config_unchanged()
+        self.stop.assert_not_called()
+        self.lock.acquire.assert_not_called()
+
+    def test_rejected_connection_change_keeps_pending_scan(self):
+        self.state.mkdir()
+        request = self.state / "scan.request"
+        for reason in ("stop", "lock", "context", "context_after_stop"):
+            with self.subTest(reason=reason):
+                optimizer.atomic_json(self.config, self.initial)
+                request.touch()
+                self.stop.side_effect = None
+                self.stop.return_value = reason != "stop"
+                self.lock.acquire.return_value = reason != "lock"
+                expected = optimizer.state_context(self.initial)
+                stored_context = expected
+                if reason == "context":
+                    expected = ("http://127.0.0.1:3", *expected[1:])
+                elif reason == "context_after_stop":
+                    stored_context = ("http://127.0.0.1:3", *expected[1:])
+                    def changed_while_stopping():
+                        optimizer.atomic_json(self.config, self.initial | {"controller": "http://127.0.0.1:3"})
+                        return True
+                    self.stop.side_effect = changed_while_stopping
+                with self.assertRaises((RuntimeError, ValueError)):
+                    optimizer.configure_client(self.fields("http://127.0.0.1:2"), expected_context=expected)
+                self.assertTrue(request.exists())
+                self.assertEqual(optimizer.state_context(optimizer.load_config()), stored_context)
+
+    def test_config_write_failure_restores_only_the_existing_scan_intent(self):
+        self.state.mkdir()
+        request = self.state / "scan.request"
+        write = optimizer.atomic_json
+
+        def occupied_config(path, value):
+            if Path(path) == self.config:
+                self.assertFalse(request.exists())
+                raise PermissionError("fixture config file is occupied")
+            return write(path, value)
+
+        for had_request in (True, False):
+            with self.subTest(had_request=had_request):
+                request.touch() if had_request else request.unlink(missing_ok=True)
+                self.lock.close.reset_mock()
+                with patch.object(optimizer, "atomic_json", side_effect=occupied_config):
+                    with self.assertRaises(PermissionError):
+                        optimizer.configure_client(self.fields("http://127.0.0.1:2"))
+                self.assertEqual(request.exists(), had_request)
+                self.lock.close.assert_called_once()
+                with optimizer.config_update_lock():
+                    self.assert_config_unchanged()
+
     def test_status_write_failure_preserves_connection_and_releases_locks(self):
         write = optimizer.atomic_json
 
