@@ -1047,6 +1047,8 @@ class Dashboard:
             return False
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             return False
+        if self.update_dialog is not None and not self.update_dialog.closed:
+            return False
         client_dialog = getattr(self, "client_dialog", None)
         if client_dialog is not None and not client_dialog.closed:
             return False

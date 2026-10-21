@@ -360,5 +360,104 @@ class NewPathHealthSchedulingTests(unittest.TestCase):
             self.assertFalse((fixture.state / "scan.request").exists())
 
 
+class ChangedPathSchedulingTests(unittest.TestCase):
+    def run_path_change(self, entry, *, health_error=False):
+        fixture = test_runtime.RuntimeTests()
+        clock = [1000.0]
+        changed_at = None
+        finished = False
+        scan_count = 0
+        new_path_checks, new_scan_probes = [], []
+        try:
+            with patch.object(optimizer.time, "time", side_effect=lambda: clock[0]):
+                fixture.setUp()
+                fixture.cfg.update(concurrency=1, probe_timeout_ms=15000)
+                fixture.cfg = optimizer.validate_config(fixture.cfg)
+                fixture.helper.next_scan = 1001.0 if entry == "scan_guard" else 1300.0
+                scan, tick = fixture.helper.scan, fixture.helper.tick_health
+
+                def change_path():
+                    nonlocal changed_at
+                    fixture.api.proxies["Main"]["now"] = "JP manual"
+                    changed_at = clock[0]
+
+                def verify(*_args, **_kwargs):
+                    current = fixture.api.proxies["Main"]["now"]
+                    if current == "JP old":
+                        if entry == "health_second_snapshot" and changed_at is None:
+                            change_path()
+                        return {"ok": True, "http_status": 405}
+                    new_path_checks.append(clock[0])
+                    return {"ok": False, "http_status": 403, "reason": "new path failed"}
+
+                def delay(name):
+                    if entry == "scan_guard" and scan_count == 1:
+                        clock[0] += 0.1
+                        if changed_at is None:
+                            change_path()
+                        return 100
+                    new_scan_probes.append(name)
+                    clock[0] += 5
+                    return 5000
+
+                def record_scan(*args, **kwargs):
+                    nonlocal scan_count
+                    scan_count += 1
+                    return scan(*args, **kwargs)
+
+                def record_health():
+                    nonlocal finished
+                    if health_error and fixture.api.proxies["Main"]["now"] == "JP manual":
+                        new_path_checks.append(clock[0])
+                        fixture.api.offline = True
+                    tick()
+                    if (fixture.helper.status.get("selected") == "JP manual"
+                            and fixture.helper.status.get("health") is not None):
+                        finished = True
+
+                def advance(seconds):
+                    clock[0] = round(clock[0] + seconds, 6)
+
+                fixture.verify.side_effect = verify
+                with patch.object(fixture.api, "delay", side_effect=delay), \
+                     patch.object(fixture.helper, "scan", side_effect=record_scan), \
+                     patch.object(fixture.helper, "tick_health", side_effect=record_health), \
+                     patch.object(fixture.helper, "stopping", side_effect=lambda: finished or clock[0] >= 1050), \
+                     patch.object(optimizer.time, "sleep", side_effect=advance):
+                    fixture.helper.run()
+                self.assertEqual(fixture.api.select_calls, [])
+                return {
+                    "changed_at": changed_at,
+                    "checks": new_path_checks,
+                    "new_scan_probes": new_scan_probes,
+                    "status": optimizer.read_json(fixture.state / "status.json", {}),
+                }
+        finally:
+            fixture.doCleanups()
+
+    def assert_new_path_checked_first(self, result):
+        self.assertTrue(result["checks"])
+        self.assertLess(result["checks"][0] - result["changed_at"], 2)
+        self.assertEqual(result["new_scan_probes"], [], "new path health must precede another scan")
+        self.assertEqual(result["status"]["selected"], "JP manual")
+        self.assertEqual(result["status"]["health"]["http_status"], 403)
+        self.assertEqual(result["status"]["consecutive_health_failures"], 1)
+        self.assertEqual(result["status"]["last_health_at"], optimizer.iso(result["checks"][0]))
+
+    def test_scan_guard_checks_new_path_despite_recent_old_path_health(self):
+        self.assert_new_path_checked_first(self.run_path_change("scan_guard"))
+
+    def test_health_second_snapshot_change_is_checked_before_another_scan(self):
+        self.assert_new_path_checked_first(self.run_path_change("health_second_snapshot"))
+
+    def test_new_path_health_error_preserves_controller_retry_backoff(self):
+        result = self.run_path_change("health_second_snapshot", health_error=True)
+        self.assertEqual(result["checks"], [1001, 1016, 1031, 1046])
+        self.assertEqual(result["new_scan_probes"], [])
+        self.assertFalse(result["status"]["controller_available"])
+        self.assertIsNone(result["status"]["health"])
+        self.assertIn("mock controller unavailable", result["status"]["last_error"])
+
+
 if __name__ == "__main__":
     unittest.main()

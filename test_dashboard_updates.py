@@ -254,6 +254,51 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertTrue(self.app.exiting)
         self.confirm.assert_not_called()
 
+    def test_download_completion_waits_for_update_dialog_to_close_before_auto_install(self):
+        self.app.update_release = RELEASE
+        self.app.update_preferences["mode"] = "install"
+        self.app.poll_updates(self.fresh_status())
+        self.assertEqual(self.app.update_busy, "prepare")
+        self.workers.pop(0)()  # Download completes before the UI receives its result.
+        dialog = dashboard.UpdateDialog.__new__(dashboard.UpdateDialog)
+        dialog.owner, dialog.window, dialog.closed = self.app, Mock(), False
+        dialog.refresh = Mock()
+        self.app.update_dialog = dialog
+
+        self.app.poll_updates(self.fresh_status())
+        self.app.poll_updates(self.fresh_status())
+
+        self.assertEqual(self.app.update_prepared, self.root / "prepared")
+        self.assertIsNone(self.app.update_busy)
+        self.assertIsNone(self.app.update_auto_install_attempted)
+        self.assertFalse(self.app.exiting)
+        self.assertEqual(self.workers, [])
+        self.install.assert_not_called()
+        dialog.close()
+        self.assertIsNone(self.app.update_dialog)
+        dialog.window.destroy.assert_called_once()
+        self.app.poll_updates(self.fresh_status())
+        self.assertEqual(self.app.update_busy, "install")
+        self.assertTrue(self.app.exiting)
+        self.confirm.assert_not_called()
+        self.finish()
+        self.install.assert_called_once()
+        self.app.close.assert_called_once()
+
+    def test_explicit_install_from_open_update_dialog_remains_available(self):
+        self.app.update_release = RELEASE
+        self.app.update_prepared = self.root / "prepared"
+        self.app.update_dialog = SimpleNamespace(closed=False, refresh=Mock())
+
+        self.app.request_update_install()
+
+        self.confirm.assert_called_once()
+        self.assertEqual(self.app.update_busy, "install")
+        self.assertTrue(self.app.exiting)
+        self.finish()
+        self.install.assert_called_once()
+        self.app.close.assert_called_once()
+
     def test_confirmed_manual_install_ignores_stale_status_but_respects_local_node_work(self):
         expired = (datetime.now(dashboard.CHINA_TIME) - timedelta(minutes=10)).isoformat()
         for status, busy in (({}, "manual_busy"),

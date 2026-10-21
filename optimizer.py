@@ -1553,17 +1553,17 @@ class Optimizer:
                 if forced:
                     requested.unlink(missing_ok=True)
                 recovery_scan_due = self.recovery_scan_pending and time.time() >= self.recovery_until
+                scan_due = self.cfg["enabled"] and (time.time() >= self.next_scan or recovery_scan_due)
                 health_due = (self.cfg["enabled"]
                               and time.time() - self.last_health >= self.cfg["health_interval_seconds"])
                 # Check an observed but unverified path before starting another ordinary scan.
-                check_new_path = (health_due and self.observed_selection is not None
+                check_new_path = (scan_due and self.observed_selection is not None
                                   and self.observed_selection[1] is not None
                                   and self.status.get("health") is None
                                   and self.failures < 2 and not recovery_scan_due)
-                if forced or (self.cfg["enabled"] and (time.time() >= self.next_scan or recovery_scan_due)
-                              and not check_new_path):
+                if forced or (scan_due and not check_new_path):
                     self.scan(forced=forced)
-                elif health_due:
+                elif health_due or check_new_path:
                     self.tick_health()
                     self.last_health = time.time()
                 elif not self.cfg["enabled"]:
