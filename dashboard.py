@@ -334,9 +334,14 @@ def diagnostic_summary(root=None) -> str:
         except OSError:
             event_files[name] = "unreadable"
     events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
+    if os.name == "nt":
+        system_name = "Windows"
+        system_version = ".".join(str(value) for value in sys.getwindowsversion()[:3])
+    else:
+        system_name, system_version = platform.system(), platform.version()
     return json.dumps({
         "generated_at": datetime.now(CHINA_TIME).isoformat(), "version": version, "version_file": version_file,
-        "runtime": {"python": platform.python_version(), "os": platform.system(), "os_version": platform.version()},
+        "runtime": {"python": platform.python_version(), "os": system_name, "os_version": system_version},
         "config": config, "status": status,
         "events": {"files": event_files, "installation_recent_events": events[-8:]},
     }, ensure_ascii=False, indent=2)
