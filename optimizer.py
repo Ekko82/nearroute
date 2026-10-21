@@ -793,7 +793,9 @@ class Optimizer:
             self.api = Controller(self.cfg)
             self.sync_runtime_context()
         self.status["enabled"] = self.cfg["enabled"]
-        if selection_policy(self.cfg) != selection_policy(previous):
+        if (selection_policy(self.cfg) != selection_policy(previous)
+                or any(self.cfg[key] != previous[key]
+                       for key in ("scan_interval_seconds", "switch_cooldown_seconds"))):
             self.next_scan = 0
         if self.cfg["codex_log_db"] != previous["codex_log_db"]:
             self.signals = LogSignals(self.cfg["codex_log_db"])
@@ -1046,9 +1048,10 @@ class Optimizer:
     def observe_selection(self, observation):
         if self.observed_selection and observation != self.observed_selection:
             self.failures = 0
+            self.next_scan = 0
             self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
             self.status.update(health=None, last_health_at=None, consecutive_health_failures=0,
-                               manual_until=iso(self.manual_until))
+                               manual_until=iso(self.manual_until), next_scan_at=iso())
             event("external_selection_change", group=observation[1], selected=observation[3])
         self.observed_selection = observation
 
@@ -1243,11 +1246,13 @@ class Optimizer:
         self.failures = 0 if health["ok"] else self.failures + 1
         self.write_status(health=health)
         if not health["ok"]:
-            confirmation = self.verify_path(general)
-            self.failures = 0 if confirmation["ok"] else self.failures + 1
+            health = self.verify_path(general)
+            self.failures = 0 if health["ok"] else self.failures + 1
+            self.write_status(health=health)
         self.require_active_mode(mode, path)
         if self.defer_recovery_scan():
             return
+        healthy_path = path if health["ok"] else None
         stats = ranking()
         tried = set()
         reason = "测速完成"
@@ -1270,6 +1275,7 @@ class Optimizer:
             if candidate is None or self.stopping():
                 break
             if self.change_candidate(general, group, previous, candidate, expected_path=path):
+                healthy_path = self.observed_selection
                 reason = "已选用通过连接验证的低延迟节点"
                 self.recover_pending()
                 break
@@ -1287,11 +1293,22 @@ class Optimizer:
             if latest.get(group, {}).get("now") != previous:
                 reason = "选择已被用户更改，停止本轮切换"
                 break
-        _, latest, _ = self.require_active_mode(mode)
+        final_general, latest, _ = self.require_active_mode(mode)
         selected = resolve_leaf(latest, latest.get(group, {}).get("now"))
+        selected_row = next((row for row in stats if row["name"] == selected), {})
+        if (self.failures == 0 and healthy_path == active_path(final_general, latest, group)
+                and (selected_row.get("eligible") or selected_row.get("region_standby"))
+                and self.record.get("group") == group
+                and self.record.get("name") == latest.get(group, {}).get("now")
+                and self.record.get("last_switch_at")):
+            # Healthy paths cannot make an ordinary switch during this cooldown.
+            # Health failures, settings changes and explicit requests still scan sooner.
+            self.next_scan = max(self.last_scan + self.cfg["scan_interval_seconds"],
+                                 self.record["last_switch_at"] + self.cfg["switch_cooldown_seconds"])
         self.write_status(phase="monitoring" if self.cfg["enabled"] else "paused", mode=mode[0], group=group, selected=selected,
                           nodes=stats + self.statistics([selected]) if selected and selected not in names else stats,
-                          message=reason, enabled=self.cfg["enabled"])
+                          message=reason, enabled=self.cfg["enabled"],
+                          next_scan_at=iso(self.next_scan) if self.next_scan else iso())
         event("scan_completed", candidates=len(names), selected=selected, message=reason,
               scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"])
 
