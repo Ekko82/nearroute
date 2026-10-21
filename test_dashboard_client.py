@@ -138,6 +138,33 @@ class ClientDialogTests(unittest.TestCase):
         self.assertIsNone(self.owner.client_dialog)
         self.start_daemon.assert_not_called()
 
+    def test_selected_group_name_is_saved_exactly_including_surrounding_spaces(self):
+        for groups in (["PROXY "], ["PROXY", "PROXY "]):
+            with self.subTest(groups=groups):
+                if self.dialog.closed:
+                    self.dialog = dashboard.ClientDialog(self.owner, visible=False)
+                    self.owner.client_dialog = self.dialog
+                self.dialog.save_button = Mock()
+                self.configure.reset_mock()
+                self.inspect.return_value = self.inspection | {"groups": groups, "active_group": None}
+                self.dialog.inspect_connection()
+                self.finish()
+                self.dialog.group.set("PROXY ")
+                self.dialog.save_button.state.assert_called_with(["!disabled"])
+                saved = dashboard.core.DEFAULTS | {"group": "PROXY ", "enabled": False}
+                self.configure.return_value = saved
+
+                self.dialog.save()
+                self.assertTrue(self.dialog.applying)
+                self.finish()
+
+                self.configure.assert_called_once_with(
+                    {"controller": dashboard.core.DEFAULTS["controller"], "controller_secret_env": "", "group": "PROXY "},
+                    expected_context=self.dialog.original_context,
+                )
+                self.assertTrue(self.dialog.closed)
+                self.assertFalse(self.owner.client_busy)
+
     def test_failed_inspection_or_save_releases_busy_and_allows_retry(self):
         self.inspect.side_effect = dashboard.core.ControllerError("无法认证")
         self.dialog.inspect_connection()

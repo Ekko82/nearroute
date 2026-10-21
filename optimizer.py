@@ -1217,15 +1217,10 @@ class Optimizer:
             return False
         policy = selection_policy(self.cfg)
         mode = active_mode(general, group)
-        self.protect_original(group, previous)
         self.write_status(phase="verifying", message="正在验证候选线路：" + candidate)
-        # Journal before PUT permits safe recovery after a helper crash or logoff.
-        transaction_id = uuid.uuid4().hex
-        pending = {"group": group, "previous": previous, "candidate": candidate, "at": iso(), "transaction_id": transaction_id,
-                   "controller": self.cfg["controller"], "controller_secret_env": self.cfg["controller_secret_env"]}
-        atomic_json(STATE / "pending-selection.json", pending)
         self.tentative = True
         committed = False
+        put_attempted = False
         try:
             self.reload_config()
             if (not self.cfg["enabled"] or self.stopping() or (STATE / "select.request.json").exists() or selection_policy(self.cfg) != policy
@@ -1239,6 +1234,14 @@ class Optimizer:
                 return None  # Removed before PUT; no candidate validation was attempted.
             if self.defer_recovery_scan(force=True):
                 return False
+            self.protect_original(group, previous)
+            # Journal only a selection that passed the final guards, before PUT
+            # so an applied request with a lost response remains recoverable.
+            transaction_id = uuid.uuid4().hex
+            pending = {"group": group, "previous": previous, "candidate": candidate, "at": iso(), "transaction_id": transaction_id,
+                       "controller": self.cfg["controller"], "controller_secret_env": self.cfg["controller_secret_env"]}
+            atomic_json(STATE / "pending-selection.json", pending)
+            put_attempted = True
             self.api.select(group, candidate)
             last_pause_check = None
 
@@ -1286,7 +1289,7 @@ class Optimizer:
         except Exception as error:
             # If the controller is unreachable, retain the journal for recovery.
             try:
-                if not committed:
+                if put_attempted and not committed:
                     self.rollback(group, candidate, previous)
             finally:
                 if isinstance(error, PathChanged):
@@ -1384,8 +1387,9 @@ class Optimizer:
         _, proxies, _ = self.require_active_mode(mode, path)
         def ranking():
             rows = self.statistics(names)
+            selectable = set(proxies[group].get("all", [])) & set(flatten_candidates(proxies, group))
             for row in rows:
-                if row["name"] not in proxies[group].get("all", []):
+                if row["name"] not in selectable:
                     row.update(eligible=False, reason="该节点不在主代理组可直接选择的列表中")
                 if self.failures >= 2 and row["name"] == current:
                     row.update(eligible=False, reason="当前实际连接连续失败")

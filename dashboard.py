@@ -583,7 +583,7 @@ class ClientDialog:
 
     def fields(self) -> dict:
         return {"controller": self.controller.get().strip().rstrip("/"),
-                "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get().strip()}
+                "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get()}
 
     def identity(self):
         fields = self.fields()
@@ -599,7 +599,7 @@ class ClientDialog:
     def update_buttons(self) -> None:
         busy = self.loading or self.applying
         self.inspect_button.state(["disabled"] if busy else ["!disabled"])
-        ready = not busy and self.verified_identity == self.identity() and self.group.get().strip() in self.selector_groups
+        ready = not busy and self.verified_identity == self.identity() and self.group.get() in self.selector_groups
         self.save_button.state(["!disabled"] if ready else ["disabled"])
         for widget in (self.address_entry, self.secret_entry, self.cancel_button):
             widget.state(["disabled"] if self.applying else ["!disabled"])

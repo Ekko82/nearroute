@@ -3,6 +3,7 @@
 import unittest
 from unittest.mock import patch
 
+import optimizer
 import test_runtime
 
 
@@ -66,6 +67,52 @@ class ScanMembershipTests(unittest.TestCase):
                         self.assertEqual([call.args[3] for call in attempt.call_args_list], ["JP manual"])
                 finally:
                     f.doCleanups()
+
+    def test_leaf_replaced_by_group_cannot_suppress_a_measured_regional_backup(self):
+        f = test_runtime.RuntimeTests()
+        try:
+            f.setUp()
+            f.cfg.update(concurrency=1, max_candidate_attempts=1)
+            f.api.proxies["Main"]["all"] = ["JP old", "JP fast", "TW backup"]
+            f.api.proxies["TW backup"] = f.api.proxies.pop("JP manual")
+            f.api.delays = {"JP old": 600, "JP fast": 100, "TW backup": 200}
+            f.verify.side_effect = lambda *_args, **_kwargs: {
+                "ok": f.api.proxies["Main"]["now"] != "JP old",
+                "reason": "fixture current path failure",
+            }
+            measure = f.helper.measure_round
+            initial_measurement = True
+            original_path = optimizer.active_path(*f.api.snapshot(f.cfg))
+
+            def replace_leaf_with_group(*args, **kwargs):
+                nonlocal initial_measurement
+                result = measure(*args, **kwargs)
+                if initial_measurement:
+                    initial_measurement = False
+                    f.api.proxies["JP fast"] = {
+                        "type": "Selector", "all": ["JP nested"], "now": "JP nested",
+                    }
+                    f.api.proxies["JP nested"] = {"type": "Trojan"}
+                    self.assertEqual(optimizer.active_path(*f.api.snapshot(f.cfg)), original_path)
+                    self.assertIn("JP fast", f.api.proxies["Main"]["all"])
+                return result
+
+            with patch.object(f.helper, "measure_round", side_effect=replace_leaf_with_group), \
+                 patch.object(f.helper, "change_candidate", wraps=f.helper.change_candidate) as attempt:
+                f.helper.scan()
+
+            self.assertEqual(f.api.select_calls, [("Main", "TW backup")])
+            self.assertEqual([call.args[3] for call in attempt.call_args_list], ["TW backup"])
+            self.assertEqual(f.helper.status["selected"], "TW backup")
+            self.assertEqual(f.helper.failures, 0)
+            rows = {row["name"]: row for row in f.helper.status["nodes"]}
+            self.assertFalse(rows["JP fast"]["eligible"])
+            self.assertTrue(rows["TW backup"]["eligible"])
+            self.assertFalse(rows["TW backup"].get("region_standby", False))
+            self.assertEqual(f.helper.quarantine, {})
+            self.assertFalse((f.state / "pending-selection.json").exists())
+        finally:
+            f.doCleanups()
 
 
 if __name__ == "__main__":
