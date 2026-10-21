@@ -869,6 +869,8 @@ class Dashboard:
                     else:
                         if previous is None or previous.tag != result.tag:
                             self.update_prepared = None
+                        if self.update_prepared is None:
+                            self.update_auto_prepare_attempted = None
                         action = "查看并安装" if self.update_can_install else "查看更新与下载页"
                         self.update_text.set(f"发现新版本 {result.version}，点击“版本与更新”{action}。")
                         if (previous is None or previous.tag != result.tag) and self.tray is not None:

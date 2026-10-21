@@ -3,10 +3,13 @@
 from contextlib import ExitStack
 from datetime import datetime, timedelta
 from pathlib import Path
+import http.client
+import io
 import queue
 import json
 import tempfile
 import tkinter as tk
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
@@ -50,6 +53,7 @@ class UpdateBehaviorTests(unittest.TestCase):
 
         self.patches.enter_context(patch.object(dashboard.threading, "Thread", side_effect=deferred_thread))
         self.due = self.patches.enter_context(patch.object(updater, "check_due", return_value=True))
+        self.real_check = updater.check_for_update
         self.check = self.patches.enter_context(patch.object(updater, "check_for_update", return_value=RELEASE))
         self.prepare = self.patches.enter_context(patch.object(updater, "prepare_update", return_value=self.root / "prepared"))
         self.install = self.patches.enter_context(patch.object(updater, "start_installer"))
@@ -117,6 +121,87 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.prepare.assert_called_once_with(RELEASE, root=self.root)
         self.assertEqual(self.app.update_prepared, self.root / "prepared")
         self.assertFalse(self.app.exiting)
+        self.install.assert_not_called()
+
+    def test_truncated_chunked_metadata_recovers_worker_and_allows_manual_recheck(self):
+        asset_name = "NearRoute-1.1.0-windows.zip"
+        download = f"https://github.com/{updater.REPOSITORY}/releases/download/v1.1.0/"
+        metadata = {
+            "tag_name": RELEASE.tag, "html_url": RELEASE.url, "body": RELEASE.notes,
+            "assets": [{"name": asset_name, "browser_download_url": download + asset_name, "size": 123},
+                       {"name": "nearroute-update.json", "browser_download_url": download + "nearroute-update.json", "size": 200}],
+        }
+        manifest = {"schema": 1, "version": RELEASE.version, "asset": asset_name, "size": 123, "sha256": "a" * 64}
+        responses = []
+
+        def open_response(url):
+            if not responses:
+                payload = b'20\r\n{"tag_name":"v1.'  # The first chunk ends before its declared size.
+            else:
+                document = metadata if url == updater.RELEASES_URL else manifest
+                body = json.dumps(document).encode()
+                payload = f"{len(body):x}\r\n".encode() + body + b"\r\n0\r\n\r\n"
+            wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" + payload
+            response = http.client.HTTPResponse(SimpleNamespace(makefile=lambda *_: io.BytesIO(wire)))
+            response.begin()
+            response.url = url
+            responses.append(response)
+            return response
+
+        self.check.side_effect = self.real_check
+        with patch.object(updater, "_open_url", side_effect=open_response):
+            self.app.check_updates(manual=True)
+            self.assertEqual(self.app.update_busy, "check")
+            self.workers.pop(0)()
+            self.assertFalse(self.app.update_results.empty())
+            self.app.poll_updates({})
+            self.assertIsNone(self.app.update_busy)
+            self.assertIn("更新未完成", self.app.update_text.set.call_args.args[0])
+            self.app.check_updates(manual=True)
+            self.finish()
+        self.assertIsNone(self.app.update_busy)
+        self.assertEqual(self.app.update_release.version, RELEASE.version)
+        self.assertEqual(len(responses), 3)
+        self.assertTrue(all(response.isclosed() for response in responses))
+        self.showerror.assert_not_called()
+
+    def test_failed_auto_download_retries_only_after_a_later_successful_check(self):
+        for mode in ("download", "install"):
+            with self.subTest(mode=mode):
+                self.app.update_preferences = {"auto_check": True, "mode": mode}
+                self.app.update_release = RELEASE
+                self.app.update_prepared = None
+                self.app.update_auto_prepare_attempted = None
+                self.app.update_next_check = float("inf")
+                self.prepare.reset_mock()
+                self.prepare.side_effect = [updater.UpdateError("下载中断"), self.root / "prepared"]
+                self.app.poll_updates({"phase": "verifying"})
+                self.finish({"phase": "verifying"})
+                self.assertIsNone(self.app.update_busy)
+                for _ in range(3):
+                    self.app.poll_updates({"phase": "verifying"})
+                self.assertEqual(self.prepare.call_count, 1)
+                self.assertEqual(self.workers, [])
+                self.app.check_updates(manual=True)
+                self.finish({"phase": "verifying"})
+                self.assertEqual(self.app.update_busy, "prepare")
+                self.assertEqual(len(self.workers), 1)
+                self.finish({"phase": "verifying"})
+                self.assertEqual(self.prepare.call_count, 2)
+                self.app.poll_updates({"phase": "verifying"})
+                self.assertEqual(self.workers, [])
+        for preferences in ({"auto_check": True, "mode": "notify"},
+                            {"auto_check": False, "mode": "download"},
+                            {"auto_check": False, "mode": "install"}):
+            with self.subTest(preferences=preferences):
+                self.app.update_preferences = preferences
+                self.app.update_prepared = None
+                self.app.update_auto_prepare_attempted = RELEASE.tag
+                self.prepare.reset_mock()
+                self.app.check_updates(manual=True)
+                self.finish({"phase": "verifying"})
+                self.assertEqual(self.workers, [])
+                self.prepare.assert_not_called()
         self.install.assert_not_called()
 
     def test_auto_install_waits_for_node_work_and_transport_recovery(self):

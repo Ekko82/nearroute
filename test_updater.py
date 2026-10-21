@@ -3,6 +3,7 @@
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError, replace
 import hashlib
+import http.client
 import io
 import json
 from pathlib import Path
@@ -98,6 +99,14 @@ class UpdaterTests(unittest.TestCase):
         with patch.object(updater, "_read_url", side_effect=read):
             return updater.check_for_update(self.root)
 
+    def truncated_chunked_response(self, url):
+        stream = io.BytesIO(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab")
+        response = http.client.HTTPResponse(SimpleNamespace(makefile=lambda *_args: stream))
+        response.begin()
+        response.geturl = lambda: url
+        self.addCleanup(response.close)
+        return response
+
     def preserve_user_files(self):
         values = {
             "config.json": b'{"enabled": true, "custom_note": "keep"}\n',
@@ -152,6 +161,26 @@ class UpdaterTests(unittest.TestCase):
         for changes in ({"tag_name": "v0.1.0"}, {"tag_name": "v0.0.9"}, {"draft": True}, {"prerelease": True}):
             with self.subTest(changes=changes):
                 self.assertIsNone(self.check(metadata | changes, manifest))
+
+    def test_truncated_metadata_keeps_cached_release_and_allows_retry(self):
+        metadata, manifest, manifest_url = self.metadata()
+        self.assertEqual(self.check(metadata, manifest), self.release)
+        response = self.truncated_chunked_response(updater.RELEASES_URL)
+        with patch.object(updater, "_open_url", return_value=response):
+            with self.assertRaises(updater.UpdateError) as failure:
+                updater.check_for_update(self.root)
+        self.assertIsInstance(failure.exception.__cause__, http.client.IncompleteRead)
+        self.assertTrue(response.isclosed())
+        self.assertEqual(updater.cached_release(self.root), self.release)
+        state = self.root / "state/update-check.json"
+        self.assertEqual(json.loads(state.read_text())["error"], "IncompleteRead")
+
+        responses = [Response(json.dumps(metadata).encode(), updater.RELEASES_URL),
+                     Response(json.dumps(manifest).encode(), manifest_url)]
+        with patch.object(updater, "_open_url", side_effect=responses):
+            self.assertEqual(updater.check_for_update(self.root), self.release)
+        self.assertTrue(all(item.closed for item in responses))
+        self.assertNotIn("error", json.loads(state.read_text()))
 
     def test_release_and_manifest_must_agree_on_version_origin_hash_and_size(self):
         metadata, manifest, _url = self.metadata()
@@ -237,6 +266,23 @@ class UpdaterTests(unittest.TestCase):
                 updater.prepare_update(self.release, self.root)
         self.assertTrue(response.closed)
         self.assertEqual(list((self.root / "state/updates").iterdir()), [])
+
+    def test_truncated_download_cleans_cache_and_allows_retry(self):
+        response = self.truncated_chunked_response(self.release.asset_url)
+        with patch.object(updater, "_open_url", return_value=response):
+            with self.assertRaises(updater.UpdateError) as failure:
+                updater.prepare_update(self.release, self.root)
+        self.assertIsInstance(failure.exception.__cause__, http.client.IncompleteRead)
+        self.assertTrue(response.isclosed())
+        updates = self.root / "state/updates"
+        self.assertEqual(list(updates.iterdir()), [])
+
+        response = Response(self.archive.read_bytes(), self.release.asset_url)
+        with patch.object(updater, "_open_url", return_value=response):
+            prepared = updater.prepare_update(self.release, self.root)
+        self.assertTrue(response.closed)
+        self.assertEqual((prepared / "package.zip").read_bytes(), self.archive.read_bytes())
+        self.assertEqual(list(updates.iterdir()), [prepared])
 
     def test_apply_replaces_program_files_and_preserves_all_user_data(self):
         user_files = self.preserve_user_files()

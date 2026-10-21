@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict, dataclass
 import hashlib
+import http.client
 import importlib.util
 import json
 import os
@@ -220,7 +221,7 @@ def check_for_update(root=ROOT) -> Release | None:
         _validate_release(release)
         _write_document(state, {"last_checked": time.time(), "latest_version": version, "release": asdict(release)})
         return release
-    except (OSError, ValueError, KeyError, TypeError) as error:
+    except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
         _write_document(state, _read_document(state, {}) | {"last_checked": time.time(), "error": type(error).__name__})
         raise UpdateError("无法检查新版本，请确认能够连接 GitHub 后重试") from error
     except UpdateError:
@@ -302,7 +303,7 @@ def prepare_update(release: Release, root=ROOT) -> Path:
                     if received > release.size or time.monotonic() - started > 180:
                         raise UpdateError("更新包下载超过大小或时间限制")
                     stream.write(block)
-        except OSError as error:
+        except (OSError, http.client.HTTPException) as error:
             raise UpdateError("下载失败，请确认能够连接 GitHub 后重试") from error
         validate_package(archive, release)
         _write_document(Path(temporary) / "release.json", asdict(release))
