@@ -826,7 +826,7 @@ class Optimizer:
         self.status = read_json(STATE / "status.json", {})
         if self.status.get("controller_context") != list(self.state_context):
             self.status = {}
-        self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接代理客户端", "last_error": None})
+        self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接代理客户端", "last_error": None, "controller_available": False, "health": None})
         self._published_status = {}
         self._last_status_at = 0.0
         self.failures = 0
@@ -834,6 +834,7 @@ class Optimizer:
         self.next_scan = 0.0
         self.last_scan = 0.0
         self.manual_until = self.record.get("manual_until", 0.0)
+        self.status["manual_until"] = iso(self.manual_until) if time.time() < self.manual_until else None
         self.manual_revision = 0
         self.scan_display_names = []
         self.last_health = 0.0
@@ -896,7 +897,8 @@ class Optimizer:
             self.next_scan = self.last_scan = self.last_health = self.last_signal_poll = 0
             self.recovery_until = 0.0
             self.recovery_scan_pending = False
-            self.status.update(selected=None, health=None, nodes=[], manual_until=None,
+            self.status.update(selected=None, health=None, nodes=[],
+                               manual_until=iso(self.manual_until) if time.time() < self.manual_until else None,
                                last_switch_at=None, last_health_at=None, consecutive_health_failures=0,
                                transport_recovery_until=None)
             self.state_context = context
@@ -989,6 +991,19 @@ class Optimizer:
         self.next_scan = 0
         try:
             general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
+            observation = active_path(general, proxies, group)
+            if observation != self.observed_selection:
+                path = STATE / "external-manual.json"
+                data = read_json(path, {})
+                records = data.get("records", []) if data.get("schema_version") == 1 else []
+                saved = next((item for item in records if item.get("context") == list(self.state_context)), {})
+                if (saved.get("path") == list(self.observed_selection or ())
+                        and saved.get("selection_transaction_id") == self.record.get("transaction_id")
+                        and time.time() < saved.get("manual_until", 0)):
+                    # Rollback changed this leaf, not the user's grace deadline.
+                    saved["path"] = list(observation)
+                    atomic_json(path, data)
+                    self.observed_selection = observation
             self.publish_active_path(general, proxies, group, health=None,
                                      phase="monitoring" if self.cfg["enabled"] else "paused",
                                      next_scan_at=iso(), message=message,
@@ -1090,6 +1105,10 @@ class Optimizer:
         results = {}
         if self.stopping() or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return results
+        self.reload_config()
+        last_config_check = time.monotonic()
+        if selection_policy(self.cfg) != policy:
+            return results
         if not forced and self.transport_recovery_active():
             return results
         executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(self.cfg["concurrency"]))
@@ -1100,7 +1119,13 @@ class Optimizer:
                                                        return_when=concurrent.futures.FIRST_COMPLETED)
                 if self.stopping():
                     break
-                if self.process_manual_selection() or selection_policy(self.cfg) != policy:
+                if self.process_manual_selection():
+                    break
+                now = time.monotonic()
+                if now - last_config_check >= 1:
+                    self.reload_config()
+                    last_config_check = now
+                if selection_policy(self.cfg) != policy:
                     break
                 if not forced and self.transport_recovery_active():
                     break
@@ -1140,12 +1165,31 @@ class Optimizer:
             event("rollback", group=group, previous=candidate, restored=original)
 
     def observe_selection(self, observation):
-        if self.observed_selection and observation != self.observed_selection:
+        protection_path = STATE / "external-manual.json"
+        context = list(self.state_context)
+        if self.observed_selection is None:
+            data = read_json(protection_path, {})
+            records = data.get("records", []) if data.get("schema_version") == 1 else []
+            saved = next((item for item in records if item.get("context") == context), {})
+            # Ownership stays in selection.json. A later tool selection supersedes
+            # this grace even if the old external path subsequently reappears.
+            if (saved.get("path") == list(observation)
+                    and saved.get("selection_transaction_id") == self.record.get("transaction_id")
+                    and time.time() < saved.get("manual_until", 0)):
+                self.manual_until = saved["manual_until"]
+                self.status["manual_until"] = iso(self.manual_until)
+        elif observation != self.observed_selection:
             self.failures = 0
             self.next_scan = 0
             self.manual_until = time.time() + self.cfg["manual_selection_grace_seconds"]
             self.status.update(health=None, last_health_at=None, consecutive_health_failures=0,
                                manual_until=iso(self.manual_until), next_scan_at=iso())
+            data = read_json(protection_path, {})
+            records = data.get("records", []) if data.get("schema_version") == 1 else []
+            saved = {"context": context, "path": list(observation), "manual_until": self.manual_until,
+                     "selection_transaction_id": self.record.get("transaction_id")}
+            atomic_json(protection_path, {"schema_version": 1,
+                                         "records": [item for item in records if item.get("context") != context] + [saved]})
             event("external_selection_change", group=observation[1], selected=observation[3])
         self.observed_selection = observation
 

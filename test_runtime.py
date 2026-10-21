@@ -132,6 +132,27 @@ class RuntimeTests(unittest.TestCase):
         restarted = optimizer.Optimizer()
         self.assertEqual(restarted.manual_until, self.helper.manual_until)
 
+    def test_restart_keeps_cached_nodes_without_claiming_a_live_client(self):
+        self.cfg["enabled"] = False
+        nodes = [{"name": "JP old", "eligible": True}]
+        self.helper.write_status(phase="stopped", pid=None, controller_available=True,
+                                 mode="rule", group="Main", selected="JP old", nodes=nodes,
+                                 health={"ok": True})
+        self.api.proxies["Main"]["now"] = "JP fast"
+        with patch.object(self.api, "snapshot", wraps=self.api.snapshot) as snapshot:
+            restarted = optimizer.Optimizer()
+            snapshot.assert_not_called()
+            self.assertEqual(restarted.status["phase"], "starting")
+            self.assertFalse(restarted.status["controller_available"])
+            self.assertIsNone(restarted.status["health"])
+            self.assertEqual(restarted.status["selected"], "JP old")
+            self.assertEqual(restarted.status["nodes"], nodes)
+            restarted.observe_paused_path()
+            snapshot.assert_called_once()
+        self.assertEqual(restarted.status["phase"], "paused")
+        self.assertTrue(restarted.status["controller_available"])
+        self.assertEqual(restarted.status["selected"], "JP fast")
+
     def test_forced_scan_respects_manual_switch_grace_period(self):
         optimizer.request_manual_selection("JP manual")
         self.assertTrue(self.helper.process_manual_selection())

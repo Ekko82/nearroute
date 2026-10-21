@@ -1411,7 +1411,9 @@ class Dashboard:
             self.node_context = context
             mode, group = status.get("mode"), status.get("group")
             self.node_mode = (core.active_mode(status, group)
-                              if isinstance(mode, str) and mode.lower() in ("rule", "global")
+                              if status.get("phase") != "starting"
+                              and status.get("controller_available") is True
+                              and isinstance(mode, str) and mode.lower() in ("rule", "global")
                               and isinstance(group, str) and group else None)
         self.poll_updates(status)
         if self.closed:
@@ -1419,8 +1421,9 @@ class Dashboard:
         self.poll_manual_selection(status)
         stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))
+        starting = phase == "starting"
         stopped = phase in ("stopped", "stopping")
-        connected = bool(status.get("controller_available", False)) and not stale and not stopped
+        connected = bool(status.get("controller_available", False)) and not stale and not stopped and not starting
         running = bool(status.get("pid")) and not stopped and not stale
         client_busy = getattr(self, "client_busy", False)
         busy = self.restore_busy or client_busy
@@ -1441,6 +1444,8 @@ class Dashboard:
             badge, color = "后台状态未更新", "#8b6508"
         elif stopped:
             badge, color = "后台已停止", "#8b6508"
+        elif starting:
+            badge, color = "正在连接代理客户端", "#1b66b0"
         elif not enabled:
             badge, color = "已暂停自动切换", "#8b6508"
         elif not connected:
@@ -1453,13 +1458,13 @@ class Dashboard:
         self.badge_label.configure(foreground=color)
         selected = str(status.get("selected") or "—")
         group = str(status.get("group") or "—")
-        last_known = stale or stopped or status.get("controller_available") is False
+        last_known = stale or stopped or starting or status.get("controller_available") is False
         node_label = "上次记录节点" if last_known else "当前节点"
         self.current.set(f"{node_label}：{selected}    代理组：{group}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
         usable = sum(bool(item.get("eligible", False)) for item in nodes)
         errors = status.get("network_errors_recent", 0)
-        connection_label = "状态待更新" if stale or stopped else ("已连接" if connected else "未连接")
+        connection_label = "状态待更新" if stale or stopped or starting else ("已连接" if connected else "未连接")
         self.health.set(f"控制接口：{connection_label}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
         self.timings.set(
             f"最近测速：{display_time(status.get('last_scan_at'))}    "

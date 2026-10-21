@@ -3,12 +3,17 @@
 import concurrent.futures
 from contextlib import contextmanager, ExitStack
 import threading
+import time
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+import urllib.parse
 
 import optimizer
 import test_runtime
+
+
+REAL_CONTROLLER = optimizer.Controller
 
 
 class MeasureResponsivenessTests(unittest.TestCase):
@@ -63,6 +68,7 @@ class MeasureResponsivenessTests(unittest.TestCase):
             patches.enter_context(patch.object(fixture.helper, "transport_recovery_active", side_effect=run.recovery.is_set))
             patches.enter_context(patch.object(optimizer.concurrent.futures, "ThreadPoolExecutor", side_effect=executor))
             worker = threading.Thread(target=measure, name="fixture-measure-round")
+            run.worker = worker
             worker.start()
             try:
                 self.assertTrue(run.started.wait(1), "first probe did not start")
@@ -122,6 +128,75 @@ class MeasureResponsivenessTests(unittest.TestCase):
         self.assertEqual(run.result, {"JP old": 100, "JP fast": None, "JP manual": 200})
         self.assertEqual(run.calls, ["JP old", "JP fast", "JP manual"])
         self.assertEqual({name: items[-1]["delay"] for name, items in run.fixture.helper.history.items()}, run.result)
+
+    def test_saved_probe_and_scope_change_interrupts_then_new_scan_uses_new_settings(self):
+        with self.measurement() as run:
+            requests = []
+
+            def request(path, *args, **kwargs):
+                if path.startswith("/proxies/") and "/delay?" in path:
+                    query = urllib.parse.parse_qs(urllib.parse.urlsplit(path).query)
+                    requests.append((urllib.parse.unquote(path.split("/")[2]), query["url"][0]))
+                    return {"delay": 125}
+                return run.fixture.api.request(path, *args, **kwargs)
+
+            def controller(cfg):
+                api = REAL_CONTROLLER(cfg)
+                api.request = Mock(side_effect=request)
+                return api
+
+            with patch.object(optimizer, "Controller", side_effect=controller):
+                run.fixture.cfg.update(probe_url="https://fixture.invalid/new-probe",
+                                       scan_mode="nodes", scan_nodes=["JP manual"])
+                (run.fixture.state / "scan.request").touch()
+                self.assertTrue(run.shutdown.wait(2.5), "saved settings waited for the old probe")
+                self.assertFalse(run.release.is_set())
+                self.assertEqual(run.fixture.helper.cfg["probe_url"], run.fixture.cfg["probe_url"])
+                run.release.set()
+                run.worker.join(3)
+                self.assertFalse(run.worker.is_alive())
+                self.assertEqual(run.result, {})
+                self.assertEqual(run.calls, ["JP old"])
+                self.assertEqual(run.fixture.helper.history, {})
+
+                run.fixture.helper.scan(forced=True)
+
+            self.assertEqual(requests, [("JP manual", run.fixture.cfg["probe_url"])] *
+                             (1 + run.fixture.cfg["confirmation_rounds"]))
+            self.assertEqual(set(run.fixture.helper.history), {"JP manual"})
+            self.assertEqual(run.fixture.api.select_calls, [])
+
+    def test_scope_only_change_preserves_history_but_discards_the_old_round(self):
+        with self.measurement() as run:
+            run.fixture.helper.add_sample("JP old", 99)
+            run.fixture.cfg.update(scan_mode="nodes", scan_nodes=["JP manual"])
+            self.assertTrue(run.shutdown.wait(2.5), "new scope waited for the old probe")
+            self.assertFalse(run.release.is_set())
+        self.assertEqual(run.calls, ["JP old"])
+        self.assertEqual(run.result, {})
+        self.assertEqual([item["delay"] for item in run.fixture.helper.history["JP old"]], [99])
+
+    def test_saved_policy_is_checked_before_submitting_a_round(self):
+        fixture = test_runtime.RuntimeTests("test_manual_request_during_scan_takes_priority_over_auto_switch")
+        try:
+            fixture.setUp()
+            fixture.cfg["probe_url"] = "https://fixture.invalid/new-probe"
+            with patch.object(fixture.api, "delay", wraps=fixture.api.delay) as delay:
+                self.assertEqual(fixture.helper.measure_round(["JP old"], "fixture"), {})
+            delay.assert_not_called()
+            self.assertEqual(fixture.helper.cfg["probe_url"], fixture.cfg["probe_url"])
+        finally:
+            fixture.doCleanups()
+
+    def test_waiting_reloads_configuration_about_once_a_second(self):
+        with self.measurement() as run:
+            optimizer.load_config.reset_mock()
+            started = time.monotonic()
+            threading.Event().wait(1.3)
+            elapsed = time.monotonic() - started
+            self.assertGreaterEqual(optimizer.load_config.call_count, 1)
+            self.assertLessEqual(optimizer.load_config.call_count, int(elapsed) + 1)
+            self.assertFalse(run.shutdown.is_set())
 
 
 if __name__ == "__main__":

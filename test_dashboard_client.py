@@ -246,7 +246,8 @@ class ClientContextTests(unittest.TestCase):
         cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context))
         old_status = {"controller_context": ["http://127.0.0.1:9090", "", "PROXY"],
                       "selected": "old node", "nodes": [{"name": "old node"}],
-                      "phase": "monitoring", "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
+                      "phase": "monitoring", "controller_available": True,
+                      "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
         with patch.object(dashboard, "read_json", side_effect=lambda path: old_status if path == dashboard.STATUS else cfg), \
              patch.object(dashboard.core, "request_manual_selection") as request:
             for status in (old_status, {key: value for key, value in old_status.items() if key != "controller_context"}):
@@ -276,10 +277,53 @@ class ClientContextTests(unittest.TestCase):
             work.pop()()
         request.assert_called_once_with("visible node", expected_context=self.context, expected_mode=("rule", self.context[2]))
 
+    def test_starting_keeps_cached_rows_untrusted_until_first_client_snapshot(self):
+        cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context)) | {"enabled": False}
+        nodes = [{"name": "old node", "eligible": True}]
+        status = {"controller_context": list(self.context), "selected": "old node", "nodes": nodes,
+                  "phase": "starting", "pid": 12345, "controller_available": True,
+                  "mode": "rule", "group": self.context[2],
+                  "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
+        work = []
+        with patch.object(dashboard, "read_json", side_effect=lambda path: status if path == dashboard.STATUS else cfg), \
+             patch.object(dashboard.threading, "Thread", side_effect=lambda **kwargs: work.append(kwargs["target"]) or Mock()), \
+             patch.object(dashboard.core, "request_manual_selection", return_value="request") as request:
+            self.app.refresh()
+            self.assertIn("上次记录节点：old node", self.app.current.set.call_args.args[0])
+            self.assertIn("控制接口：状态待更新", self.app.health.set.call_args.args[0])
+            self.app.render_nodes.assert_called_with("old node", nodes)
+            self.assertIsNone(self.app.node_mode)
+            self.app.switch_node("old node")
+            self.assertEqual(work, [])
+            request.assert_not_called()
+            self.app.ensure_service.assert_not_called()
+
+            for phase in ("paused", "waiting"):
+                with self.subTest(phase=phase):
+                    status.update(phase=phase, controller_available=False)
+                    self.app.refresh()
+                    self.assertIn("上次记录节点：old node", self.app.current.set.call_args.args[0])
+                    self.app.render_nodes.assert_called_with("old node", nodes)
+                    self.assertIsNone(self.app.node_mode)
+                    self.app.switch_node("old node")
+                    self.assertEqual(work, [])
+                    request.assert_not_called()
+                    self.app.ensure_service.assert_not_called()
+
+            status.update(phase="paused", controller_available=True, mode="global", group="GLOBAL", selected="fresh node")
+            self.app.refresh()
+            self.assertIn("当前节点：fresh node", self.app.current.set.call_args.args[0])
+            self.assertIn("控制接口：已连接", self.app.health.set.call_args.args[0])
+            self.assertEqual(self.app.node_mode, ("global", "GLOBAL"))
+            self.app.switch_node("fresh node")
+            work.pop()()
+            request.assert_called_once_with("fresh node", expected_context=self.context, expected_mode=("global", "GLOBAL"))
+
     def test_status_without_actual_selector_mode_cannot_submit_visible_node(self):
         cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context))
         status = {"controller_context": list(self.context), "selected": "visible node", "nodes": [{"name": "visible node"}],
-                  "phase": "monitoring", "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
+                  "phase": "monitoring", "controller_available": True,
+                  "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
         with patch.object(dashboard, "read_json", side_effect=lambda path: status if path == dashboard.STATUS else cfg), \
              patch.object(dashboard.core, "request_manual_selection") as request:
             for fields in ({"mode": None, "group": None}, {"mode": "rule"}, {"mode": "direct", "group": None}):
