@@ -288,7 +288,13 @@ def diagnostic_summary(root=None) -> str:
               "verifying", "stopping", "stopped", "error"}
     phase = record.get("phase") if isinstance(record.get("phase"), str) and record["phase"] in phases else None
     stale = status_is_stale({"updated_at": recorded_at}) if status_file == "ok" else None
-    context_matches = record.get("controller_context") == list(core.state_context(cfg)) if cfg is not None else None
+    stored_context = record.get("controller_context")
+    expected_context = list(core.state_context(cfg)) if cfg is not None else None
+    context_matches = None
+    if (expected_context is not None and isinstance(stored_context, list)
+            and len(stored_context) == len(expected_context)
+            and all(isinstance(value, str) for value in stored_context)):
+        context_matches = stored_context == expected_context
     current = (status_file == "ok" and context_matches is True and stale is False
                and phase is not None and phase not in ("starting", "stopping", "stopped"))
     available = record.get("controller_available")
@@ -306,7 +312,10 @@ def diagnostic_summary(root=None) -> str:
     event_types = {"started", "stopped", "manual_selection", "external_selection_change", "switched", "rollback",
                    "selection_changed_during_validation", "candidate_rejected", "scan_completed", "restore", "error"}
     event_files, events = {}, []
-    for name in ("events.previous.jsonl", "events.jsonl"):
+    for name in ("events.jsonl", "events.previous.jsonl"):
+        if name == "events.previous.jsonl" and len(events) >= 8:
+            event_files[name] = "not_needed"
+            continue
         try:
             with (root / "state" / name).open("r", encoding="utf-8-sig", errors="replace") as stream:
                 for line in stream:

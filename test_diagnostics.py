@@ -97,6 +97,9 @@ class DiagnosticSummaryTests(unittest.TestCase):
 
     def test_fresh_summary_contains_safe_facts_and_installation_event_times_only(self):
         self.populate()
+        previous = {"event": "started", "at": (self.now - timedelta(seconds=120)).isoformat()}
+        self.write("state/events.previous.jsonl", json.dumps(previous) + "\n")
+        self.events.append(previous)
         summary = self.summarize()
 
         self.assertEqual(summary["version"], "0.2.223")
@@ -114,7 +117,8 @@ class DiagnosticSummaryTests(unittest.TestCase):
         self.assertEqual(datetime.fromisoformat(status["recorded_last_switch_at"]), datetime.fromisoformat(self.status["last_switch_at"]))
         self.assertNotIn("last_switch_at", status)
         recent = summary["events"]["installation_recent_events"]
-        self.assertEqual({row["type"] for row in recent}, {"switched", "rollback"})
+        self.assertEqual({row["type"] for row in recent}, {"started", "switched", "rollback"})
+        self.assertEqual(summary["events"]["files"]["events.previous.jsonl"], "ok")
         self.assertTrue(all(set(row) == {"type", "time"} for row in recent))
         self.assertEqual({datetime.fromisoformat(row["time"]) for row in recent},
                          {datetime.fromisoformat(row["at"]) for row in self.events})
@@ -126,20 +130,25 @@ class DiagnosticSummaryTests(unittest.TestCase):
         self.assertFalse(invalid["status"]["current"])
 
     def test_old_other_context_and_inactive_snapshots_never_claim_current_health(self):
-        for reason in ("stale", "other_context", "starting", "stopping", "stopped"):
+        for reason in ("stale", "other_context", "missing_context", "starting", "stopping", "stopped"):
             with self.subTest(reason=reason):
                 self.populate()
                 if reason == "stale":
                     self.status["updated_at"] = (self.now - timedelta(seconds=600)).isoformat()
                 elif reason == "other_context":
                     self.status["controller_context"][0] = "http://127.0.0.1:9799"
+                elif reason == "missing_context":
+                    self.status.pop("controller_context")
                 else:
                     self.status["phase"] = reason
                 self.write("state/status.json", self.status)
                 status = self.summarize()["status"]
                 self.assertFalse(status["current"])
                 self.assertEqual(status["stale"], reason == "stale")
-                self.assertEqual(status["context_matches"], reason != "other_context")
+                if reason == "missing_context":
+                    self.assertIsNone(status["context_matches"])
+                else:
+                    self.assertEqual(status["context_matches"], reason != "other_context")
                 for field in ("controller_available", "health_ok", "network_errors_recent", "transport_recovery_until"):
                     self.assertIsNone(status[field], field)
                 self.assertEqual(datetime.fromisoformat(status["recorded_last_switch_at"]),
@@ -158,6 +167,7 @@ class DiagnosticSummaryTests(unittest.TestCase):
         self.assertEqual(missing["version_file"], "missing")
         self.assertEqual(missing["config"]["file"], "missing")
         self.assertEqual(missing["status"]["file"], "missing")
+        self.assertIsNone(missing["status"]["context_matches"])
         self.assertEqual(missing["events"]["files"]["events.jsonl"], "missing")
         self.assertFalse((self.root / "state").exists())
 
