@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import ctypes
 import hashlib
 import http.client
+import io
 import ipaddress
 import json
 import math
@@ -30,6 +31,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
+from functools import partial
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
@@ -37,6 +39,7 @@ CONFIG = ROOT / "config.json"
 PROBE_HOST = "chatgpt.com"
 PROBE_PATH = "/backend-api/codex/responses"
 PROBE_URL = "https://" + PROBE_HOST + PROBE_PATH
+PROBE_REQUEST_TIMEOUT = 7.0
 TZ = timezone(timedelta(hours=8))
 DEFAULTS = {
     "enabled": True,
@@ -661,7 +664,49 @@ def inspect_controller(fields):
     return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port}
 
 
+class _ProbeCancelled(Exception):
+    pass
+
+
+class _ProbeBudget:
+    def __init__(self, cancel):
+        self.cancel = cancel
+        self.deadline = 0
+
+    def remaining(self):
+        if self.cancel and self.cancel():
+            raise _ProbeCancelled()
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("线路验证请求超时")
+        return remaining
+
+
+class _ProbeReader(io.RawIOBase):
+    def __init__(self, source, sock, budget):
+        self.source, self.sock, self.budget = source, sock, budget
+
+    def readable(self):
+        return True
+
+    def readinto(self, buffer):
+        self.sock.settimeout(self.budget.remaining())
+        count = self.source.readinto1(buffer)
+        self.budget.remaining()
+        return count
+
+    def close(self):
+        try:
+            self.source.close()
+        finally:
+            super().close()
+
+
 class ProbeHTTPResponse(http.client.HTTPResponse):
+    def __init__(self, sock, *args, budget, **kwargs):
+        super().__init__(sock, *args, **kwargs)
+        self.fp = io.BufferedReader(_ProbeReader(self.fp, sock, budget))
+
     def _read_status(self):
         # http.client skips only 100; other informational responses also
         # precede the final result. 101 switches protocols and must stop here.
@@ -686,17 +731,37 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
         return {"ok": False, "reason": str(exc)}
     target = parse_probe_url(probe_url)
     if target.scheme == "https":
-        conn = http.client.HTTPSConnection(host, port, timeout=7, context=ssl.create_default_context())
+        conn = http.client.HTTPSConnection(host, port, timeout=PROBE_REQUEST_TIMEOUT, context=ssl.create_default_context())
         conn.set_tunnel(target.hostname, target.port or 443)
         request_path = urllib.parse.urlunsplit(("", "", target.path or "/", target.query, ""))
     else:
-        conn = http.client.HTTPConnection(host, port, timeout=7)
+        conn = http.client.HTTPConnection(host, port, timeout=PROBE_REQUEST_TIMEOUT)
         request_path = probe_url
-    conn.response_class = ProbeHTTPResponse
+    budget = _ProbeBudget(cancel)
+    original_connect, original_tunnel = conn.connect, conn._tunnel
+
+    def refresh_timeout():
+        conn.timeout = budget.remaining()
+        if conn.sock is not None:
+            conn.sock.settimeout(conn.timeout)
+
+    def connect():
+        conn.timeout = budget.remaining()
+        original_connect()
+        refresh_timeout()
+
+    def tunnel():
+        refresh_timeout()
+        original_tunnel()
+        # The stdlib TLS handshake starts after CONNECT returns.
+        refresh_timeout()
+
+    conn.connect, conn._tunnel = connect, tunnel
+    conn.response_class = partial(ProbeHTTPResponse, budget=budget)
     headers = {"Accept": "*/*", "User-Agent": "NearRoute/1.0", "Connection": "keep-alive"}
     if target.scheme == "http":
         headers["Proxy-Connection"] = "keep-alive"
-    delays, sock = [], None
+    delays, sock, response = [], None, None
     try:
         for index in range(3 if idle_seconds else 1):
             if index:
@@ -705,15 +770,16 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
                     if cancel and cancel():
                         return {"ok": False, "reason": "验证已取消", "cancelled": True}
                     time.sleep(min(0.2, max(0, deadline - time.monotonic())))
-            if cancel and cancel():
-                return {"ok": False, "reason": "验证已取消", "cancelled": True}
+            budget.deadline = time.monotonic() + PROBE_REQUEST_TIMEOUT
             started = time.perf_counter()
+            refresh_timeout()
             conn.request("GET", request_path, headers=headers)
             response = conn.getresponse()
             delays.append(round((time.perf_counter() - started) * 1000, 1))
             if response.status not in expected_statuses:
                 return {"ok": False, "reason": "测试链接返回非预期 HTTP " + str(response.status), "http_status": response.status}
             body = response.read(65537)
+            budget.remaining()
             if len(body) > 65536:
                 return {"ok": False, "reason": "测试响应超过 64 KiB，请选择轻量健康检查链接"}
             if response.length is not None and response.length > 0:
@@ -725,10 +791,18 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
         return {"ok": True, "http_status": response.status, "request_ms": delays,
                 "same_connection": bool(idle_seconds),
                 "same_tls_connection": bool(idle_seconds) and target.scheme == "https", "idle_test_seconds": idle_seconds * 2}
+    except _ProbeCancelled:
+        return {"ok": False, "reason": "验证已取消", "cancelled": True}
     except (OSError, http.client.HTTPException, ssl.SSLError) as exc:
+        if cancel and cancel():
+            return {"ok": False, "reason": "验证已取消", "cancelled": True}
         return {"ok": False, "reason": "线路请求失败 (" + type(exc).__name__ + ")"}
     finally:
-        conn.close()
+        try:
+            if response is not None:
+                response.close()
+        finally:
+            conn.close()
 
 
 MUTEX_NAME = "Local\\CodexNodeOptimizer_" + hashlib.sha256(str(ROOT).lower().encode()).hexdigest()[:16]
@@ -968,6 +1042,19 @@ class Optimizer:
         self.history_probe = fingerprint
 
     def verify_path(self, general, idle_seconds=0, cancel=None):
+        if cancel is None:
+            last_pause_check = None
+
+            def cancel():
+                nonlocal last_pause_check
+                if self.stopping() or (STATE / "select.request.json").exists():
+                    return True
+                now = time.monotonic()
+                if last_pause_check is None or now - last_pause_check >= 1:
+                    last_pause_check = now
+                    return not load_config()["enabled"]
+                return False
+
         return verify_current_path(general, idle_seconds, cancel,
                                    probe_url=self.cfg["probe_url"], expected_statuses=self.cfg["probe_expected_statuses"])
 
@@ -1520,11 +1607,15 @@ class Optimizer:
         # A short active-path check detects 403/5xx hidden by old delay APIs.
         endpoint = self.require_proxy_endpoint(general, proxies, group, endpoint)
         health = self.verify_path(general)
+        if health.get("cancelled"):
+            return
         general, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
         self.failures = 0 if health["ok"] else self.failures + 1
         self.write_status(health=health)
         if not health["ok"]:
             health = self.verify_path(general)
+            if health.get("cancelled"):
+                return
             general, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
             self.failures = 0 if health["ok"] else self.failures + 1
             self.write_status(health=health)
@@ -1617,6 +1708,8 @@ class Optimizer:
             return
         endpoint = self.require_proxy_endpoint(general, proxies, group)
         result = self.verify_path(general)
+        if result.get("cancelled"):
+            return
         general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
         latest_path = active_path(general, proxies, group)
         if latest_path != path:

@@ -44,7 +44,7 @@ class ProbeIntegrityTests(unittest.TestCase):
         clock = [0.0]
         cancelled = [False]
         connection = Mock()
-        connection.sock = object()
+        connection.sock = Mock()
         connection.getresponse.side_effect = lambda: self.response(
             b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n",
         )

@@ -28,14 +28,14 @@ class ProxyReconfigurationTests(unittest.TestCase):
 
             def connection(host, port, **_kwargs):
                 conn = Mock()
-                conn.sock = object()
+                conn.sock = Mock()
                 connections.append(conn)
                 conn.request.side_effect = lambda *_args, **_kwargs: run.requests.append((host, port))
 
                 def response():
                     if run.on_response:
                         run.on_response()
-                    return SimpleNamespace(status=run.status, length=0, read=lambda _limit: b"")
+                    return SimpleNamespace(status=run.status, length=0, read=lambda _limit: b"", close=Mock())
 
                 conn.getresponse.side_effect = response
                 return conn

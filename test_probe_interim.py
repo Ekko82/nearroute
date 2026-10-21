@@ -9,6 +9,13 @@ import optimizer
 
 
 class WireStream(io.BytesIO):
+    def readinto1(self, buffer):
+        # Deliver one wire line per packet so parser boundary checks remain
+        # independent of the response reader's buffering size.
+        data = self.readline(len(buffer))
+        buffer[:len(data)] = data
+        return len(data)
+
     def close(self):
         if not self.closed:
             self.consumed = self.tell()
@@ -24,6 +31,9 @@ class WireSocket:
 
     def sendall(self, data):
         self.sent.append(data)
+
+    def settimeout(self, timeout):
+        self.timeout = timeout
 
     def makefile(self, *_args):
         stream = WireStream(next(self.responses))

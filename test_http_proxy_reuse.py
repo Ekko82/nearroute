@@ -113,7 +113,8 @@ class HTTPProxyReuseTests(unittest.TestCase):
         sock = ProxyWireSocket([])
         connection = http.client.HTTPConnection("127.0.0.1", 10090)
         self.addCleanup(connection.close)
-        connection.connect = Mock(side_effect=lambda: setattr(connection, "sock", sock))
+        connect = Mock(side_effect=lambda: setattr(connection, "sock", sock))
+        connection.connect = connect
         with patch.object(optimizer, "verify_current_path", side_effect=runtime.REAL_VERIFY), \
              patch.object(optimizer.http.client, "HTTPConnection", return_value=connection), virtual_idle():
             changed = fixture.helper.change_candidate(fixture.api.general, "Main", "JP old", "JP fast")
@@ -124,7 +125,7 @@ class HTTPProxyReuseTests(unittest.TestCase):
         self.assertEqual(fixture.helper.record["name"], "JP fast")
         self.assertTrue(fixture.helper.record["verification"]["same_connection"])
         self.assertNotIn("candidate_rejected", [event["event"] for event in fixture.events()])
-        connection.connect.assert_called_once()
+        connect.assert_called_once()
         self.assertEqual(len(sock.sent), 3)
         self.assertTrue(sock.closed)
         self.assertTrue(all(stream.closed for stream in sock.streams))

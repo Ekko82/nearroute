@@ -331,8 +331,8 @@ class RuntimeTests(unittest.TestCase):
                 paused_at = []
                 requests = []
                 connection = MagicMock()
-                connection.sock = object()
-                connection.getresponse.return_value = SimpleNamespace(status=405, length=0, read=lambda _limit: b"")
+                connection.sock = MagicMock()
+                connection.getresponse.return_value = SimpleNamespace(status=405, length=0, read=lambda _limit: b"", close=MagicMock())
                 connection.request.side_effect = lambda *_args, **_kwargs: requests.append(clock[0])
 
                 def sleep(seconds):
@@ -679,7 +679,7 @@ class TLSVerificationTests(unittest.TestCase):
 
     def test_idle_verification_rejects_replaced_tls_socket(self):
         conn = MagicMock()
-        sockets = iter([object(), object(), object()])
+        sockets = iter([MagicMock(), MagicMock(), MagicMock()])
         def response_with_new_socket():
             conn.sock = next(sockets)
             return MagicMock(status=405, length=0)
