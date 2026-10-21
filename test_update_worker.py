@@ -10,7 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import updater
 from tools.build_release import build_release, RELEASE_FILES
@@ -98,10 +98,35 @@ class UpdateWorkerTests(unittest.TestCase):
              patch.object(updater.subprocess, "Popen") as restart:
             updater._run_installer(self.prepared, self.root, 12345, "test-python")
         self.assertEqual(updater.current_version(self.root), "0.0.0")
-        self.assertFalse(updater.read_update_result(self.root)["success"])
+        result = updater.read_update_result(self.root)
+        self.assertFalse(result["success"])
+        self.assertEqual(result.get("version"), self.release.version)
         self.assertEqual(stop.call_args.args[0][-1], "stop")
+        restart.assert_called_once()
         self.assertEqual(Path(restart.call_args.args[0][-1]).resolve(), (self.root / "dashboard.py").resolve())
         self.assertFalse(updater.is_installing(self.root))
+
+    def test_failed_install_records_target_version_and_releases_locks(self):
+        core = Mock()
+        helper_lock = core.InstanceLock.return_value
+        helper_lock.acquire.return_value = True
+        with patch.object(updater, "_wait_for_parent"), \
+             patch.object(updater.subprocess, "run", return_value=subprocess.CompletedProcess([], 0)), \
+             patch.object(updater.subprocess, "Popen") as restart, \
+             patch.object(updater.importlib.util, "spec_from_file_location", return_value=Mock()), \
+             patch.object(updater.importlib.util, "module_from_spec", return_value=core), \
+             patch.object(updater, "apply_package", side_effect=updater.UpdateError("程序文件正被占用，已还原旧版程序")) as apply:
+            updater._run_installer(self.prepared, self.root, 12345, "test-python")
+        apply.assert_called_once_with(self.prepared / "package.zip", self.release, self.root.resolve())
+        self.assertEqual(updater.current_version(self.root), "0.0.0")
+        result = updater.read_update_result(self.root)
+        self.assertFalse(result["success"])
+        self.assertEqual(result.get("version"), self.release.version)
+        self.assertIn("已还原旧版程序", result["message"])
+        helper_lock.close.assert_called_once()
+        self.assertFalse(updater.is_installing(self.root))
+        restart.assert_called_once()
+        self.assertEqual(Path(restart.call_args.args[0][-1]).resolve(), (self.root / "dashboard.py").resolve())
 
 
 if __name__ == "__main__":

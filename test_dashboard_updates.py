@@ -1,6 +1,7 @@
 """Offline update UI behavior; no network, real helper, or installation runs."""
 
 from contextlib import ExitStack
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 import http.client
@@ -34,6 +35,7 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.app.updates_enabled = self.app.update_can_install = True
         self.app.update_busy = self.app.update_release = self.app.update_prepared = None
         self.app.update_requested_install = False
+        self.app.update_auto_install_attempted = None
         self.app.update_results = queue.SimpleQueue()
         self.app.update_preferences = {"auto_check": True, "mode": "notify"}
         self.app.update_next_check = float("inf")
@@ -270,6 +272,60 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertIsNone(self.app.update_busy)
         self.install.assert_not_called()
         self.app.close.assert_not_called()
+
+    def test_reopened_failed_version_requires_manual_retry_but_new_release_can_auto_install(self):
+        state = self.root / "state"
+        state.mkdir()
+        (state / "update-settings.json").write_text(json.dumps({"auto_check": True, "mode": "install"}), encoding="utf-8")
+        for retry in ("manual", "new-release", "previous-success"):
+            with self.subTest(retry=retry):
+                (state / "update-result.json").write_text(json.dumps({
+                    "success": retry == "previous-success", "version": RELEASE.version, "message": "上次安装结果",
+                }), encoding="utf-8")
+                self.check.return_value = RELEASE
+                self.confirm.reset_mock()
+                self.prepare.reset_mock()
+                with patch.object(dashboard, "ttk"), \
+                     patch.object(dashboard.tk, "StringVar"), \
+                     patch.object(dashboard.tk, "Menu"), \
+                     patch.object(updater, "cached_release", return_value=RELEASE), \
+                     patch.object(dashboard.Dashboard, "poll_tray"), \
+                     patch.object(dashboard.Dashboard, "refresh"):
+                    # Exercise production initialization and the real persisted result reader.
+                    self.app = dashboard.Dashboard(Mock(), enable_tray=False)
+                try:
+                    self.app.update_next_check = float("inf")
+                    self.assertIsNone(self.app.update_prepared)
+                    self.app.check_updates(manual=True)
+                    self.finish({"phase": "verifying"})
+                    if retry == "previous-success":
+                        self.assertEqual(self.app.update_busy, "prepare")
+                        self.finish()
+                        self.confirm.assert_not_called()
+                    else:
+                        self.app.poll_updates({"phase": "monitoring"})
+                        self.assertEqual(self.workers, [])
+                        self.assertIsNone(self.app.update_busy)
+                        self.assertFalse(self.app.exiting)
+                        self.prepare.assert_not_called()
+                        self.assertIn("手动重试", self.app.update_text.set.call_args.args[0])
+                        if retry == "manual":
+                            self.app.request_update_install()
+                            self.confirm.assert_called_once()
+                        else:
+                            self.check.return_value = replace(RELEASE, version="1.2.0", tag="v1.2.0")
+                            self.app.check_updates(manual=True)
+                            self.finish({"phase": "verifying"})
+                            self.confirm.assert_not_called()
+                        self.assertEqual(self.app.update_busy, "prepare")
+                        self.finish()
+                    self.assertEqual(self.app.update_busy, "install")
+                    self.assertTrue(self.app.exiting)
+                    self.assertEqual(len(self.workers), 1)
+                    self.install.assert_not_called()  # The installer handoff remains deferred.
+                finally:
+                    self.app.close()
+                    self.workers.clear()
 
     def test_installing_guard_prevents_second_window_creation(self):
         with patch.object(updater, "is_installing", return_value=True), \

@@ -475,6 +475,7 @@ def _run_installer(prepared, root, parent_pid, python_exe):
     lock = InstallLock(root)
     helper_lock = None
     restart = False
+    release = None
     try:
         if not lock.acquire():
             return
@@ -500,7 +501,9 @@ def _run_installer(prepared, root, parent_pid, python_exe):
                         {"success": True, "version": release.version, "message": "近舟已更新到 " + release.version})
     except Exception as error:
         message = str(error) if isinstance(error, UpdateError) else "更新未完成，请重试；用户配置已保留"
-        _write_document(root / "state" / "update-result.json", {"success": False, "message": message})
+        _write_document(root / "state" / "update-result.json",
+                        {"success": False, "version": release.version if release is not None else None,
+                         "message": message})
     finally:
         if helper_lock is not None:
             helper_lock.close()

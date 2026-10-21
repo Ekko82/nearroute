@@ -613,6 +613,9 @@ class Dashboard:
         self.update_next_check = 0.0
         self.update_can_install = updater.can_install(root=ROOT)
         self.update_preferences = updater.load_preferences(root=ROOT)
+        update_result = updater.read_update_result(root=ROOT)
+        failed_version = update_result.get("version") if update_result.get("success") is False else None
+        self.update_auto_install_attempted = "v" + failed_version if isinstance(failed_version, str) else None
 
         root.title(WINDOW_TITLE)
         if os.name == "nt":
@@ -747,9 +750,11 @@ class Dashboard:
                     self.notify("系统托盘暂不可用，点击 × 将最小化到任务栏。", 15)
             self.poll_tray()
             if self.updates_enabled:
-                result = updater.read_update_result(root=ROOT)
-                if result and self.update_release is None:
-                    self.update_text.set(str(result.get("message") or "更新已完成。"))
+                if (self.update_can_install and self.update_release is not None
+                        and self.update_release.tag == self.update_auto_install_attempted):
+                    self.update_text.set(f"版本 {self.update_release.version} 上次安装未完成，请打开“版本与更新”手动重试。")
+                elif update_result and self.update_release is None:
+                    self.update_text.set(str(update_result.get("message") or "更新已完成。"))
             self.refresh()
         except Exception:
             self.close()
@@ -872,7 +877,10 @@ class Dashboard:
                         if self.update_prepared is None:
                             self.update_auto_prepare_attempted = None
                         action = "查看并安装" if self.update_can_install else "查看更新与下载页"
-                        self.update_text.set(f"发现新版本 {result.version}，点击“版本与更新”{action}。")
+                        if self.update_can_install and self.update_auto_install_attempted == result.tag:
+                            self.update_text.set(f"版本 {result.version} 上次安装未完成，请打开“版本与更新”手动重试。")
+                        else:
+                            self.update_text.set(f"发现新版本 {result.version}，点击“版本与更新”{action}。")
                         if (previous is None or previous.tag != result.tag) and self.tray is not None:
                             self.tray.show_notification("近舟发现新版本", f"{result.version} 已发布，打开近舟的“版本与更新”{action}。")
                 elif operation == "prepare":
@@ -902,7 +910,8 @@ class Dashboard:
         release = self.update_release
         if release is None or not self.update_can_install:
             return
-        auto_prepare = self.update_preferences["auto_check"] and mode in ("download", "install")
+        auto_prepare = (self.update_preferences["auto_check"] and mode in ("download", "install")
+                        and (mode != "install" or self.update_auto_install_attempted != release.tag))
         if self.update_prepared is None and auto_prepare and getattr(self, "update_auto_prepare_attempted", None) != release.tag:
             self.update_auto_prepare_attempted = release.tag
             self.update_text.set(f"正在下载并校验版本 {release.version}…")
