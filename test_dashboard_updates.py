@@ -66,9 +66,12 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.patches.enter_context(patch.object(dashboard, "python_executable", return_value="mock-python"))
         self.wait = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
 
+    def fresh_status(self, **fields):
+        return {"phase": "monitoring", "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(), **fields}
+
     def finish(self, status=None):
         self.workers.pop(0)()
-        self.app.poll_updates(status or {"phase": "monitoring"})
+        self.app.poll_updates(self.fresh_status() if status is None else status)
 
     def test_default_notify_check_is_async_and_never_downloads_or_opens_dialog(self):
         self.app.tray = Mock()
@@ -210,20 +213,78 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.app.update_release = RELEASE
         self.app.update_prepared = self.root / "prepared"
         self.app.update_preferences["mode"] = "install"
-        self.app.poll_updates({"phase": "verifying"})
+        self.app.poll_updates(self.fresh_status(phase="verifying"))
         until = (datetime.now(dashboard.CHINA_TIME) + timedelta(seconds=60)).isoformat()
-        self.app.poll_updates({"phase": "monitoring", "transport_recovery_until": until})
+        self.app.poll_updates(self.fresh_status(transport_recovery_until=until))
         self.app.manual_busy = True
-        self.app.poll_updates({"phase": "monitoring"})
+        self.app.poll_updates(self.fresh_status())
         self.app.manual_busy = False
         self.app.restore_busy = True
-        self.app.poll_updates({"phase": "monitoring"})
-        self.assertEqual(self.workers, [])
+        self.app.poll_updates(self.fresh_status())
         self.app.restore_busy = False
-        self.app.poll_updates({"phase": "monitoring"})
+        self.app.settings_dialog = SimpleNamespace(closed=False)
+        self.app.poll_updates(self.fresh_status())
+        self.assertEqual(self.workers, [])
+        self.app.settings_dialog = None
+        self.app.poll_updates(self.fresh_status())
         self.assertTrue(self.app.exiting)
         self.assertEqual(self.app.update_busy, "install")
         self.confirm.assert_not_called()  # This mode was explicitly enabled in preferences.
+
+    def test_auto_install_waits_for_fresh_idle_status(self):
+        self.app.update_release = RELEASE
+        self.app.update_prepared = self.root / "prepared"
+        self.app.update_preferences["mode"] = "install"
+        expired = (datetime.now(dashboard.CHINA_TIME) - timedelta(seconds=dashboard.STATUS_STALE_SECONDS + 1)).isoformat()
+        for status in ({"phase": "monitoring", "updated_at": expired},
+                       {"phase": "monitoring"},
+                       {"phase": "monitoring", "updated_at": "invalid"}):
+            self.app.poll_updates(status)
+            self.assertEqual(self.workers, [], msg=str(status))
+            self.assertIsNone(self.app.update_busy)
+            self.assertFalse(self.app.exiting)
+        self.app.poll_updates(self.fresh_status())
+        self.assertEqual(self.app.update_busy, "install")
+        self.assertEqual(len(self.workers), 1)
+        self.assertTrue(self.app.exiting)
+        self.confirm.assert_not_called()
+
+    def test_confirmed_manual_install_ignores_stale_status_but_respects_local_node_work(self):
+        expired = (datetime.now(dashboard.CHINA_TIME) - timedelta(minutes=10)).isoformat()
+        for status, busy in (({}, "manual_busy"),
+                             ({"phase": "monitoring", "updated_at": expired}, "restore_busy")):
+            for prepared in (False, True):
+                with self.subTest(status=status, prepared=prepared):
+                    self.app.update_release = RELEASE
+                    self.app.update_prepared = self.root / "prepared" if prepared else None
+                    self.app.update_requested_install = False
+                    self.app.update_busy = None
+                    self.app.exiting = False
+                    self.workers.clear()
+                    self.confirm.reset_mock()
+                    self.app.poll_updates(status)
+                    if prepared:
+                        setattr(self.app, busy, True)
+                        self.app.request_update_install()
+                        self.assertEqual(self.workers, [])
+                        self.confirm.assert_not_called()
+                        setattr(self.app, busy, False)
+                        self.app.request_update_install()
+                    else:
+                        self.app.request_update_install()
+                        self.assertEqual(self.app.update_busy, "prepare")
+                        setattr(self.app, busy, True)
+                        self.finish(status)
+                        self.assertEqual(self.workers, [])
+                        self.assertIsNone(self.app.update_busy)
+                        self.assertFalse(self.app.exiting)
+                        setattr(self.app, busy, False)
+                        self.app.poll_updates(status)
+                    self.confirm.assert_called_once()
+                    self.assertEqual(self.app.update_busy, "install")
+                    self.assertEqual(len(self.workers), 1)
+                    self.assertTrue(self.app.exiting)
+                    self.install.assert_not_called()
 
     def test_click_install_requires_confirmation_before_download(self):
         self.app.update_release = RELEASE

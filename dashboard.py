@@ -213,6 +213,16 @@ def wait_for_helper_startup(processes, timeout: float = 10.0) -> bool:
     return True
 
 
+def status_is_stale(status: dict) -> bool:
+    try:
+        updated = datetime.fromisoformat(str(status.get("updated_at", "")).replace("Z", "+00:00"))
+        if updated.tzinfo is None:
+            updated = updated.replace(tzinfo=CHINA_TIME)
+        return (datetime.now(CHINA_TIME) - updated).total_seconds() > STATUS_STALE_SECONDS
+    except ValueError:
+        return True
+
+
 def display_time(value: object) -> str:
     if not value:
         return "—"
@@ -839,7 +849,7 @@ class Dashboard:
             return False
         if self.settings_dialog is not None and not self.settings_dialog.closed:
             return False
-        if status.get("phase") not in ("monitoring", "paused", "waiting", "stopped"):
+        if status_is_stale(status) or status.get("phase") not in ("monitoring", "paused", "waiting", "stopped"):
             return False
         recovery = status.get("transport_recovery_until")
         if recovery:
@@ -918,10 +928,9 @@ class Dashboard:
             self.update_worker("prepare", lambda: updater.prepare_update(release, root=ROOT))
         elif self.update_prepared is not None:
             auto_install = self.update_preferences["auto_check"] and mode == "install" and getattr(self, "update_auto_install_attempted", None) != release.tag
-            if self.update_requested_install or auto_install:
-                if self.automatic_install_ready(status):
-                    self.update_auto_install_attempted = release.tag
-                    self.begin_update_install()
+            if self.update_requested_install or (auto_install and self.automatic_install_ready(status)):
+                self.update_auto_install_attempted = release.tag
+                self.begin_update_install()
 
     def resize_text(self, event: tk.Event) -> None:
         for label in self.wrapping_labels:
@@ -1163,14 +1172,7 @@ class Dashboard:
         except (OSError, ValueError):
             enabled = bool(status.get("enabled", True))
             self.policy.set(policy_summary({}))
-        try:
-            updated = datetime.fromisoformat(str(status.get("updated_at", "")).replace("Z", "+00:00"))
-            if updated.tzinfo is None:
-                updated = updated.replace(tzinfo=CHINA_TIME)
-            status_age = (datetime.now(CHINA_TIME) - updated).total_seconds()
-            stale = status_age > STATUS_STALE_SECONDS
-        except ValueError:
-            stale = bool(status)
+        stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))
         stopped = phase in ("stopped", "stopping")
         connected = bool(status.get("controller_available", False)) and not stale and not stopped
