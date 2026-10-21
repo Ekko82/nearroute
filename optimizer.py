@@ -844,6 +844,7 @@ class Optimizer:
         self.observed_selection = None
         self.tentative = False
         self.sync_probe_history()
+        self.prune_probe_history()
         self.write_status()
 
     def stopping(self):
@@ -1083,6 +1084,23 @@ class Optimizer:
             self.write_status(manual_selection_result=result, message="手动切换失败：" + str(error))
             return False
 
+    def prune_probe_history(self, *, force_history=False, force_quarantine=False):
+        now = time.time()
+        history = {}
+        for name, samples in self.history.items():
+            retained = [sample for sample in samples if now - sample["at"] <= self.cfg["history_seconds"]]
+            if retained:
+                history[name] = retained[-int(self.cfg["history_samples"]):]
+        quarantine = {name: deadline for name, deadline in self.quarantine.items() if deadline > now}
+        history_changed = history != self.history
+        quarantine_changed = quarantine != self.quarantine
+        self.history = history
+        self.quarantine = quarantine
+        if history_changed or force_history:
+            atomic_json(STATE / "history.json", self.history)
+        if quarantine_changed or force_quarantine:
+            atomic_json(STATE / "quarantine.json", self.quarantine)
+
     def add_sample(self, name, delay):
         now = time.time()
         data = self.history.setdefault(name, [])
@@ -1141,7 +1159,7 @@ class Optimizer:
             for future in pending:
                 future.cancel()
             executor.shutdown(wait=True, cancel_futures=True)
-        atomic_json(STATE / "history.json", self.history)
+        self.prune_probe_history(force_history=True)
         return results
 
     def protect_original(self, group, current):
@@ -1216,6 +1234,9 @@ class Optimizer:
             general, latest, _ = self.require_active_mode(mode, expected_path)
             if latest.get(group, {}).get("now") != previous:
                 return False
+            if (candidate not in latest[group].get("all", [])
+                    or candidate not in flatten_candidates(latest, group)):
+                return None  # Removed before PUT; no candidate validation was attempted.
             if self.defer_recovery_scan(force=True):
                 return False
             self.api.select(group, candidate)
@@ -1258,7 +1279,7 @@ class Optimizer:
                 return True
             if not result["ok"] and not result.get("cancelled") and selection_policy(self.cfg) == policy:
                 self.quarantine[candidate] = time.time() + self.cfg["node_quarantine_seconds"]
-                atomic_json(STATE / "quarantine.json", self.quarantine)
+                self.prune_probe_history(force_quarantine=True)
             self.rollback(group, candidate, previous)
             event("candidate_rejected", node=candidate, reason=result.get("reason", "自动切换已暂停"))
             return False
@@ -1360,7 +1381,7 @@ class Optimizer:
             self.require_active_mode(mode, path)
         if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return
-        self.require_active_mode(mode, path)
+        _, proxies, _ = self.require_active_mode(mode, path)
         def ranking():
             rows = self.statistics(names)
             for row in rows:
@@ -1398,14 +1419,15 @@ class Optimizer:
             health = self.verify_path(general)
             self.failures = 0 if health["ok"] else self.failures + 1
             self.write_status(health=health)
-        self.require_active_mode(mode, path)
+        _, proxies, _ = self.require_active_mode(mode, path)
         if self.defer_recovery_scan():
             return
         healthy_path = path if health["ok"] else None
         stats = ranking()
         tried = set()
         reason = "测速完成"
-        for _ in range(int(self.cfg["max_candidate_attempts"])):
+        attempts = 0
+        while attempts < int(self.cfg["max_candidate_attempts"]):
             self.reload_config()
             if self.process_manual_selection():
                 return
@@ -1423,7 +1445,10 @@ class Optimizer:
                 self.cfg["switch_cooldown_seconds"], self.failures >= 2)
             if candidate is None or self.stopping():
                 break
-            if self.change_candidate(general, group, previous, candidate, expected_path=path):
+            changed = self.change_candidate(general, group, previous, candidate, expected_path=path)
+            if changed is not None:
+                attempts += 1
+            if changed:
                 healthy_path = self.observed_selection
                 reason = "已选用通过连接验证的低延迟节点"
                 self.recover_pending()
@@ -1434,14 +1459,14 @@ class Optimizer:
             if self.defer_recovery_scan():
                 return
             tried.add(candidate)
-            stats = ranking()
             self.reload_config()
             if not self.cfg["enabled"]:
                 break
-            _, latest, _ = self.require_active_mode(mode, path)
-            if latest.get(group, {}).get("now") != previous:
+            _, proxies, _ = self.require_active_mode(mode, path)
+            if proxies.get(group, {}).get("now") != previous:
                 reason = "选择已被用户更改，停止本轮切换"
                 break
+            stats = ranking()
         final_general, latest, _ = self.require_active_mode(mode)
         selected = resolve_leaf(latest, latest.get(group, {}).get("now"))
         selected_row = next((row for row in stats if row["name"] == selected), {})
