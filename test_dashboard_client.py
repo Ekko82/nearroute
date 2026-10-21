@@ -227,6 +227,7 @@ class ClientContextTests(unittest.TestCase):
         self.app.results = queue.SimpleQueue()
         self.app.manual_results = queue.SimpleQueue()
         self.app.node_context = self.context
+        self.app.node_mode = ("rule", self.context[2])
         self.app.manual_attempt = self.app.manual_request_id = None
         self.app.manual_request_name = ""
         self.app.manual_request_started = self.app.started_at = self.app.notice_until = 0
@@ -252,31 +253,49 @@ class ClientContextTests(unittest.TestCase):
                 old_status = status
                 self.app.refresh()
                 self.assertIsNone(self.app.node_context)
+                self.assertIsNone(self.app.node_mode)
                 self.app.render_nodes.assert_called_with("—", [])
                 self.app.poll_manual_selection.assert_called_with({})
                 self.app.poll_updates.assert_called_with({})
                 self.app.switch_node("old node")
             request.assert_not_called()
             self.app.ensure_service.assert_not_called()
-            old_status = old_status | {"controller_context": list(self.context), "selected": "new node", "nodes": [{"name": "new node"}]}
+            old_status = old_status | {"controller_context": list(self.context), "mode": "global", "group": "GLOBAL", "selected": "new node", "nodes": [{"name": "new node"}]}
             self.app.refresh()
             self.assertEqual(self.app.node_context, self.context)
+            self.assertEqual(self.app.node_mode, ("global", "GLOBAL"))
             self.app.render_nodes.assert_called_with("new node", [{"name": "new node"}])
 
-    def test_manual_worker_keeps_the_context_of_its_visible_node_list(self):
+    def test_manual_worker_keeps_context_and_mode_of_its_visible_node_list(self):
         work = []
         with patch.object(dashboard.threading, "Thread", side_effect=lambda **kwargs: work.append(kwargs["target"]) or Mock()), \
              patch.object(dashboard.core, "request_manual_selection", return_value="request") as request:
             self.app.switch_node("visible node")
             self.app.node_context = ("http://127.0.0.1:9090", "", "OTHER")
+            self.app.node_mode = ("global", "GLOBAL")
             work.pop()()
-        request.assert_called_once_with("visible node", expected_context=self.context)
+        request.assert_called_once_with("visible node", expected_context=self.context, expected_mode=("rule", self.context[2]))
+
+    def test_status_without_actual_selector_mode_cannot_submit_visible_node(self):
+        cfg = dict(zip(("controller", "controller_secret_env", "group"), self.context))
+        status = {"controller_context": list(self.context), "selected": "visible node", "nodes": [{"name": "visible node"}],
+                  "phase": "monitoring", "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
+        with patch.object(dashboard, "read_json", side_effect=lambda path: status if path == dashboard.STATUS else cfg), \
+             patch.object(dashboard.core, "request_manual_selection") as request:
+            for fields in ({"mode": None, "group": None}, {"mode": "rule"}, {"mode": "direct", "group": None}):
+                status = {key: value for key, value in status.items() if key not in ("mode", "group")} | fields
+                self.app.refresh()
+                self.assertIsNone(self.app.node_mode)
+                self.app.switch_node("visible node")
+            request.assert_not_called()
+            self.app.ensure_service.assert_not_called()
 
     def test_client_save_clears_old_nodes_and_leaves_background_stopped(self):
         cfg = dashboard.core.DEFAULTS | {"controller": "http://127.0.0.1:9090", "group": "PROXY", "enabled": False}
         with patch.object(dashboard, "start_daemon", side_effect=AssertionError("must stay stopped")):
             self.app.client_saved(cfg)
         self.assertIsNone(self.app.node_context)
+        self.assertIsNone(self.app.node_mode)
         self.app.render_nodes.assert_called_once_with("—", [])
         self.app.ensure_service.assert_not_called()
         self.assertIn("立即测速", self.app.notify.call_args.args[0])

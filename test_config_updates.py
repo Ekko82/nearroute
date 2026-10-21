@@ -41,10 +41,15 @@ def _config_worker(config_path, operation, hold_phase, started, holding, release
 
     def controller_read(_path):
         wait_if_requested("controller")
+        if _path == "/configs":
+            return {"mode": "direct", "mixed-port": 7890}
+        assert _path == "/proxies", "unexpected controller request"
         return {"proxies": {}}
 
+    snapshot = optimizer.Controller.snapshot
     api = Mock()
     api.request.side_effect = controller_read
+    api.snapshot.side_effect = lambda cfg, **kwargs: snapshot(api, cfg, **kwargs)
     api.select.side_effect = AssertionError("test must not select a node")
     try:
         with ExitStack() as stack:

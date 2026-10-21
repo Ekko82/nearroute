@@ -137,6 +137,60 @@ class ModeChangeTests(unittest.TestCase):
                     self.assertEqual(fixture.api.proxies[group]["now"], previous)
                     self.assert_not_committed(fixture)
 
+    def test_queued_manual_choice_rejects_a_changed_displayed_mode(self):
+        for source, target in (("rule", "global"), ("global", "rule")):
+            with self.subTest(source=source, target=target), self.runtime(source, enabled=False) as fixture:
+                general, _, group = fixture.api.snapshot(fixture.cfg)
+                optimizer.request_manual_selection(
+                    "JP fast", expected_context=optimizer.state_context(fixture.cfg),
+                    expected_mode=optimizer.active_mode(general, group),
+                )
+                fixture.api.general["mode"] = target
+
+                self.assertFalse(fixture.helper.process_manual_selection())
+
+                self.assertEqual(fixture.api.select_calls, [])
+                self.assertFalse((fixture.state / "pending-selection.json").exists())
+                self.assertFalse((fixture.state / "original-selection.json").exists())
+                self.assertIn("重新选择", fixture.helper.status["manual_selection_result"]["message"])
+                self.assert_refreshed_status(fixture, target)
+
+    def test_queued_manual_choice_accepts_unchanged_displayed_mode(self):
+        for source in ("rule", "global"):
+            with self.subTest(mode=source), self.runtime(source, enabled=False) as fixture:
+                general, _, group = fixture.api.snapshot(fixture.cfg)
+                optimizer.request_manual_selection(
+                    "JP fast", expected_mode=list(optimizer.active_mode(general, group)),
+                )
+
+                self.assertTrue(fixture.helper.process_manual_selection())
+
+                self.assertEqual(fixture.api.select_calls, [(group, "JP fast")])
+                self.assertTrue(fixture.helper.status["manual_selection_result"]["ok"])
+
+    def test_cli_manual_choice_without_displayed_mode_uses_current_mode(self):
+        for source, target in (("rule", "global"), ("global", "rule")):
+            with self.subTest(source=source, target=target), self.runtime(source, enabled=False) as fixture:
+                optimizer.request_manual_selection("JP fast")
+                fixture.api.general["mode"] = target
+
+                self.assertTrue(fixture.helper.process_manual_selection())
+
+                group = "GLOBAL" if target == "global" else fixture.cfg["group"]
+                self.assertEqual(fixture.api.select_calls, [(group, "JP fast")])
+
+    def test_invalid_displayed_mode_cannot_replace_a_pending_manual_choice(self):
+        with self.runtime("rule", enabled=False) as fixture:
+            optimizer.request_manual_selection("JP manual")
+            path = fixture.state / "select.request.json"
+            original = path.read_bytes()
+            for invalid in ("rule", {}, ["rule"], ["rule", "Main", "extra"],
+                            ["unknown", "Main"], ["rule", None], ["rule", ""], ["rule", 1]):
+                with self.subTest(expected_mode=invalid):
+                    with self.assertRaises(ValueError):
+                        optimizer.request_manual_selection("JP fast", expected_mode=invalid)
+                    self.assertEqual(path.read_bytes(), original)
+
     def test_paused_manual_mode_change_keeps_unconfirmed_rollback_for_recovery(self):
         for source, target in TRANSITIONS:
             with self.subTest(source=source, target=target), self.runtime(source, enabled=False) as fixture:

@@ -782,6 +782,7 @@ class Dashboard:
         self.client_busy = False
         self.client_dialog = None
         self.node_context = None
+        self.node_mode = None
         self.manual_busy = False
         self.manual_results: queue.SimpleQueue = queue.SimpleQueue()
         self.manual_request_id = None
@@ -1152,6 +1153,7 @@ class Dashboard:
     def client_saved(self, saved: dict) -> None:
         if tuple(core.state_context(saved)) != self.node_context:
             self.node_context = None
+            self.node_mode = None
             self.manual_attempt = None
             self.manual_request_id = None
             self.node_signature = ""
@@ -1254,7 +1256,8 @@ class Dashboard:
         if self.closed or self.exiting or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             return
         context = self.node_context
-        if context is None:
+        mode = self.node_mode
+        if context is None or mode is None:
             self.notify("客户端状态尚未确认，请刷新节点后再切换。", 15)
             return
         self.manual_busy = True
@@ -1271,7 +1274,7 @@ class Dashboard:
 
         def worker() -> None:
             try:
-                request_id = core.request_manual_selection(name, expected_context=context)
+                request_id = core.request_manual_selection(name, expected_context=context, expected_mode=mode)
                 self.manual_results.put((attempt, True, request_id))
             except (OSError, ValueError) as error:
                 self.manual_results.put((attempt, False, str(error)))
@@ -1392,8 +1395,13 @@ class Dashboard:
         if status.get("controller_context") != list(context):
             status = {}
             self.node_context = None
+            self.node_mode = None
         else:
             self.node_context = context
+            mode, group = status.get("mode"), status.get("group")
+            self.node_mode = (core.active_mode(status, group)
+                              if isinstance(mode, str) and mode.lower() in ("rule", "global")
+                              and isinstance(group, str) and group else None)
         self.poll_updates(status)
         if self.closed:
             return

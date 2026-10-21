@@ -12,6 +12,7 @@ import dashboard
 
 
 CLIENT_CONTEXT = dashboard.core.state_context(dashboard.core.DEFAULTS)
+DISPLAYED_MODE = ("rule", CLIENT_CONTEXT[2])
 
 
 def dashboard_state():
@@ -20,6 +21,7 @@ def dashboard_state():
     app.closed = app.exiting = app.restore_busy = app.manual_busy = app.client_busy = False
     app.client_dialog = None
     app.node_context = CLIENT_CONTEXT
+    app.node_mode = DISPLAYED_MODE
     app.manual_results = queue.SimpleQueue()
     app.manual_request_id = app.manual_attempt = None
     app.manual_request_name = ""
@@ -65,7 +67,7 @@ class ManualSelectionTests(unittest.TestCase):
         self.request.assert_not_called()
         self.app.notify.reset_mock()
         self.workers[0]()
-        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT, expected_mode=DISPLAYED_MODE)
         self.app.notify.assert_not_called()  # worker only posts to its queue
         self.app.poll_manual_selection(self.acknowledgement())
         self.assertFalse(self.app.manual_busy)
@@ -78,20 +80,20 @@ class ManualSelectionTests(unittest.TestCase):
         self.assertEqual(len(self.workers), 1)
         self.app.ensure_service.assert_called_once()
         self.publish_id()
-        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT, expected_mode=DISPLAYED_MODE)
 
     def test_auto_ineligible_node_can_be_selected_manually(self):
         self.app.table.selection.return_value = ("node not auto eligible",)
         self.assertEqual(self.app.switch_selected_node(), "break")
         self.publish_id()
-        self.request.assert_called_once_with("node not auto eligible", expected_context=CLIENT_CONTEXT)
+        self.request.assert_called_once_with("node not auto eligible", expected_context=CLIENT_CONTEXT, expected_mode=DISPLAYED_MODE)
 
     def test_double_click_uses_row_under_pointer_and_heading_click_does_nothing(self):
         self.app.table.identify_row.return_value = "JP A"
         self.app.switch_clicked_node(SimpleNamespace(y=25))
         self.app.table.selection_set.assert_called_once_with("JP A")
         self.publish_id()
-        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT)
+        self.request.assert_called_once_with("JP A", expected_context=CLIENT_CONTEXT, expected_mode=DISPLAYED_MODE)
         self.app.table.identify_row.return_value = ""
         self.app.switch_clicked_node(SimpleNamespace(y=0))
         self.assertEqual(len(self.workers), 1)
@@ -287,6 +289,7 @@ class StatusFreshnessTests(unittest.TestCase):
             "pid": 12345, "phase": "monitoring", "controller_available": True,
             "selected": "JP last-known", "nodes": self.nodes,
             "controller_context": list(CLIENT_CONTEXT),
+            "mode": DISPLAYED_MODE[0], "group": DISPLAYED_MODE[1],
             "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat(),
         }
 

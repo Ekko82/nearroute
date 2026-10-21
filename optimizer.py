@@ -144,10 +144,18 @@ def _manual_request_lock():
     return _file_lock(STATE / "manual-request.lock")
 
 
-def request_manual_selection(name, expected_context=None):
+def request_manual_selection(name, expected_context=None, expected_mode=None):
     """Queue a user choice for the helper, which serializes all controller PUTs."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("请选择要切换的节点")
+    if expected_mode is not None:
+        if not isinstance(expected_mode, (list, tuple)) or len(expected_mode) != 2:
+            raise ValueError("节点列表的代理模式无效，请刷新后重新选择")
+        mode, group = expected_mode
+        valid_group = group is None if mode == "direct" else isinstance(group, str) and bool(group.strip())
+        if mode not in ("rule", "global", "direct") or not valid_group:
+            raise ValueError("节点列表的代理模式无效，请刷新后重新选择")
+        expected_mode = list(expected_mode)
     cfg = load_config()
     _check_expected_context(cfg, expected_context)
     request_id = uuid.uuid4().hex
@@ -155,6 +163,7 @@ def request_manual_selection(name, expected_context=None):
         atomic_json(STATE / "select.request.json", {
             "request_id": request_id, "name": name,
             **controller_identity(cfg), "group": cfg["group"],
+            **({"expected_mode": expected_mode} if expected_mode is not None else {}),
         })
     return request_id
 
@@ -567,6 +576,7 @@ class Controller:
                 content = res.read(4 * 1024 * 1024)
                 return json.loads(content) if content else {}
         except urllib.error.HTTPError as exc:
+            exc.close()
             raise ControllerError("控制接口 HTTP " + str(exc.code)) from None
         except (OSError, ValueError, http.client.HTTPException):
             raise ControllerError("无法连接代理客户端控制接口") from None
@@ -1005,6 +1015,8 @@ class Optimizer:
             self.recover_pending()
             general, proxies, group = self.api.snapshot(self.cfg)
             mode = active_mode(general, group)
+            if request.get("expected_mode") is not None and request["expected_mode"] != list(mode):
+                raise ModeChanged("代理模式或主代理组已改变，请刷新后重新选择节点")
             name = request.get("name")
             if not isinstance(name, str) or name not in proxies[group].get("all", []) or name not in flatten_candidates(proxies, group):
                 raise ValueError("该节点已失效或不能由当前主代理组直接选择，请刷新后重试")
@@ -1545,7 +1557,6 @@ def _restore_original_locked():
     pending = pending_record(read_json(STATE / "pending-selection.json", {}))
     proxies = api.request("/proxies")["proxies"]
     restored = []
-    restored_names = {}
     for saved in owned_records(original):
         if not same_controller(saved, cfg):
             continue
@@ -1572,7 +1583,6 @@ def _restore_original_locked():
             pending = {}
         retire_owned_record(STATE / "original-selection.json", cfg, group)
         restored.append(group)
-        restored_names[group] = saved["name"]
     event("restore", restored_groups=restored)
     state = read_json(STATE / "status.json", {})
     context = list(state_context(cfg))
@@ -1580,8 +1590,16 @@ def _restore_original_locked():
         state = {}
     state.update(controller_context=context, enabled=False, phase="stopped", pid=None,
                  message="已恢复原节点" if restored else "已停止；当前节点已有手动变化或无需恢复", updated_at=iso())
-    if restored:
-        state.update(group=restored[0], selected=restored_names[restored[0]])
+    try:
+        general, proxies, group = api.snapshot(cfg, allow_direct=True)
+        selected = resolve_leaf(proxies, proxies[group].get("now")) if group else "DIRECT"
+        state.update(mode=general.get("mode", "rule").lower(), group=group, selected=selected,
+                     controller_available=True, health=None, last_error=None)
+    except (ControllerError, ValueError, OSError) as error:
+        # Restoration has already committed; a status read cannot undo it.
+        state.update(controller_available=False, mode=None, group=None, selected=None,
+                     health=None, last_error=str(error),
+                     message=state["message"] + "；暂时无法确认当前线路")
     atomic_json(STATE / "status.json", state)
     return restored
 

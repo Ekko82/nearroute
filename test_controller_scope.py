@@ -355,6 +355,77 @@ class ControllerScopeTests(unittest.TestCase):
                 for name in ("selection.json", "original-selection.json"):
                     self.assertEqual(optimizer.owned_records(optimizer.read_json(self.state / name, {})), [])
 
+    def test_restore_status_uses_current_rule_group_after_restoring_multiple_groups(self):
+        self.choose("JP fast", "Main")
+        self.api.proxies["Other"] = {
+            "type": "Selector", "all": ["JP old", "JP fast", "JP manual"], "now": "JP manual",
+        }
+        self.choose("JP fast", "Other")
+
+        self.assertEqual(optimizer.restore_original(), ["Main", "Other"])
+        status = optimizer.read_json(self.state / "status.json", {})
+        self.assertEqual((status.get("mode"), status.get("group"), status.get("selected")),
+                         ("rule", "Other", "JP manual"))
+        self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
+        self.assertEqual(self.api.proxies["Other"]["now"], "JP manual")
+
+    def test_restore_status_resolves_nested_global_and_refreshes_without_restoration(self):
+        self.api.general["mode"] = "global"
+        self.api.proxies["GLOBAL"] = {
+            "type": "Selector", "all": ["Main", "JP fast"], "now": "Main",
+        }
+        self.choose("JP fast")
+
+        self.assertEqual(optimizer.restore_original(), ["GLOBAL"])
+        status = optimizer.read_json(self.state / "status.json", {})
+        self.assertEqual((status.get("mode"), status.get("group"), status.get("selected")),
+                         ("global", "GLOBAL", "JP old"))
+        self.assertEqual(self.api.proxies["GLOBAL"]["now"], "Main")
+        self.api.select_calls.clear()
+
+        self.api.proxies["Main"]["now"] = "JP manual"
+        for mode, group, selected in (("global", "GLOBAL", "JP manual"),
+                                      ("direct", None, "DIRECT")):
+            with self.subTest(mode=mode):
+                self.api.general["mode"] = mode
+                self.assertEqual(optimizer.restore_original(), [])
+                status = optimizer.read_json(self.state / "status.json", {})
+                self.assertEqual((status.get("mode"), status.get("group"), status.get("selected")),
+                                 (mode, group, selected))
+                self.assertTrue(status["controller_available"])
+        self.assertEqual(self.api.select_calls, [])
+
+    def test_restore_status_read_failure_preserves_completed_restoration(self):
+        self.choose("JP fast")
+        self.api.select_calls.clear()
+        request = self.api.request
+
+        def fail_mode_read(path, *args, **kwargs):
+            if path == "/configs":
+                raise optimizer.ControllerError("mock final metadata read failed")
+            return request(path, *args, **kwargs)
+
+        with patch.object(self.api, "request", side_effect=fail_mode_read):
+            self.assertEqual(optimizer.restore_original(), ["Main"])
+        status = optimizer.read_json(self.state / "status.json", {})
+        self.assertEqual(status["phase"], "stopped")
+        self.assertFalse(status.get("controller_available", True))
+        for field in ("mode", "group", "selected", "health"):
+            self.assertIsNone(status.get(field))
+        self.assertIn("无法确认", status["message"])
+        self.assertEqual(status["last_error"], "mock final metadata read failed")
+        for name in ("selection.json", "original-selection.json"):
+            self.assertEqual(optimizer.owned_records(optimizer.read_json(self.state / name, {})), [])
+        self.assertEqual(self.api.select_calls, [("Main", "JP old")])
+
+        self.api.proxies["Main"]["now"] = "JP manual"
+        self.assertEqual(optimizer.restore_original(), [])
+        status = optimizer.read_json(self.state / "status.json", {})
+        self.assertEqual(status["selected"], "JP manual")
+        self.assertTrue(status["controller_available"])
+        self.assertIsNone(status["last_error"])
+        self.assertEqual(self.api.select_calls, [("Main", "JP old")])
+
 
 if __name__ == "__main__":
     unittest.main()

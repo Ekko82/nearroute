@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import os
 from pathlib import Path
@@ -148,6 +149,22 @@ class ClientConnectionTests(unittest.TestCase):
         self.assertEqual(destination_calls, [])
         self.assert_config_unchanged()
         self.stop.assert_not_called()
+
+    def test_controller_http_errors_close_the_response_before_raising(self):
+        for code in (401, 302):
+            with self.subTest(http_status=code):
+                response = io.BytesIO(b"synthetic error response")
+                error = optimizer.urllib.error.HTTPError(
+                    "http://127.0.0.1:1/configs", code, "fixture error", {}, response,
+                )
+                self.addCleanup(error.close)
+                opener = Mock()
+                opener.open.side_effect = error
+                with patch.object(optimizer.urllib.request, "build_opener", return_value=opener):
+                    with self.assertRaisesRegex(optimizer.ControllerError, f"^控制接口 HTTP {code}$") as caught:
+                        optimizer.Controller(self.initial).request("/configs")
+                self.assertIs(caught.exception.__context__, error)
+                self.assertTrue(response.closed)
 
     def test_invalid_endpoint_or_environment_is_rejected_before_stopping(self):
         endpoint, calls = self.controller()
