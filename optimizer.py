@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import ctypes
 import hashlib
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -609,6 +610,32 @@ class Controller:
         self.request("/proxies/" + urllib.parse.quote(group, safe=""), "PUT", {"name": name})
 
 
+def local_proxy_endpoint(general):
+    port = general.get("mixed-port") or general.get("port")
+    if type(port) is not int or not 1 <= port <= 65535:
+        raise ControllerError("代理客户端须开启本机 HTTP 或 mixed 代理端口，近舟才能验证实际线路")
+    # Mihomo ignores bind-address when allow-lan is disabled.
+    if not general.get("allow-lan"):
+        return "127.0.0.1", port
+    bind = general.get("bind-address", "*")
+    if bind in ("*", ""):
+        return "127.0.0.1", port
+    if bind == "localhost":
+        return "127.0.0.1", port
+    if isinstance(bind, str) and bind.startswith("[") and bind.endswith("]"):
+        bind = bind[1:-1]
+    try:
+        address = ipaddress.ip_address(bind) if isinstance(bind, str) else None
+    except ValueError:
+        address = None
+    if address is not None:
+        if address.is_unspecified:
+            return ("::1" if address.version == 6 else "127.0.0.1"), port
+        if address.is_loopback:
+            return str(address), port
+    raise ControllerError("HTTP 代理端口未绑定本机回环地址，请在客户端使用 127.0.0.1、[::1] 或通配地址")
+
+
 def inspect_controller(fields):
     """Read a local Clash-compatible client's groups without changing its state."""
     cfg = validate_config(fields)
@@ -625,9 +652,7 @@ def inspect_controller(fields):
     if not isinstance(mode, str) or mode.lower() not in ("rule", "global", "direct"):
         raise ControllerError("代理客户端返回了不支持的代理模式")
     mode = mode.lower()
-    port = general.get("mixed-port") or general.get("port")
-    if type(port) is not int or not 1 <= port <= 65535:
-        raise ControllerError("代理客户端须开启本机 HTTP 或 mixed 代理端口，近舟才能验证实际线路")
+    _, port = local_proxy_endpoint(general)
     groups = sorted(name for name, item in proxies.items()
                     if isinstance(item, dict) and item.get("type") == "Selector")
     active_group = None if mode == "direct" else ("GLOBAL" if mode == "global" else cfg["group"])
@@ -655,16 +680,17 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
     use their configured status codes. Redirects are not followed. This checks
     the connection, not account access or complete model generation.
     """
-    port = general.get("mixed-port") or general.get("port")
-    if not port:
-        return {"ok": False, "reason": "未找到本机 HTTP 代理端口"}
+    try:
+        host, port = local_proxy_endpoint(general)
+    except ControllerError as exc:
+        return {"ok": False, "reason": str(exc)}
     target = parse_probe_url(probe_url)
     if target.scheme == "https":
-        conn = http.client.HTTPSConnection("127.0.0.1", int(port), timeout=7, context=ssl.create_default_context())
+        conn = http.client.HTTPSConnection(host, port, timeout=7, context=ssl.create_default_context())
         conn.set_tunnel(target.hostname, target.port or 443)
         request_path = urllib.parse.urlunsplit(("", "", target.path or "/", target.query, ""))
     else:
-        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=7)
+        conn = http.client.HTTPConnection(host, port, timeout=7)
         request_path = probe_url
     conn.response_class = ProbeHTTPResponse
     delays, sock = [], None
