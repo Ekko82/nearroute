@@ -693,6 +693,9 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
         conn = http.client.HTTPConnection(host, port, timeout=7)
         request_path = probe_url
     conn.response_class = ProbeHTTPResponse
+    headers = {"Accept": "*/*", "User-Agent": "NearRoute/1.0", "Connection": "keep-alive"}
+    if target.scheme == "http":
+        headers["Proxy-Connection"] = "keep-alive"
     delays, sock = [], None
     try:
         for index in range(3 if idle_seconds else 1):
@@ -705,7 +708,7 @@ def verify_current_path(general, idle_seconds=0, cancel=None, *, probe_url=PROBE
             if cancel and cancel():
                 return {"ok": False, "reason": "验证已取消", "cancelled": True}
             started = time.perf_counter()
-            conn.request("GET", request_path, headers={"Accept": "*/*", "User-Agent": "NearRoute/1.0", "Connection": "keep-alive"})
+            conn.request("GET", request_path, headers=headers)
             response = conn.getresponse()
             delays.append(round((time.perf_counter() - started) * 1000, 1))
             if response.status not in expected_statuses:
@@ -1000,7 +1003,27 @@ class Optimizer:
         self.write_status(mode=general.get("mode", "rule").lower(), group=group, selected=selected,
                           controller_available=True, last_error=None, **updates)
 
-    def require_active_mode(self, expected, expected_path=None):
+    def require_proxy_endpoint(self, general, proxies, group, expected=None):
+        message = None
+        try:
+            endpoint = local_proxy_endpoint(general)
+        except ControllerError as error:
+            endpoint = None
+            message = str(error)
+        if message is None and (expected is None or endpoint == expected):
+            return endpoint
+        self.failures = 0
+        self.last_health = time.time() if endpoint is None else 0
+        self.next_scan = self.last_health + self.cfg["health_interval_seconds"] if endpoint is None else 0
+        message = message or "代理监听地址或端口已改变，已丢弃旧连接验证，等待重新检查"
+        self.publish_active_path(
+            general, proxies, group, health=None, verification=None, last_health_at=None,
+            consecutive_health_failures=0, next_scan_at=iso(self.next_scan) if self.next_scan else iso(),
+            phase="waiting" if endpoint is None else ("monitoring" if self.cfg["enabled"] else "paused"),
+            message=message)
+        raise PathChanged(message)
+
+    def require_active_mode(self, expected, expected_path=None, *, expected_endpoint=None):
         snapshot = self.api.snapshot(self.cfg, allow_direct=True)
         general, proxies, group = snapshot
         mode_changed = active_mode(general, group) != expected
@@ -1018,6 +1041,8 @@ class Optimizer:
                                      consecutive_health_failures=0, next_scan_at=iso(), message=message,
                                      **({"nodes": []} if mode_changed else {}))
             raise (ModeChanged if mode_changed else PathChanged)(message)
+        if expected_endpoint is not None:
+            self.require_proxy_endpoint(general, proxies, group, expected_endpoint)
         return snapshot
 
     def observe_paused_path(self):
@@ -1282,6 +1307,7 @@ class Optimizer:
             if (candidate not in latest[group].get("all", [])
                     or candidate not in flatten_candidates(latest, group)):
                 return None  # Removed before PUT; no candidate validation was attempted.
+            endpoint = self.require_proxy_endpoint(general, latest, group)
             if self.defer_recovery_scan(force=True):
                 return False
             self.protect_original(group, previous)
@@ -1307,7 +1333,7 @@ class Optimizer:
 
             result = self.verify_path(general, self.cfg["verification_idle_seconds"],
                                       cancel=cancel_verification)
-            general, latest, _ = self.require_active_mode(mode)
+            general, latest, _ = self.require_active_mode(mode, expected_endpoint=endpoint)
             self.reload_config()
             if latest.get(group, {}).get("now") != candidate:
                 event("selection_changed_during_validation", group=group)
@@ -1434,6 +1460,7 @@ class Optimizer:
                               excluded_node_count=len(all_names))
             raise ControllerError("代理组中没有符合地区范围的节点；保留当前选择")
         self.observe_selection(path)
+        endpoint = self.require_proxy_endpoint(general, proxies, group) if self.cfg["enabled"] and not self.dry_run else None
         self.write_status(controller_available=True, mode=mode[0], group=group, selected=current or previous,
                           phase="scanning", message="开始对所选范围测速", last_error=None,
                           nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
@@ -1446,7 +1473,7 @@ class Optimizer:
             return
         if not forced and self.defer_recovery_scan():
             return
-        self.require_active_mode(mode, path)
+        self.require_active_mode(mode, path, expected_endpoint=endpoint)
         shortlist = select_shortlist(fresh, current, int(self.cfg["shortlist_size"]), self.cfg["prefer_japan"])
         for round_no in range(int(self.cfg["confirmation_rounds"])):
             if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
@@ -1456,10 +1483,10 @@ class Optimizer:
                 return
             if not forced and self.defer_recovery_scan():
                 return
-            self.require_active_mode(mode, path)
+            self.require_active_mode(mode, path, expected_endpoint=endpoint)
         if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return
-        _, proxies, _ = self.require_active_mode(mode, path)
+        _, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
         def ranking():
             rows = self.statistics(names)
             selectable = set(proxies[group].get("all", [])) & set(flatten_candidates(proxies, group))
@@ -1481,7 +1508,7 @@ class Optimizer:
             self.next_scan = 0
             self.write_status(message="地区策略已更新，将按新范围重新测速")
             return
-        self.require_active_mode(mode, path)
+        general, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
         if self.dry_run or not self.cfg["enabled"]:
             self.write_status(phase="paused" if not self.cfg["enabled"] else "monitoring", message="测速完成；本轮仅测量，未切换")
             return
@@ -1491,14 +1518,16 @@ class Optimizer:
             self.write_status(message="检测到手动选点，暂时尊重手动选择")
             return
         # A short active-path check detects 403/5xx hidden by old delay APIs.
+        endpoint = self.require_proxy_endpoint(general, proxies, group, endpoint)
         health = self.verify_path(general)
+        general, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
         self.failures = 0 if health["ok"] else self.failures + 1
         self.write_status(health=health)
         if not health["ok"]:
             health = self.verify_path(general)
+            general, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
             self.failures = 0 if health["ok"] else self.failures + 1
             self.write_status(health=health)
-        _, proxies, _ = self.require_active_mode(mode, path)
         if self.defer_recovery_scan():
             return
         healthy_path = path if health["ok"] else None
@@ -1541,7 +1570,7 @@ class Optimizer:
             self.reload_config()
             if not self.cfg["enabled"]:
                 break
-            _, proxies, _ = self.require_active_mode(mode, path)
+            _, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
             if proxies.get(group, {}).get("now") != previous:
                 reason = "选择已被用户更改，停止本轮切换"
                 break
@@ -1551,7 +1580,7 @@ class Optimizer:
             self.write_status(nodes=[], phase="monitoring" if self.cfg["enabled"] else "paused",
                               next_scan_at=iso(), message="测速设置已更新，等待重新测速")
             return
-        final_general, latest, _ = self.require_active_mode(mode)
+        final_general, latest, _ = self.require_active_mode(mode, expected_endpoint=endpoint)
         final_path = active_path(final_general, latest, group)
         if final_path != self.observed_selection:
             self.observe_selection(final_path)
@@ -1586,6 +1615,7 @@ class Optimizer:
                                      consecutive_health_failures=self.failures,
                                      message="客户端当前为直连模式，等待切换回规则或全局模式")
             return
+        endpoint = self.require_proxy_endpoint(general, proxies, group)
         result = self.verify_path(general)
         general, proxies, group = self.api.snapshot(self.cfg, allow_direct=True)
         latest_path = active_path(general, proxies, group)
@@ -1597,6 +1627,7 @@ class Optimizer:
                                      message="连接路径已改变，已丢弃上一条线路的检查结果",
                                      **({"nodes": []} if latest_path[:2] != path[:2] else {}))
             return
+        self.require_proxy_endpoint(general, proxies, group, endpoint)
         self.failures = 0 if result["ok"] else self.failures + 1
         if self.failures >= 2 and time.time() - self.last_scan >= 30:
             self.next_scan = 0
@@ -1641,6 +1672,9 @@ class Optimizer:
                         self.write_idle_status(phase="paused", message="已暂停自动测速和切换")
                 else:
                     self.write_idle_status(phase="monitoring")
+            except PathChanged:
+                # The guard already published the live controller state.
+                pass
             except (ControllerError, ValueError, OSError) as exc:
                 self.write_status(phase="waiting", controller_available=False, message=str(exc), last_error=str(exc))
                 self.next_scan = time.time() + 15
