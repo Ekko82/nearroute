@@ -1126,12 +1126,13 @@ class Optimizer:
 
     def measure_round(self, names, title, *, forced=False):
         policy = selection_policy(self.cfg)
+        automatic = self.cfg["enabled"] and not forced
         results = {}
         if self.stopping() or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return results
         self.reload_config()
         last_config_check = time.monotonic()
-        if selection_policy(self.cfg) != policy:
+        if selection_policy(self.cfg) != policy or (automatic and not self.cfg["enabled"]):
             return results
         if not forced and self.transport_recovery_active():
             return results
@@ -1149,7 +1150,7 @@ class Optimizer:
                 if now - last_config_check >= 1:
                     self.reload_config()
                     last_config_check = now
-                if selection_policy(self.cfg) != policy:
+                if selection_policy(self.cfg) != policy or (automatic and not self.cfg["enabled"]):
                     break
                 if not forced and self.transport_recovery_active():
                     break
@@ -1340,15 +1341,26 @@ class Optimizer:
             self.rollback(pending["group"], pending["candidate"], pending["previous"], api=api)
         path.unlink(missing_ok=True)
 
-    def scan(self, forced=False):
+    def scan(self, forced=False, *, automatic=None):
         try:
-            self._scan(forced)
+            self._scan(forced, automatic=automatic)
         except PathChanged:
             # The guard has already published the current active path.
             return
 
-    def _scan(self, forced=False):
+    def _scan(self, forced=False, *, automatic=None):
         self.reload_config()
+        automatic = not forced and (self.cfg["enabled"] if automatic is None else automatic)
+
+        def stop_if_paused():
+            if not automatic or self.cfg["enabled"]:
+                return False
+            self.next_scan = 0
+            self.write_status(phase="paused", next_scan_at=iso(), message="已暂停自动测速和切换")
+            return True
+
+        if stop_if_paused():
+            return
         if not forced and self.defer_recovery_scan(force=True):
             return
         if not self.transport_recovery_active():
@@ -1386,6 +1398,8 @@ class Optimizer:
                           scan_node_count=len(names), excluded_node_count=len(all_names) - len(names),
                           region_counts=dict(collections.Counter(node_region(name) for name in names)))
         fresh = self.measure_round(names, "所选节点初测", forced=forced)
+        if stop_if_paused():
+            return
         if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
             return
         if not forced and self.defer_recovery_scan():
@@ -1396,6 +1410,8 @@ class Optimizer:
             if self.stopping() or self.manual_revision != revision or selection_policy(self.cfg) != policy:
                 return
             self.measure_round(shortlist, f"候选复测 {round_no + 1}/{int(self.cfg['confirmation_rounds'])}", forced=forced)
+            if stop_if_paused():
+                return
             if not forced and self.defer_recovery_scan():
                 return
             self.require_active_mode(mode, path)
@@ -1572,7 +1588,7 @@ class Optimizer:
                                   and self.status.get("health") is None
                                   and self.failures < 2 and not recovery_scan_due)
                 if forced or (scan_due and not check_new_path):
-                    self.scan(forced=forced)
+                    self.scan(forced=forced, automatic=not forced)
                 elif health_due or check_new_path:
                     self.tick_health()
                     self.last_health = time.time()
