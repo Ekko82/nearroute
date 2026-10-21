@@ -1067,6 +1067,7 @@ class Optimizer:
             self.next_scan = now + self.cfg["scan_interval_seconds"]
             result.update(ok=True, message="已手动切换；暂时尊重此选择")
             self.write_status(selected=name, mode=mode[0], group=group, controller_available=True, last_error=None,
+                              health=None, last_health_at=None, verification=None, consecutive_health_failures=0,
                               phase="monitoring" if self.cfg["enabled"] else "paused",
                               last_switch_at=iso(now), manual_until=iso(self.manual_until),
                               next_scan_at=iso(self.next_scan), manual_selection_result=result, message=result["message"])
@@ -1283,7 +1284,9 @@ class Optimizer:
                 committed = True
                 self.observed_selection = active_path(general, latest, group)
                 self.failures = 0
+                self.last_health = now
                 self.write_status(selected=candidate, mode=mode[0], group=group,
+                                  health=result, last_health_at=iso(now), consecutive_health_failures=0,
                                   last_switch_at=iso(now), verification=result, last_error=None)
                 event("switched", group=group, previous=previous, selected=candidate, verification=result)
                 return True
@@ -1321,6 +1324,8 @@ class Optimizer:
             same_controller(item, pending) and item["group"] == pending["group"]
             and item.get("transaction_id") == pending["transaction_id"] for item in records)
         if not completed:
+            if self.dry_run:
+                raise ControllerError("存在未完成的节点切换；只测速模式不会自动恢复，请先执行 restore 或正常运行近舟后重试")
             api = self.api
             if not same_controller(pending, self.cfg):
                 recovery_cfg = validate_config(self.cfg | {
@@ -1479,9 +1484,15 @@ class Optimizer:
                 break
             stats = ranking()
         final_general, latest, _ = self.require_active_mode(mode)
-        selected = resolve_leaf(latest, latest.get(group, {}).get("now"))
+        final_path = active_path(final_general, latest, group)
+        if final_path != self.observed_selection:
+            self.observe_selection(final_path)
+            self.status["verification"] = None
+            self.last_health = 0.0
+            reason = "检测到手动选点，暂时尊重手动选择"
+        selected = final_path[3]
         selected_row = next((row for row in stats if row["name"] == selected), {})
-        if (self.failures == 0 and healthy_path == active_path(final_general, latest, group)
+        if (self.failures == 0 and healthy_path == final_path
                 and (selected_row.get("eligible") or selected_row.get("region_standby"))
                 and self.record.get("group") == group
                 and self.record.get("name") == latest.get(group, {}).get("now")
@@ -1733,9 +1744,11 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(description="近舟 NearRoute 代理线路优选")
     parser.add_argument("command", choices=["run", "scan", "status", "stop", "restore"])
-    parser.add_argument("--dry-run", action="store_true", help="只测速，不切换")
+    parser.add_argument("--dry-run", action="store_true", help="只测速，不切换（仅 run 和 scan）")
     parser.add_argument("--ready-token", type=uuid.UUID, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.dry_run and args.command not in ("run", "scan"):
+        parser.error("--dry-run 仅适用于 run 和 scan 命令")
     STATE.mkdir(parents=True, exist_ok=True)
     if args.command == "status":
         print(json.dumps(read_json(STATE / "status.json", {}), ensure_ascii=False, indent=2))
