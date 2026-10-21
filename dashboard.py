@@ -561,9 +561,11 @@ class ClientDialog:
         self.save_button.pack(side="right")
         self.cancel_button = ttk.Button(actions, text="取消", command=self.close)
         self.cancel_button.pack(side="right", padx=8)
-        self.controller.trace_add("write", self.invalidate_connection)
-        self.secret_env.trace_add("write", self.invalidate_connection)
-        self.group.trace_add("write", lambda *_: self.update_buttons())
+        self._variable_traces = [
+            (self.controller, self.controller.trace_add("write", self.invalidate_connection)),
+            (self.secret_env, self.secret_env.trace_add("write", self.invalidate_connection)),
+            (self.group, self.group.trace_add("write", lambda *_: self.update_buttons())),
+        ]
         self.update_buttons()
         self.after_id = self.window.after(150, self.poll_results)
         if visible:
@@ -675,6 +677,9 @@ class ClientDialog:
     def close(self) -> None:
         if self.applying:
             return
+        for variable, token in self._variable_traces:
+            variable.trace_remove("write", token)
+        self._variable_traces.clear()
         self.closed = True
         if self.after_id is not None:
             self.window.after_cancel(self.after_id)

@@ -318,6 +318,43 @@ class ControllerScopeTests(unittest.TestCase):
         self.assertEqual(optimizer.restore_original(), [])
         self.assertEqual(self.api.select_calls, [("Main", "JP old")])
 
+    def test_restore_rebinds_status_after_failed_client_save_or_legacy_snapshot(self):
+        for source in ("failed client save", "legacy snapshot"):
+            with self.subTest(source=source):
+                self.choose("JP fast")
+                optimizer.atomic_json(optimizer.CONFIG, self.cfg)
+                if source == "failed client save":
+                    write = optimizer.atomic_json
+
+                    def fail_config_write(path, value):
+                        if path == optimizer.CONFIG:
+                            raise PermissionError("fixture config file is occupied")
+                        return write(path, value)
+
+                    with patch.object(optimizer, "atomic_json", side_effect=fail_config_write):
+                        with self.assertRaises(PermissionError):
+                            optimizer.configure_client({"controller": "http://127.0.0.1:9791"})
+                    self.assertEqual(optimizer.read_json(optimizer.CONFIG, {}), self.cfg)
+                    stale = optimizer.read_json(self.state / "status.json", {})
+                    self.assertNotEqual(stale.get("controller_context"), list(optimizer.state_context(self.cfg)))
+                else:
+                    optimizer.atomic_json(self.state / "status.json", {
+                        "selected": "legacy node", "group": "legacy group",
+                        "nodes": [{"name": "legacy node"}], "health": {"ok": True},
+                    })
+
+                self.assertEqual(optimizer.restore_original(), ["Main"])
+                self.assertEqual(self.api.proxies["Main"]["now"], "JP old")
+                status = optimizer.read_json(self.state / "status.json", {})
+                # The dashboard accepts a snapshot only when this identity matches.
+                self.assertEqual(status.get("controller_context"), list(optimizer.state_context(self.cfg)))
+                self.assertEqual(status.get("group"), "Main")
+                self.assertEqual(status.get("selected"), "JP old")
+                self.assertEqual(status.get("nodes", []), [])
+                self.assertIsNone(status.get("health"))
+                for name in ("selection.json", "original-selection.json"):
+                    self.assertEqual(optimizer.owned_records(optimizer.read_json(self.state / name, {})), [])
+
 
 if __name__ == "__main__":
     unittest.main()

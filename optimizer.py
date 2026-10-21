@@ -1575,9 +1575,13 @@ def _restore_original_locked():
         restored_names[group] = saved["name"]
     event("restore", restored_groups=restored)
     state = read_json(STATE / "status.json", {})
-    state.update(enabled=False, phase="stopped", pid=None, message="已恢复原节点" if restored else "已停止；当前节点已有手动变化或无需恢复", updated_at=iso())
+    context = list(state_context(cfg))
+    if state.get("controller_context") != context:
+        state = {}
+    state.update(controller_context=context, enabled=False, phase="stopped", pid=None,
+                 message="已恢复原节点" if restored else "已停止；当前节点已有手动变化或无需恢复", updated_at=iso())
     if restored:
-        state["selected"] = restored_names[restored[0]]
+        state.update(group=restored[0], selected=restored_names[restored[0]])
     atomic_json(STATE / "status.json", state)
     return restored
 

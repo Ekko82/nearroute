@@ -1,7 +1,8 @@
-"""Client connection UI checks with Tcl variables and no windows or real controller."""
+"""Offline client connection checks; never use a real controller or helper."""
 
 from contextlib import ExitStack
 from datetime import datetime
+import gc
 import json
 from pathlib import Path
 import queue
@@ -10,6 +11,7 @@ import tkinter as tk
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import weakref
 
 import dashboard
 
@@ -176,6 +178,42 @@ class ClientDialogTests(unittest.TestCase):
         self.assertTrue(self.dialog.closed)
         self.assertEqual(self.dialog.window.mock_calls, [])
         self.owner.client_saved.assert_not_called()
+
+
+class ClientDialogLifecycleTests(unittest.TestCase):
+    def test_close_releases_variable_traces_and_dialog_after_apply_finishes(self):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError as error:
+            self.skipTest(f"Tk display unavailable: {error}")
+        try:
+            with tempfile.TemporaryDirectory(prefix="nearroute-client-lifecycle-") as directory:
+                config = Path(directory) / "config.json"
+                config.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+                owner = SimpleNamespace(root=root, client_dialog=None)
+                with patch.object(dashboard, "CONFIG", config):
+                    # Real widgets avoid Mock command/protocol references masking leaks.
+                    dialog = dashboard.ClientDialog(owner, visible=False)
+                owner.client_dialog = dialog
+                variables = (dialog.controller, dialog.secret_env, dialog.group)
+                reference = weakref.ref(dialog)
+                self.assertTrue(all(len(variable.trace_info()) == 1 for variable in variables))
+                dialog.applying = True
+                dialog.close()
+                self.assertFalse(dialog.closed)
+                self.assertTrue(dialog.window.winfo_exists())
+                self.assertTrue(all(len(variable.trace_info()) == 1 for variable in variables))
+                dialog.applying = False
+                dialog.close()
+                self.assertTrue(dialog.closed)
+                self.assertTrue(all(not variable.trace_info() for variable in variables))
+                self.assertIsNone(owner.client_dialog)
+                del dialog
+                gc.collect()
+                self.assertIsNone(reference())
+        finally:
+            root.destroy()
 
 
 class ClientContextTests(unittest.TestCase):
