@@ -38,6 +38,12 @@ import client_detection
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 CONFIG = ROOT / "config.json"
+try:
+    RUNTIME_VERSION = (ROOT / "VERSION").read_text(encoding="utf-8-sig").strip()
+    if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", RUNTIME_VERSION):
+        RUNTIME_VERSION = None
+except (OSError, UnicodeError):
+    RUNTIME_VERSION = None
 PROBE_HOST = "chatgpt.com"
 PROBE_PATH = "/backend-api/codex/responses"
 PROBE_URL = "https://" + PROBE_HOST + PROBE_PATH
@@ -998,6 +1004,129 @@ class LogSignals:
         return len(self.recent)
 
 
+def codex_connection_summary(path, *, now=None):
+    """Return an opt-in, read-only summary of recent trusted Codex log records.
+
+    Counts are observations, with paired client/retry records counted once.
+    When truncated, the count covers only the records read, not the full window.
+    No log text, request identifiers, or paths leave this function.
+    """
+    result = {"state": "ok", "window_seconds": 7200, "error_count": 0,
+              "errors": [], "transports": [], "truncated": False}
+    if not path:
+        result["state"] = "not_configured"
+        return result
+    db = None
+    try:
+        path = Path(path)
+        if not path.exists():
+            result["state"] = "missing"
+            return result
+        current = time.time() if now is None else (now.timestamp() if isinstance(now, datetime) else float(now))
+        if not math.isfinite(current):
+            raise ValueError
+        db = sqlite3.connect(path.absolute().as_uri() + "?mode=ro", uri=True, timeout=0.15)
+        deadline = time.monotonic() + 0.75
+        db.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+        required = {"id", "ts", "ts_nanos", "level", "target", "feedback_log_body", "process_uuid", "thread_id"}
+        columns = {row[1] for row in db.execute("PRAGMA table_info(logs)")}
+        index = db.execute('PRAGMA index_info("idx_logs_ts")').fetchall()
+        if not required <= columns or not index or index[0][2] != "ts":
+            result["state"] = "unsupported"
+            return result
+        targets = ("codex_core::responses_retry", "codex_http_client::client",
+                   "codex_http_client::request", "codex_http_client::feedback_tags")
+        rows = db.execute("""SELECT ts,ts_nanos,level,target,feedback_log_body,process_uuid,thread_id
+            FROM logs INDEXED BY idx_logs_ts WHERE ts>=? AND ts<=? AND target IN (?,?,?,?)
+            ORDER BY ts DESC,ts_nanos DESC,id DESC LIMIT ?""",
+            (math.floor(current - 7200), current, *targets, 5001)).fetchall()
+        result["truncated"] = len(rows) > 5000
+        observations = []
+        unpaired = {}
+        transports = {}
+        for stamp, nanos, level, target, raw, process, thread in rows[:5000]:
+            if (type(stamp) is not int or type(nanos) is not int or not 0 <= nanos < 1000000000
+                    or not 0 <= current - stamp - nanos / 1000000000 <= 7200 or not isinstance(raw, str)):
+                continue
+            body = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw)
+            if target in targets[2:]:
+                for match in re.finditer(r'\btransport\s*=\s*[\"\']?(responses_http|responses_websocket)(?=[\"\']?(?:\s|[,}\]]|$))', body):
+                    transports.setdefault(match.group(1), (stamp, nanos))
+                continue
+            if not isinstance(level, str) or level.upper() not in ("WARN", "ERROR"):
+                continue
+            source = "client" if target == targets[1] else "retry"
+            lower = body.lower()
+            kind = None
+            if source == "client":
+                if "error sending request" in lower and LogSignals._responses_request(body):
+                    kind = "decode" if "error decoding response body" in lower else "send"
+            else:
+                kind = LogSignals._retry_stream_kind(body)
+                field = re.search(r'\b(sampling_error|compact_error)\s*=\s*', body)
+                error = body.strip()
+                if field:
+                    template = ("stream disconnected - retrying sampling request (" if field.group(1) == "sampling_error"
+                                else "remote compaction v2 stream failed; retrying request after delay")
+                    if template not in body[:field.start()]:
+                        continue
+                    error = re.split(r'\s+[A-Za-z_][A-Za-z_0-9]*\s*=', body[field.end():], maxsplit=1)[0].strip().strip('\"\'')
+                    prefix = "stream disconnected before completion: Transport error: network error: "
+                    if error.startswith(prefix):
+                        error = error[len(prefix):]
+                for phrase, candidate in (("error decoding response body", "decode"), ("error sending request", "send")):
+                    if (error.startswith(phrase) if field else
+                            error == phrase or (LogSignals._responses_request(body) and error.endswith(phrase))):
+                        kind = candidate
+                        break
+            if kind is None:
+                continue
+            at = datetime.fromtimestamp(stamp, TZ).replace(microsecond=nanos // 1000).isoformat(timespec="milliseconds")
+            record = {"at": at, "kind": kind, "retry": None, "max_retries": None, "retry_wait_ms": None}
+            for field, output in (("retries", "retry"), ("max_retries", "max_retries")):
+                match = re.search(r'\b' + field + r'\s*=\s*(\d{1,6})(?!\d)', body)
+                if match:
+                    record[output] = int(match.group(1))
+            delay = re.search(r'stream disconnected - retrying sampling request \((\d{1,6})/(\d{1,6}) in (\d{1,9}(?:\.\d{1,3})?)ms\)', body)
+            if delay:
+                record["retry"] = record["retry"] if record["retry"] is not None else int(delay.group(1))
+                record["max_retries"] = record["max_retries"] if record["max_retries"] is not None else int(delay.group(2))
+                record["retry_wait_ms"] = float(delay.group(3))
+            key = LogSignals._error_key(process, thread, body, kind)
+            if key is not None:
+                pending = unpaired.setdefault(key, [])
+                paired = next((i for i, item in enumerate(pending) if item[1] != source and abs(stamp - item[0]) <= 2), None)
+                if paired is not None:
+                    _, _, previous = pending.pop(paired)
+                    for field in ("retry", "max_retries", "retry_wait_ms"):
+                        if previous[field] is None:
+                            previous[field] = record[field]
+                    continue
+                pending.append((stamp, source, record))
+            observations.append(record)
+        result["error_count"] = len(observations)
+        result["errors"] = observations[:20]
+        result["transports"] = [{"transport": transport,
+                                 "last_seen": datetime.fromtimestamp(stamp, TZ).replace(microsecond=nanos // 1000).isoformat(timespec="milliseconds")}
+                                for transport, (stamp, nanos) in transports.items()]
+        result["truncated"] = result["truncated"] or len(observations) > 20
+    except sqlite3.Error as exc:
+        code = getattr(exc, "sqlite_errorcode", 0) or 0
+        # Python 3.10 does not expose sqlite_errorcode on SQLite exceptions.
+        transient = code & 255 in (5, 6, 9) or (not code and str(exc).split(":", 1)[0] in (
+            "database is locked", "database table is locked", "database schema is locked", "interrupted"))
+        result["state"] = "busy" if transient else "unreadable"
+    except (OSError, TypeError, ValueError, OverflowError):
+        result["state"] = "unreadable"
+    finally:
+        if db is not None:
+            try:
+                db.set_progress_handler(None, 0)
+            finally:
+                db.close()
+    return result
+
+
 class Optimizer:
     def __init__(self, dry_run=False):
         STATE.mkdir(parents=True, exist_ok=True)
@@ -1011,7 +1140,9 @@ class Optimizer:
         self.status = read_json(STATE / "status.json", {})
         if self.status.get("controller_context") != list(self.state_context):
             self.status = {}
-        self.status.update({"pid": os.getpid(), "started_at": iso(), "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接代理客户端", "last_error": None, "controller_available": False, "health": None})
+        self.status.update({"pid": os.getpid(), "started_at": iso(), "runtime_version": RUNTIME_VERSION,
+                            "enabled": self.cfg["enabled"], "phase": "starting", "message": "正在连接代理客户端",
+                            "last_error": None, "controller_available": False, "health": None})
         self._published_status = {}
         self._last_status_at = 0.0
         self.failures = 0
@@ -1043,6 +1174,7 @@ class Optimizer:
                 self.status["last_scan_at"] = None
             self.status["nodes_probe_identity"] = self.history_probe
         self.status.update(updates)
+        self.status["runtime_version"] = RUNTIME_VERSION
         self.status["controller_context"] = list(self.state_context)
         self.status["updated_at"] = iso()
         self.status.pop("storage_error", None)

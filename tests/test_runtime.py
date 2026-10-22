@@ -92,6 +92,24 @@ class RuntimeTests(unittest.TestCase):
         )
         self.helper = optimizer.Optimizer()
 
+    def test_helper_reports_loaded_version_after_disk_version_changes(self):
+        self.assertEqual(self.helper.status["runtime_version"], optimizer.RUNTIME_VERSION)
+        disk_version = Path(self.temp.name) / "VERSION"
+        disk_version.write_text("99.0.0\n", encoding="utf-8")
+        with patch.object(optimizer, "ROOT", Path(self.temp.name)):
+            self.helper.write_status()
+        saved = optimizer.read_json(self.state / "status.json", {})
+        self.assertEqual(saved["runtime_version"], optimizer.RUNTIME_VERSION)
+        self.assertNotEqual(saved["runtime_version"], "99.0.0")
+
+    def test_restarted_helper_replaces_previous_runtime_version(self):
+        self.helper.write_status()
+        record = optimizer.read_json(self.state / "status.json", {})
+        record["runtime_version"] = "0.0.1"
+        optimizer.atomic_json(self.state / "status.json", record)
+        restarted = optimizer.Optimizer()
+        self.assertEqual(restarted.status["runtime_version"], optimizer.RUNTIME_VERSION)
+
     def journal(self, previous="JP old", candidate="JP fast", **extra):
         value = {**optimizer.controller_identity(self.cfg), "group": "Main",
                  "previous": previous, "candidate": candidate, "at": optimizer.iso()}

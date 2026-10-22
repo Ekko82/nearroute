@@ -319,6 +319,13 @@ def diagnostic_summary(root=None) -> str:
         except ValueError:
             return None
 
+    def runtime_version(value):
+        try:
+            updater.version_tuple(value)
+            return value
+        except (ValueError, updater.UpdateError):
+            return None
+
     version, version_file = None, "ok"
     try:
         version = updater.current_version(root=root)
@@ -360,6 +367,8 @@ def diagnostic_summary(root=None) -> str:
     available = record.get("controller_available")
     health = record.get("health")
     errors = record.get("network_errors_recent")
+    helper_version = runtime_version(record.get("runtime_version"))
+    gui_version = runtime_version(core.RUNTIME_VERSION)
     status = {
         "file": status_file, "recorded_at": recorded_at, "phase": phase, "stale": stale,
         "context_matches": context_matches, "current": current,
@@ -368,6 +377,8 @@ def diagnostic_summary(root=None) -> str:
         "network_errors_recent": errors if current and type(errors) is int and errors >= 0 else None,
         "recorded_last_switch_at": timestamp(record.get("last_switch_at")),
         "transport_recovery_until": timestamp(record.get("transport_recovery_until")) if current else None,
+        "helper_runtime_version": helper_version,
+        "started_at": timestamp(record.get("started_at")),
     }
     event_types = {"started", "stopped", "manual_selection", "external_selection_change", "switched", "rollback",
                    "selection_changed_during_validation", "candidate_rejected", "scan_completed", "restore", "error"}
@@ -400,8 +411,14 @@ def diagnostic_summary(root=None) -> str:
     else:
         system_name, system_version = platform.system(), platform.version()
     return json.dumps({
-        "generated_at": datetime.now(CHINA_TIME).isoformat(), "version": version, "version_file": version_file,
-        "runtime": {"python": platform.python_version(), "os": system_name, "os_version": system_version},
+        "generated_at": datetime.now(CHINA_TIME).isoformat(), "version": version,
+        "installed_version": version, "version_file": version_file,
+        "runtime": {
+            "python": platform.python_version(), "os": system_name, "os_version": system_version,
+            "gui_runtime_version": gui_version,
+            "gui_matches_installed": gui_version == version if gui_version is not None and version is not None else None,
+            "helper_matches_installed": helper_version == version if current and helper_version is not None and version is not None else None,
+        },
         "config": config, "status": status,
         "events": {"files": event_files, "installation_recent_events": events[-8:]},
     }, ensure_ascii=False, indent=2)
@@ -973,10 +990,13 @@ class DiagnosticDialog:
     def __init__(self, owner, *, visible=True):
         self.owner, self.closed = owner, False
         self.summary = diagnostic_summary()
+        self.results = queue.SimpleQueue()
+        self.after_id = None
+        self.reading_codex = False
         self.window = tk.Toplevel(owner.window)
         self.window.title("诊断信息 · 近舟 NearRoute")
-        self.window.geometry("720x580")
-        self.window.minsize(580, 440)
+        self.window.geometry("760x720")
+        self.window.minsize(620, 590)
         self.window.configure(background="#f3f6fb")
         self.window.transient(owner.window)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -985,28 +1005,137 @@ class DiagnosticDialog:
         form = ttk.Frame(self.window, padding=24)
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
-        form.rowconfigure(2, weight=1)
+        form.rowconfigure(4, weight=1)
         ttk.Label(form, text="诊断信息", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
         description = ttk.Label(form, text="查看本安装的运行摘要，复制后可用于排查连接或更新问题。\n摘要不会自动发送。", style="Muted.TLabel", wraplength=650)
-        description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 18))
+        description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 12))
+        self.version_note = tk.StringVar(value=self.runtime_note(json.loads(self.summary)))
+        runtime_label = ttk.Label(form, textvariable=self.version_note, style="Muted.TLabel", wraplength=680)
+        runtime_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        opt_in = ttk.Frame(form)
+        opt_in.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        opt_in.columnconfigure(0, weight=1)
+        privacy_label = ttk.Label(opt_in, text="仅此次读取本机日志，输出脱敏时间线；不启用后台日志监测。\n使用配置的路径或本机 Codex 默认日志，仅显示近 2 小时的时间、错误类别、重试次数与传输方式。\n不包含原始日志、提示词、令牌或路径，读取后先在下方预览。", style="Muted.TLabel", wraplength=650)
+        privacy_label.grid(row=0, column=0, sticky="ew")
+        self.codex_button = ttk.Button(opt_in, text="读取 Codex 断流摘要", command=self.read_codex_summary)
+        self.codex_button.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.codex_message = tk.StringVar(value="")
+        ttk.Label(opt_in, textvariable=self.codex_message, style="Muted.TLabel", wraplength=650).grid(row=2, column=0, sticky="ew", pady=(6, 0))
         self.text = tk.Text(form, wrap="word", font=("Consolas", 10), background="#ffffff", foreground="#334155", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#e2e8f0", padx=16, pady=14, spacing3=3)
-        self.text.grid(row=2, column=0, sticky="nsew")
+        self.text.grid(row=4, column=0, sticky="nsew")
         self.text.insert("1.0", self.summary)
         self.text.configure(state="disabled")
         scrollbar = ttk.Scrollbar(form, command=self.text.yview)
-        scrollbar.grid(row=2, column=1, sticky="ns")
+        scrollbar.grid(row=4, column=1, sticky="ns")
         self.text.configure(yscrollcommand=scrollbar.set)
         actions = ttk.Frame(form)
-        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(18, 0))
         self.copy_message = tk.StringVar(value="")
         ttk.Label(actions, textvariable=self.copy_message, style="Muted.TLabel").pack(side="left")
         ttk.Button(actions, text="复制摘要", style="Primary.TButton", command=self.copy_summary).pack(side="right")
         ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=(0, 10))
         def resize_description(event):
             if event.widget is self.window:
-                description.configure(wraplength=max(320, event.width - 64))
+                for label in (description, runtime_label, privacy_label):
+                    label.configure(wraplength=max(320, event.width - 64))
 
         self.window.bind("<Configure>", resize_description, add="+")
+
+    @staticmethod
+    def runtime_note(summary):
+        runtime, status = summary["runtime"], summary["status"]
+        installed = summary["installed_version"] or "未知"
+        gui = runtime["gui_runtime_version"] or "未知"
+        helper = status["helper_runtime_version"] or "未知"
+        started = display_time(status["started_at"])
+        text = f"安装文件 {installed} · 窗口 {gui} · 后台快照 {helper}\n后台启动：{started}"
+        hints = []
+        if runtime["gui_matches_installed"] is False:
+            hints.append("窗口与安装文件版本不同")
+        if runtime["helper_matches_installed"] is False:
+            hints.append("后台与安装文件版本不同")
+        elif runtime["helper_matches_installed"] is None and status["current"]:
+            hints.append("当前后台版本未知")
+        return text + ("\n" + "；".join(hints) + "。可从托盘选择“退出近舟”后重新打开。" if hints else "")
+
+    def read_codex_summary(self):
+        if self.closed or self.reading_codex:
+            return
+        self.reading_codex = True
+        self.codex_button.state(["disabled"])
+        self.codex_message.set("正在读取本地断流摘要…")
+        results, config_path = self.results, ROOT / "config.json"
+
+        def work():
+            source = "default"
+            try:
+                try:
+                    config = read_json(config_path)
+                except FileNotFoundError:
+                    config = {}
+                configured = config.get("codex_log_db", "")
+                configured = configured.strip() if isinstance(configured, str) else ""
+                if configured:
+                    source, log_path = "configured", configured
+                else:
+                    codex_home = os.environ.get("CODEX_HOME")
+                    log_path = str((Path(codex_home) if codex_home else Path.home() / ".codex") / "logs_2.sqlite")
+                result = core.codex_connection_summary(log_path)
+            except Exception:
+                # This preview boundary must never expose an exception's log contents or path.
+                result = {"state": "unreadable", "window_seconds": 7200, "error_count": 0,
+                          "errors": [], "transports": [], "truncated": False}
+            result["source"] = source
+            results.put(result)
+
+        try:
+            threading.Thread(target=work, daemon=True).start()
+        except RuntimeError:
+            source = "configured" if json.loads(self.summary)["config"].get("codex_log_configured") else "default"
+            results.put({"state": "unreadable", "window_seconds": 7200, "error_count": 0,
+                         "errors": [], "transports": [], "truncated": False, "source": source})
+        self.after_id = self.window.after(100, self.poll_codex_summary)
+
+    def poll_codex_summary(self):
+        self.after_id = None
+        if self.closed:
+            return
+        try:
+            result = self.results.get_nowait()
+        except queue.Empty:
+            self.after_id = self.window.after(100, self.poll_codex_summary)
+            return
+        self.reading_codex = False
+        self.codex_button.state(["!disabled"])
+        summary = json.loads(self.summary)
+        events = summary["events"]["installation_recent_events"]
+        for error in result["errors"]:
+            at = datetime.fromisoformat(error["at"])
+            nearby = []
+            for event in events:
+                seconds = (at - datetime.fromisoformat(event["time"])).total_seconds()
+                if abs(seconds) <= 120:
+                    nearby.append({**event, "seconds_from_event": round(seconds, 3)})
+            error["nearby_events"] = nearby
+        summary["codex_connection"] = result
+        self.summary = json.dumps(summary, ensure_ascii=False, indent=2)
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        self.text.insert("1.0", self.summary)
+        self.text.configure(state="disabled")
+        self.copy_message.set("")
+        messages = {
+            "ok": "已读取。仅对照当前摘要已有助手事件，不能据此判断原因或重试结果。",
+            "not_configured": "未配置日志路径，未读取 Codex 日志。",
+            "missing": "本机日志暂不存在。",
+            "busy": "日志正忙，请稍后重试。",
+            "unreadable": "无法读取日志摘要。",
+            "unsupported": "当前日志格式暂不支持。",
+        }
+        message = messages[result["state"]]
+        if result["truncated"]:
+            message += " 摘要已截断；错误数仅为已读取范围内的观察数，不代表近 2 小时完整错误数或最终失败数。"
+        self.codex_message.set(message)
 
     def copy_summary(self):
         self.copy_message.set("")
@@ -1022,6 +1151,9 @@ class DiagnosticDialog:
         if self.closed:
             return
         self.closed = True
+        if self.after_id is not None:
+            self.window.after_cancel(self.after_id)
+            self.after_id = None
         self.owner.diagnostic_dialog = None
         self.window.destroy()
 
