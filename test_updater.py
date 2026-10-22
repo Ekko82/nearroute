@@ -390,7 +390,7 @@ class UpdaterTests(unittest.TestCase):
             with self.assertRaises(updater.UpdateError):
                 updater.validate_package(self.archive, release)
 
-    def test_git_checkout_at_root_or_ancestor_only_allows_notification(self):
+    def test_zip_apply_refuses_git_checkout_at_root_or_ancestor(self):
         metadata, manifest, _url = self.metadata()
         git = self.root / ".git"
         git.write_text("gitdir: elsewhere", encoding="utf-8")

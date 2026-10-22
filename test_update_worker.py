@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import updater
+from test_git_updates import GitUpdateFixture
 from tools.build_release import build_release, RELEASE_FILES
 
 
@@ -127,6 +128,55 @@ class UpdateWorkerTests(unittest.TestCase):
         self.assertFalse(updater.is_installing(self.root))
         restart.assert_called_once()
         self.assertEqual(Path(restart.call_args.args[0][-1]).resolve(), (self.root / "dashboard.py").resolve())
+
+
+@unittest.skipUnless(os.name == "nt" and shutil.which("git"), "Windows installer with Git")
+class GitUpdateWorkerTests(unittest.TestCase):
+    def test_detached_git_worker_waits_updates_and_restarts_the_fake_dashboard(self):
+        fixture = GitUpdateFixture()
+        self.addCleanup(fixture.close)
+        prepared = fixture.prepare()
+        gate = fixture.base / "parent-can-exit"
+        parent = subprocess.Popen(
+            [sys.executable, "-B", "-c",
+             "import pathlib,sys,time\np=pathlib.Path(sys.argv[1])\nwhile not p.exists(): time.sleep(.02)\n", str(gate)],
+            creationflags=updater.NO_WINDOW)
+        child = None
+        try:
+            child = updater.start_installer(prepared, parent_pid=parent.pid,
+                                           python_exe=sys.executable, root=fixture.root)
+            deadline = time.monotonic() + 8
+            while not updater.is_installing(fixture.root) and child.poll() is None and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(updater.is_installing(fixture.root), "Git worker did not acquire the install lock")
+            self.assertIsNone(parent.poll())
+            self.assertEqual(fixture.git(fixture.root, "rev-parse", "HEAD"), fixture.old)
+            gate.touch()
+            parent.wait(timeout=5)
+            child.wait(timeout=20)
+            self.assertEqual(child.returncode, 0)
+            result = updater.read_update_result(fixture.root)
+            self.assertTrue(result.get("success"), result)
+            self.assertEqual(result.get("version"), fixture.release.version)
+            self.assertEqual(fixture.git(fixture.root, "rev-parse", "HEAD"), fixture.target)
+            fixture.assert_preserved(self)
+            self.assertTrue((fixture.root / "state" / "fixture-stopped.txt").exists())
+            restarted = fixture.root / "state" / "restarted.txt"
+            deadline = time.monotonic() + 5
+            while not restarted.exists() and time.monotonic() < deadline:
+                time.sleep(.02)
+            self.assertTrue(restarted.exists(), "updated fake dashboard was not restarted")
+            updater._wait_for_parent(int(restarted.read_text()), timeout=5)
+            self.assertFalse(updater.is_installing(fixture.root))
+            self.assertFalse((fixture.root / "state" / "fixture-helper.lock").exists())
+            self.assertFalse(Path(child.args[2]).parent.exists(), "temporary updater was not removed")
+        finally:
+            gate.touch()
+            for process in (child, parent):
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                    process.wait(timeout=5)
 
 
 if __name__ == "__main__":

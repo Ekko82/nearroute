@@ -16,7 +16,6 @@ import tempfile
 import threading
 import time
 import uuid
-import webbrowser
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import tkinter as tk
@@ -903,8 +902,9 @@ class UpdateDialog:
             button.pack(anchor="w", pady=2)
             if value != "notify" and not owner.update_can_install:
                 button.state(["disabled"])
-        if not owner.update_can_install:
-            ttk.Label(form, text="当前从源码运行，可查看版本并打开下载页；安装包支持应用内更新。", style="Muted.TLabel", wraplength=610).grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        update_help = ("支持在软件内更新，本地源码有改动时会保留并提示。" if owner.update_can_install
+                       else "当前目录不能安全地在软件内更新，请使用官方安装目录。")
+        ttk.Label(form, text=update_help, style="Muted.TLabel", wraplength=610).grid(row=5, column=0, sticky="ew", pady=(8, 0))
         actions = ttk.Frame(form)
         actions.grid(row=6, column=0, sticky="ew", pady=(16, 0))
         self.check_button = ttk.Button(actions, text="立即检查", command=lambda: owner.check_updates(manual=True))
@@ -932,7 +932,7 @@ class UpdateDialog:
         self.notes.configure(state="disabled")
         busy = bool(owner.update_busy) or owner.exiting
         self.check_button.state(["disabled"] if busy else ["!disabled"])
-        self.install_button.configure(text=("打开下载页" if not owner.update_can_install else "安装并重启" if owner.update_prepared else "下载并安装"))
+        self.install_button.configure(text=("无法安全更新" if not owner.update_can_install else "安装并重启" if owner.update_prepared else "下载并安装"))
         self.install_button.state(["disabled"] if busy or release is None else ["!disabled"])
 
     def save(self) -> None:
@@ -991,7 +991,7 @@ class Dashboard:
         self.update_requested_install = False
         self.update_dialog = None
         self.update_next_check = 0.0
-        self.update_can_install = updater.can_install(root=ROOT)
+        self.update_can_install = updater.can_update(root=ROOT)
         self.update_preferences = updater.load_preferences(root=ROOT)
         update_result = updater.read_update_result(root=ROOT)
         failed_version = update_result.get("version") if update_result.get("success") is False else None
@@ -1112,7 +1112,7 @@ class Dashboard:
         update_row.columnconfigure(0, weight=1)
         self.update_text = tk.StringVar(value=f"版本 {updater.current_version(root=ROOT)}")
         if self.update_release is not None:
-            action = "查看并安装" if self.update_can_install else "查看更新与下载页"
+            action = "查看并安装" if self.update_can_install else "查看更新说明"
             self.update_text.set(f"发现新版本 {self.update_release.version}，点击“版本与更新”{action}。")
         self.update_label = ttk.Label(update_row, textvariable=self.update_text, style="Muted.TLabel", wraplength=790)
         self.update_label.grid(row=0, column=0, sticky="w")
@@ -1182,7 +1182,9 @@ class Dashboard:
         if self.closed or self.exiting or self.update_busy or self.update_release is None:
             return
         if not self.update_can_install:
-            webbrowser.open(self.update_release.url)
+            self.update_text.set("当前目录不能安全地在软件内更新，请使用官方安装目录。")
+            if self.update_dialog is not None:
+                self.update_dialog.refresh()
             return
         if self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             self.notify("正在处理节点操作，请完成后再安装更新。", 15)
@@ -1263,7 +1265,7 @@ class Dashboard:
                             self.update_prepared = None
                         if self.update_prepared is None:
                             self.update_auto_prepare_attempted = None
-                        action = "查看并安装" if self.update_can_install else "查看更新与下载页"
+                        action = "查看并安装" if self.update_can_install else "查看更新说明"
                         if self.update_can_install and self.update_auto_install_attempted == result.tag:
                             self.update_text.set(f"版本 {result.version} 上次安装未完成，请打开“版本与更新”手动重试。")
                         else:

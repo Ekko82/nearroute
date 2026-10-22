@@ -1,4 +1,4 @@
-"""Stable GitHub releases and in-place updates for extracted NearRoute packages."""
+"""Stable GitHub releases and in-app updates for packages and source checkouts."""
 
 from __future__ import annotations
 
@@ -26,6 +26,7 @@ import zipfile
 ROOT = Path(__file__).resolve().parent
 REPOSITORY = "Ekko82/nearroute"
 RELEASES_URL = f"https://api.github.com/repos/{REPOSITORY}/releases/latest"
+SOURCE_URL = f"https://github.com/{REPOSITORY}.git"
 CHECK_INTERVAL_SECONDS = 6 * 3600
 MAX_PACKAGE_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 100 * 1024 * 1024
@@ -242,6 +243,96 @@ def can_install(root=ROOT) -> bool:
     return not any((parent / ".git").exists() for parent in (root, *root.parents))
 
 
+def can_update(root=ROOT) -> bool:
+    root = Path(root).resolve()
+    return (root / ".git").exists() or can_install(root)
+
+
+def _git(root, *arguments, message="无法检查源码更新，请确认 Git 可用后重试", timeout=30):
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")
+    for key in list(env):
+        if key.startswith("GIT_TRACE") or key in {"GIT_CURL_VERBOSE", "GIT_DIR", "GIT_WORK_TREE",
+                                                 "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE"}:
+            env.pop(key, None)
+    try:
+        result = subprocess.run(["git", "-C", str(root), *arguments], env=env,
+                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                creationflags=NO_WINDOW, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        raise UpdateError(message) from error
+    if result.returncode:
+        raise UpdateError(message)
+    return result.stdout
+
+
+def _git_source_state(root):
+    root = Path(root).resolve()
+    top = _git(root, "rev-parse", "--show-toplevel").decode("utf-8").strip()
+    if Path(top).resolve() != root:
+        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
+    origin = _git(root, "config", "--get", "remote.origin.url").decode("utf-8").strip().rstrip("/").lower()
+    if origin not in {SOURCE_URL.lower(), SOURCE_URL[:-4].lower(),
+                      f"git@github.com:{REPOSITORY}.git".lower(),
+                      f"ssh://git@github.com/{REPOSITORY}.git".lower()}:
+        raise UpdateError("当前源码不是近舟官方仓库，已保留本地文件")
+    if _git(root, "status", "--porcelain", "--untracked-files=no"):
+        raise UpdateError("当前源码有本地改动，已保留；请先提交或处理改动后重试更新")
+    return {"head": _git(root, "rev-parse", "HEAD").decode("ascii").strip(),
+            "branch": _git(root, "rev-parse", "--abbrev-ref", "HEAD").decode("utf-8").strip()}
+
+
+def _verify_git_release(root, target, release, archive, names):
+    paths = _git(root, "ls-tree", "-r", "--name-only", "-z", target).split(b"\0")
+    if any(path.lower() in {b"config.json", b"state"} or path.lower().startswith(b"state/") for path in paths):
+        raise UpdateError("源码更新包含用户数据路径，已取消更新并保留现有配置")
+    with zipfile.ZipFile(archive) as package:
+        for name in names:
+            content = _git(root, "show", f"{target}:{name}", message="源码标签文件不完整，已取消更新")
+            if content != package.read(name):
+                raise UpdateError("源码标签与已校验的正式安装包不匹配，已取消更新")
+    _git(root, "merge-base", "--is-ancestor", "HEAD", target,
+         message="当前源码已领先或与正式版本分叉，已保留本地版本")
+
+
+def _prepare_git_update(root, prepared, release, before, names):
+    reference = "refs/nearroute-updates/" + release.tag
+    _git(root, "fetch", "--no-tags", "--no-recurse-submodules", SOURCE_URL,
+         f"refs/tags/{release.tag}:{reference}", timeout=120,
+         message="无法获取正式版本源码，请确认能够连接 GitHub 后重试")
+    target = _git(root, "rev-parse", "--verify", reference + "^{commit}").decode("ascii").strip()
+    _verify_git_release(root, target, release, prepared / "package.zip", names)
+    if _git_source_state(root) != before:
+        raise UpdateError("准备更新期间源码版本或分支发生变化，已保留现有文件，请重新检查更新")
+    _write_document(prepared / "git-update.json", before | {"target": target, "tag": release.tag})
+
+
+def _validate_prepared_git_update(root, archive, release, names):
+    record = _read_document(Path(archive).parent / "git-update.json", {})
+    if (record.get("tag") != release.tag or not isinstance(record.get("branch"), str)
+            or any(not isinstance(record.get(key), str) or not re.fullmatch(r"[0-9a-f]{40}", record[key])
+                   for key in ("head", "target"))):
+        raise UpdateError("源码更新准备信息已失效，请重新下载并校验更新")
+    if _git_source_state(root) != {"head": record["head"], "branch": record["branch"]}:
+        raise UpdateError("准备更新后源码版本或分支发生变化，已保留现有文件，请重新检查更新")
+    _verify_git_release(root, record["target"], release, archive, names)
+    return record["target"]
+
+
+def apply_git_update(archive, release, root=ROOT):
+    root = Path(root).resolve()
+    if not (root / ".git").exists():
+        raise UpdateError("当前目录不是独立的近舟源码安装，已取消更新")
+    names = validate_package(archive, release)
+    target = _validate_prepared_git_update(root, archive, release, names)
+    # Suppress local merge hooks; application updates only install validated code.
+    with tempfile.TemporaryDirectory(prefix="nearroute-git-hooks-") as hooks:
+        _git(root, "-c", "core.hooksPath=" + hooks, "merge", "--ff-only", "--no-overwrite-ignore",
+             "--no-autostash", "--no-edit", target,
+             message="源码更新未完成，本地文件未被强制覆盖；请处理文件占用或冲突后重试")
+    if _git(root, "rev-parse", "HEAD").decode("ascii").strip() != target or current_version(root) != release.version:
+        raise UpdateError("安装后源码版本发生变化，请检查当前版本后重试")
+
+
 def _safe_member(name):
     path = PurePosixPath(name)
     if (not name or "\\" in name or ":" in name or path.is_absolute()
@@ -288,17 +379,23 @@ def validate_package(archive, release):
 def prepare_update(release: Release, root=ROOT) -> Path:
     _validate_release(release)
     root = Path(root).absolute()
+    if not can_update(root):
+        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
+    before = _git_source_state(root) if not can_install(root) else None
     updates = _safe_target(root, "state/updates")
     updates.mkdir(parents=True, exist_ok=True)
     prepared = _safe_target(root, "state/updates/" + release.tag)
     if prepared.exists():
         try:
-            validate_package(prepared / "package.zip", release)
+            names = validate_package(prepared / "package.zip", release)
             _write_document(prepared / "release.json", asdict(release))
-            return prepared
         except (OSError, UpdateError):
             # Only this version's private download cache is discarded.
             shutil.rmtree(prepared)
+        else:
+            if before is not None:
+                _prepare_git_update(root, prepared, release, before, names)
+            return prepared
     with tempfile.TemporaryDirectory(prefix=".download-", dir=updates) as temporary:
         archive = Path(temporary) / "package.zip"
         started = time.monotonic()
@@ -313,9 +410,11 @@ def prepare_update(release: Release, root=ROOT) -> Path:
                     stream.write(block)
         except (OSError, http.client.HTTPException) as error:
             raise UpdateError("下载失败，请确认能够连接 GitHub 后重试") from error
-        validate_package(archive, release)
+        names = validate_package(archive, release)
         _write_document(Path(temporary) / "release.json", asdict(release))
         os.replace(temporary, prepared)
+    if before is not None:
+        _prepare_git_update(root, prepared, release, before, names)
     return prepared
 
 
@@ -431,13 +530,15 @@ def is_installing(root=ROOT):
 
 
 def start_installer(prepared: Path, *, parent_pid: int, python_exe: str, root=ROOT):
-    if not can_install(root):
-        raise UpdateError("源码检出目录请使用 git pull --ff-only 更新；内置安装适用于发行 ZIP")
+    if not can_update(root):
+        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
     try:
         release = Release(**_read_document(Path(prepared) / "release.json", {}))
     except TypeError as error:
         raise UpdateError("缓存版本信息已失效，请重新下载更新") from error
-    validate_package(Path(prepared) / "package.zip", release)
+    names = validate_package(Path(prepared) / "package.zip", release)
+    if not can_install(root):
+        _validate_prepared_git_update(root, Path(prepared) / "package.zip", release, names)
     worker = Path(tempfile.mkdtemp(prefix="nearroute-updater-"))
     try:
         shutil.copy2(Path(__file__), worker / "updater.py")
@@ -494,8 +595,8 @@ def _run_installer(prepared, root, parent_pid, python_exe):
         restart = True
         release = Release(**_read_document(Path(prepared) / "release.json", {}))
         validate_package(Path(prepared) / "package.zip", release)
-        if not can_install(root):
-            raise UpdateError("源码检出目录不能使用内置安装")
+        if not can_update(root):
+            raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
         result = subprocess.run([python_exe, "-B", str(root / "optimizer.py"), "stop"], cwd=root,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 creationflags=NO_WINDOW, timeout=45, check=False)
@@ -507,7 +608,10 @@ def _run_installer(prepared, root, parent_pid, python_exe):
         helper_lock = core.InstanceLock()
         if not helper_lock.acquire():
             raise UpdateError("后台已重新启动，已取消更新")
-        apply_package(Path(prepared) / "package.zip", release, root)
+        if can_install(root):
+            apply_package(Path(prepared) / "package.zip", release, root)
+        else:
+            apply_git_update(Path(prepared) / "package.zip", release, root)
         _write_document(root / "state" / "update-result.json",
                         {"success": True, "version": release.version, "message": "近舟已更新到 " + release.version})
     except Exception as error:

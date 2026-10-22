@@ -13,6 +13,7 @@ import tempfile
 import tkinter as tk
 from types import SimpleNamespace
 import unittest
+import webbrowser
 import zipfile
 from unittest.mock import Mock, patch
 
@@ -67,7 +68,7 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.patches.enter_context(patch.object(updater, "current_version", return_value="1.0.0"))
         self.confirm = self.patches.enter_context(patch.object(dashboard.messagebox, "askyesno", return_value=True))
         self.showerror = self.patches.enter_context(patch.object(dashboard.messagebox, "showerror"))
-        self.browser = self.patches.enter_context(patch.object(dashboard.webbrowser, "open"))
+        self.browser = self.patches.enter_context(patch.object(webbrowser, "open"))
         self.patches.enter_context(patch.object(dashboard, "python_executable", return_value="mock-python"))
         self.wait = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
 
@@ -347,17 +348,63 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertTrue(self.app.update_requested_install)
         self.assertEqual(self.app.update_busy, "prepare")
 
-    def test_source_checkout_only_opens_release_page_even_in_auto_install_mode(self):
+    def test_source_checkout_downloads_and_installs_inside_the_app(self):
+        with patch.object(dashboard, "ttk"), \
+             patch.object(dashboard.tk, "StringVar"), \
+             patch.object(dashboard.tk, "Menu"), \
+             patch.object(updater, "cached_release", return_value=RELEASE), \
+             patch.object(updater, "can_install", return_value=False), \
+             patch.object(updater, "can_update", return_value=True) as can_update, \
+             patch.object(dashboard.Dashboard, "poll_tray"), \
+             patch.object(dashboard.Dashboard, "refresh"):
+            # A source checkout is eligible for preparation, although ZIP installation
+            # remains unavailable. All Tk widgets and service starts stay mocked.
+            self.app = dashboard.Dashboard(Mock(), start_service=False, enable_tray=False)
+        can_update.assert_called_once_with(root=self.root)
+        self.assertTrue(self.app.update_can_install)
+        self.app.updates_enabled = True
+        self.app.update_next_check = float("inf")
+        self.app.close = Mock()
+        self.app.request_update_install()
+        self.confirm.assert_called_once()
+        self.assertEqual(self.app.update_busy, "prepare")
+        self.finish()
+        self.prepare.assert_called_once_with(RELEASE, root=self.root)
+        self.assertEqual(self.app.update_busy, "install")
+        self.finish()
+        self.install.assert_called_once()
+        self.app.close.assert_called_once()
+        self.browser.assert_not_called()
+
+    def test_unsupported_directory_reports_reason_without_opening_browser(self):
         self.app.update_release = RELEASE
         self.app.update_can_install = False
         self.app.update_preferences["mode"] = "install"
         self.app.poll_updates({"phase": "monitoring"})
         self.app.request_update_install()
-        self.browser.assert_called_once_with(RELEASE.url)
+        self.browser.assert_not_called()
+        self.assertIn("不能安全", self.app.update_text.set.call_args.args[0])
         self.assertEqual(self.workers, [])
         self.prepare.assert_not_called()
         self.install.assert_not_called()
         self.confirm.assert_not_called()
+
+    def test_source_safety_failure_is_visible_and_leaves_app_open_for_retry(self):
+        self.app.update_release = RELEASE
+        self.prepare.side_effect = updater.UpdateError("本地源码有改动，已保留现有文件，无法安全更新。")
+        self.app.request_update_install()
+        self.finish()
+        self.assertIsNone(self.app.update_busy)
+        self.assertFalse(self.app.exiting)
+        self.assertFalse(self.app.update_requested_install)
+        self.assertIn("本地源码有改动", self.app.update_text.set.call_args.args[0])
+        self.assertEqual(self.workers, [])
+        self.install.assert_not_called()
+        self.app.close.assert_not_called()
+        self.browser.assert_not_called()
+        self.prepare.side_effect = None
+        self.app.request_update_install()
+        self.assertEqual(self.app.update_busy, "prepare")
 
     def test_installer_handoff_waits_for_startup_then_closes_ui_from_queue(self):
         self.app.update_prepared = self.root / "prepared"
@@ -483,6 +530,72 @@ class UpdateBehaviorTests(unittest.TestCase):
             dashboard.main()
         instance.assert_not_called()
         window.assert_not_called()
+
+
+class UpdateDialogLayoutTests(unittest.TestCase):
+    def test_source_update_controls_and_diagnostics_fit_the_minimum_window(self):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+        except tk.TclError as error:
+            self.skipTest(f"Tk display unavailable: {error}")
+        original_toplevel = tk.Toplevel
+
+        def invisible_window(*args, **kwargs):
+            window = original_toplevel(*args, **kwargs)
+            window.withdraw()
+            window.attributes("-alpha", 0)
+            return window
+
+        dialog = None
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                source = Path(directory)
+                (source / ".git").mkdir()
+                owner = SimpleNamespace(
+                    root=root, update_preferences=updater.load_preferences(root=source),
+                    update_can_install=updater.can_update(root=source), update_text=Mock(get=Mock(return_value="发现新版本")),
+                    update_release=RELEASE, update_busy=None, update_prepared=None, exiting=False,
+                    check_updates=Mock(), request_update_install=Mock(), update_dialog=None,
+                )
+                with patch.object(dashboard.tk, "Toplevel", side_effect=invisible_window):
+                    dialog = dashboard.UpdateDialog(owner)
+                self.assertTrue(dialog.auto_check.get())
+                self.assertEqual(dialog.mode.get(), "notify")
+                self.assertEqual(dialog.install_button.cget("text"), "下载并安装")
+                widgets = []
+
+                def collect(parent):
+                    for child in parent.winfo_children():
+                        widgets.append(child)
+                        collect(child)
+
+                collect(dialog.window)
+                buttons = [widget for widget in widgets if widget.winfo_class() == "TButton"]
+                diagnostic = next(button for button in buttons if button.cget("text") == "诊断信息")
+                self.assertEqual(diagnostic.grid_info()["row"], 7)
+                for widget in widgets:
+                    if widget.winfo_class() == "TRadiobutton":
+                        self.assertFalse(widget.instate(["disabled"]))
+                # Allocate a transparent test window without showing its withdrawn owner.
+                dialog.window.transient("")
+                for width, height in ((660, 530), (520, 420)):
+                    dialog.window.geometry(f"{width}x{height}")
+                    dialog.window.deiconify()
+                    root.update()
+                    self.assertEqual((dialog.window.winfo_width(), dialog.window.winfo_height()), (width, height))
+                    for button in buttons:
+                        self.assertTrue(button.winfo_ismapped())
+                        x = button.winfo_rootx() - dialog.window.winfo_rootx()
+                        y = button.winfo_rooty() - dialog.window.winfo_rooty()
+                        self.assertGreaterEqual(x, 0)
+                        self.assertGreaterEqual(y, 0)
+                        self.assertLessEqual(x + button.winfo_width(), width)
+                        self.assertLessEqual(y + button.winfo_height(), height)
+        finally:
+            if dialog is not None:
+                dialog.close()
+            root.destroy()
 
 
 class DisabledStartupTests(unittest.TestCase):
