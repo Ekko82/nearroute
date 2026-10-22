@@ -757,6 +757,18 @@ class ProbeHTTPResponse(http.client.HTTPResponse):
         super().__init__(sock, *args, **kwargs)
         self.fp = io.BufferedReader(_ProbeReader(self.fp, sock, budget))
 
+    def _read_and_discard_trailer(self):
+        # The stdlib tolerates EOF here; a health probe must require the
+        # terminating blank line before declaring a chunked response complete.
+        while True:
+            line = self.fp.readline(http.client._MAXLINE + 1)
+            if len(line) > http.client._MAXLINE:
+                raise http.client.LineTooLong("trailer line")
+            if not line:
+                raise http.client.IncompleteRead(b"")
+            if line in (b"\r\n", b"\n"):
+                return
+
     def _read_status(self):
         # http.client skips only 100; other informational responses also
         # precede the final result. 101 switches protocols and must stop here.

@@ -121,6 +121,23 @@ class ProbeInterimTests(unittest.TestCase):
                 self.assertFalse(result["ok"])
                 self.assertIn("IncompleteRead", result["reason"])
 
+    def test_chunked_trailer_must_reach_its_final_blank_line(self):
+        headers = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n"
+        cases = (
+            (b"2\r\nok\r\n0\r\n\r\n", True),
+            (b"2\r\nok\r\n0\r\nX-Note: complete\r\n\r\n", True),
+            (b"2\r\nok\r\n0\r\n", False),
+            (b"2\r\nok\r\n0", False),
+            (b"2\r\nok\r\n0\r\nX-Note: truncated", False),
+        )
+        for scheme in ("http", "https"):
+            for body, complete in cases:
+                with self.subTest(scheme=scheme, body=body):
+                    result, _ = self.verify([headers + body], scheme=scheme)
+                    self.assertEqual(result["ok"], complete, result)
+                    if not complete:
+                        self.assertIn("IncompleteRead", result["reason"])
+
     def test_switching_protocols_is_final_and_does_not_wait_for_another_status(self):
         upgrade = (b"HTTP/1.1 101 Switching Protocols\r\n"
                    b"Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
