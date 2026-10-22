@@ -129,7 +129,7 @@ class ProxyBindingTests(unittest.TestCase):
                     else:
                         with self.assertRaises((optimizer.ControllerError, ValueError)):
                             optimizer.inspect_controller({"group": "Main"})
-                self.assertEqual(api.request.call_args_list, [call("/configs"), call("/proxies")])
+                self.assertEqual(api.request.call_args_list, [call("/configs", timeout=5), call("/proxies", timeout=5)])
                 api.select.assert_not_called()
 
     def test_plain_http_port_fallback_and_missing_port(self):

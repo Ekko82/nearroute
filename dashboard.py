@@ -214,6 +214,8 @@ def policy_summary(raw: dict) -> str:
         scope = "全部节点"
     elif mode == "nodes":
         scope = f"指定节点（{len(cfg.get('scan_nodes', []))} 个）"
+    elif mode == "adaptive":
+        scope = "自动邻近地区（JP、TW、SG、HK、PH 中现有地区）"
     else:
         scope = "地区 " + "、".join(cfg.get("scan_regions", []))
     preference = "日本优先" if cfg.get("prefer_japan", False) else "按线路评分择优"
@@ -503,8 +505,8 @@ class SettingsDialog:
         scope = ttk.Frame(candidates, style="Surface.TFrame")
         scope.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         ttk.Label(scope, text="候选节点", style="Section.TLabel", background="#ffffff").pack(side="left", padx=(0, 20))
-        for value, label in (("regions", "按地区"), ("nodes", "指定节点"), ("all", "全部节点")):
-            ttk.Radiobutton(scope, text=label, style="Surface.TRadiobutton", variable=self.mode, value=value, command=self.update_mode).pack(side="left", padx=(0, 16))
+        for value, label in (("adaptive", "自动邻近"), ("regions", "按地区"), ("nodes", "指定节点"), ("all", "全部节点")):
+            ttk.Radiobutton(scope, text=label, style="Surface.TRadiobutton", variable=self.mode, value=value, command=self.update_mode).pack(side="left", padx=(0, 10))
         ttk.Checkbutton(scope, text="日本优先", style="Surface.TCheckbutton", variable=self.prefer_japan).pack(side="right")
         region_row = ttk.Frame(candidates, style="Surface.TFrame")
         region_row.grid(row=2, column=0, sticky="ew")
@@ -515,7 +517,7 @@ class SettingsDialog:
         self.preset_button = ttk.Button(region_row, text="常用邻近地区", command=lambda: self.regions.set("JP, TW, SG, HK"))
         self.preset_button.grid(row=0, column=2, padx=(10, 0))
         region_help = ttk.Label(
-            candidates, text="使用 JP, TW 等两字母代码，地区按节点名识别；UNKNOWN 为未知地区。日本优先仍遵守范围与稳定性门槛。",
+            candidates, text="自动邻近按现有节点识别 JP、TW、SG、HK、PH，订阅变化后自动适应；没有邻近节点时不会扩大范围。按地区可手动填写两字母代码，UNKNOWN 为未知地区。",
             style="Surface.TLabel", foreground="#64748b", wraplength=730,
         )
         region_help.grid(row=3, column=0, sticky="ew", pady=(8, 12))
@@ -715,12 +717,14 @@ class ClientDialog:
         self.closed = self.loading = self.applying = False
         self.verified_identity = None
         self.selector_groups = []
+        self.discovered_clients = {}
+        self.discovery_identity = None
         self.results = queue.SimpleQueue()
         self.after_id = None
         self.window = tk.Toplevel(owner.root)
         self.window.title("客户端连接 · 近舟 NearRoute")
-        self.window.geometry("760x610")
-        self.window.minsize(680, 560)
+        self.window.geometry("800x700")
+        self.window.minsize(720, 640)
         self.window.configure(background="#f3f6fb")
         self.window.transient(owner.root)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
@@ -729,7 +733,9 @@ class ClientDialog:
         self.controller = tk.StringVar(value=cfg["controller"])
         self.secret_env = tk.StringVar(value=cfg["controller_secret_env"])
         self.group = tk.StringVar(value=cfg["group"])
-        self.message = tk.StringVar(value="填写客户端的外部控制地址，然后读取可选择的代理组。")
+        self.auto_detect = tk.BooleanVar(value=cfg.get("auto_detect_client", True))
+        self.auto_group = tk.BooleanVar(value=cfg.get("auto_select_group", True))
+        self.message = tk.StringVar(value="自动发现本机客户端，或填写控制地址后测试连接；检查过程不会切换节点。")
         form = ttk.Frame(self.window, padding=(24, 20, 24, 20))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
@@ -746,15 +752,20 @@ class ClientDialog:
         connection.grid(row=1, column=0, sticky="ew", pady=(0, 14))
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text="控制地址", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 14))
-        self.address_entry = ttk.Entry(connection, textvariable=self.controller)
+        self.address_entry = ttk.Combobox(connection, textvariable=self.controller)
         self.address_entry.grid(row=0, column=1, sticky="ew")
-        address_help = ttk.Label(connection, text="例如 http://127.0.0.1:9090，使用客户端的外部控制端口。", style="Surface.TLabel", foreground="#64748b", wraplength=650)
-        address_help.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 10))
+        self.address_entry.bind("<<ComboboxSelected>>", self.select_discovered_client)
+        self.discover_button = ttk.Button(connection, text="自动发现", command=self.discover_connections)
+        self.discover_button.grid(row=0, column=2, padx=(10, 0))
+        address_help = ttk.Label(connection, text="优先保留当前有效地址；发现多个客户端时，请从下拉列表选择。也可手动填写 HTTP 控制地址。", style="Surface.TLabel", foreground="#64748b", wraplength=650)
+        address_help.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 10))
         ttk.Label(connection, text="密钥环境变量", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 14))
         self.secret_entry = ttk.Entry(connection, textvariable=self.secret_env)
-        self.secret_entry.grid(row=2, column=1, sticky="ew")
+        self.secret_entry.grid(row=2, column=1, columnspan=2, sticky="ew")
         secret_help = ttk.Label(connection, text="如 CLASH_SECRET，请填变量名，不填写密钥本身；无需认证时留空。设置变量后重开近舟。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
-        secret_help.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        secret_help.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        self.auto_detect_button = ttk.Checkbutton(connection, text="当前地址失效时自动发现本机客户端", variable=self.auto_detect, style="Surface.TCheckbutton")
+        self.auto_detect_button.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
         selection = ttk.Frame(form, style="Card.TFrame", padding=16)
         selection.grid(row=2, column=0, sticky="nsew")
@@ -764,8 +775,10 @@ class ClientDialog:
         self.groups.grid(row=1, column=0, sticky="ew", pady=(10, 12))
         self.inspect_button = ttk.Button(selection, text="测试连接 · 读取代理组", command=self.inspect_connection)
         self.inspect_button.grid(row=1, column=1, sticky="e", padx=(10, 0), pady=(10, 12))
+        self.auto_group_button = ttk.Checkbutton(selection, text="所选代理组不可用时自动判断合适的代理组", variable=self.auto_group, style="Surface.TCheckbutton")
+        self.auto_group_button.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 12))
         message_label = ttk.Label(selection, textvariable=self.message, wraplength=650, style="Surface.TLabel", foreground="#64748b")
-        message_label.grid(row=2, column=0, columnspan=2, sticky="ew")
+        message_label.grid(row=3, column=0, columnspan=2, sticky="ew")
         actions = ttk.Frame(form)
         actions.grid(row=3, column=0, sticky="ew", pady=(18, 0))
         ttk.Label(actions, text="更换连接会停止后台并暂停自动优选。", style="Muted.TLabel").pack(side="left")
@@ -786,10 +799,12 @@ class ClientDialog:
         self.after_id = self.window.after(150, self.poll_results)
         if visible:
             self.window.grab_set()
+            self.discover_connections()
 
     def fields(self) -> dict:
         return {"controller": self.controller.get().strip().rstrip("/"),
-                "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get()}
+                "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get(),
+                "auto_detect_client": self.auto_detect.get(), "auto_select_group": self.auto_group.get()}
 
     def identity(self):
         fields = self.fields()
@@ -805,11 +820,55 @@ class ClientDialog:
     def update_buttons(self) -> None:
         busy = self.loading or self.applying
         self.inspect_button.state(["disabled"] if busy else ["!disabled"])
+        self.discover_button.state(["disabled"] if busy else ["!disabled"])
         ready = not busy and self.verified_identity == self.identity() and self.group.get() in self.selector_groups
         self.save_button.state(["!disabled"] if ready else ["disabled"])
-        for widget in (self.address_entry, self.secret_entry, self.cancel_button):
+        for widget in (self.address_entry, self.secret_entry, self.auto_detect_button, self.auto_group_button, self.cancel_button):
             widget.state(["disabled"] if self.applying else ["!disabled"])
         self.groups.configure(state="disabled" if self.applying else "readonly")
+
+    def discover_connections(self) -> None:
+        if self.closed or self.loading or self.applying:
+            return
+        fields = self.fields()
+        fields["group"] = fields["group"] or self.original_context[2] or core.DEFAULTS["group"]
+        self.loading = True
+        self.verified_identity = None
+        self.message.set("正在发现本机控制接口；只读检查，不测速或切换节点…")
+        self.update_buttons()
+        self.start_worker("discover", self.identity(), lambda: core.discover_clients(fields))
+
+    def select_discovered_client(self, _event=None) -> None:
+        candidate = self.discovered_clients.get(self.fields()["controller"])
+        if candidate is None or self.applying:
+            return
+        identity = self.discovery_identity
+        expected_env = identity[1] if identity and candidate["controller"] == identity[0] else ""
+        self.secret_env.set(expected_env)
+        if candidate.get("verified"):
+            self.apply_inspection(candidate, self.identity())
+        else:
+            self.verified_identity = None
+            self.message.set("此控制地址需要认证。请填写对应的密钥环境变量名，再点击“测试连接”。"
+                             if candidate.get("needs_auth") else "此控制地址尚未验证，请点击“测试连接”。")
+        self.update_buttons()
+
+    def apply_inspection(self, result, identity) -> None:
+        self.verified_identity = identity
+        self.selector_groups = result["groups"]
+        self.groups.configure(values=self.selector_groups)
+        if self.group.get() not in self.selector_groups:
+            suggested = result.get("recommended_group") if self.auto_group.get() else None
+            suggested = suggested or result.get("active_group")
+            self.group.set(suggested if suggested in self.selector_groups else "")
+        note = ("当前为全局模式，实际控制 GLOBAL。" if result["mode"] == "global" else
+                "当前为直连模式，优选前请改为规则或全局模式。" if result["mode"] == "direct" else "规则模式使用所选代理组。")
+        if result.get("group_reason"):
+            note += " " + result["group_reason"]
+        if "nearby_regions" in result:
+            nearby = result["nearby_regions"]
+            note += " 邻近地区：" + "、".join(nearby) + "。" if nearby else " 未识别到邻近地区，自动范围不会扩大。"
+        self.message.set(f"连接成功，HTTP 代理端口 {result['proxy_port']}，读取 {len(self.selector_groups)} 个代理组。{note}")
 
     def start_worker(self, operation, identity, work) -> None:
         def worker():
@@ -844,7 +903,7 @@ class ClientDialog:
             return
         self.applying = self.owner.client_busy = True
         self.owner.cancel_service_start()
-        self.message.set("正在停止后台并保存连接…")
+        self.message.set("正在保存客户端设置…")
         self.update_buttons()
         helpers = list(self.owner.started_helpers)
 
@@ -861,20 +920,22 @@ class ClientDialog:
         try:
             while True:
                 operation, identity, success, result = self.results.get_nowait()
-                if operation == "inspect":
+                if operation in ("inspect", "discover"):
                     self.loading = False
                     if identity != self.identity():
                         self.message.set("连接参数已改变，请重新测试连接。")
+                    elif operation == "discover" and success:
+                        self.discovery_identity = identity
+                        self.discovered_clients = {candidate["controller"]: candidate for candidate in result["candidates"]}
+                        self.address_entry.configure(values=list(self.discovered_clients))
+                        candidate = self.discovered_clients.get(result.get("selected_controller"))
+                        if candidate is not None and candidate.get("verified"):
+                            self.controller.set(candidate["controller"])
+                            self.select_discovered_client()
+                        else:
+                            self.message.set(result["message"])
                     elif success:
-                        self.verified_identity = identity
-                        self.selector_groups = result["groups"]
-                        self.groups.configure(values=self.selector_groups)
-                        if self.group.get() not in self.selector_groups:
-                            active = result.get("active_group")
-                            self.group.set(active if active in self.selector_groups else "")
-                        note = ("当前为全局模式，实际控制 GLOBAL。" if result["mode"] == "global" else
-                                "当前为直连模式，优选前请改为规则或全局模式。" if result["mode"] == "direct" else "规则模式使用所选代理组。")
-                        self.message.set(f"连接成功，HTTP 代理端口 {result['proxy_port']}，读取 {len(self.selector_groups)} 个代理组。{note}")
+                        self.apply_inspection(result, identity)
                     else:
                         self.verified_identity = None
                         self.message.set("连接未通过：" + result)
@@ -1480,7 +1541,8 @@ class Dashboard:
             messagebox.showerror("无法打开客户端连接", str(error), parent=self.root)
 
     def client_saved(self, saved: dict) -> None:
-        if tuple(core.state_context(saved)) != self.node_context:
+        same_context = tuple(core.state_context(saved)) == self.node_context
+        if not same_context:
             self.node_context = None
             self.node_mode = None
             self.manual_attempt = None
@@ -1496,7 +1558,8 @@ class Dashboard:
                           "next_scan_value", "update_time_value"):
                 getattr(self, field).set("—")
         self.policy.set(policy_summary(saved))
-        message = ("客户端连接已保存，自动优选保持暂停。可点击“立即测速”检查，再启用自动优选。"
+        message = ("客户端设置已保存，当前节点和优选开关保持。" if same_context else
+                   "客户端连接已保存，自动优选保持暂停。可点击“立即测速”检查，再启用自动优选。"
                    if not saved["enabled"] else "客户端连接设置已保存，原有优选开关保持。")
         self.notify(message, 25)
 

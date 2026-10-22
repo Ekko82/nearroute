@@ -35,6 +35,7 @@ class ClientConnectionTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(os.environ, {self.secret_env: self.secret}))
         os.environ.pop(self.missing_env, None)
         self.ports = set()
+        self.auth_headers = {}
         build_opener = optimizer.urllib.request.build_opener
 
         def local_opener(*args, **kwargs):
@@ -59,8 +60,10 @@ class ClientConnectionTests(unittest.TestCase):
         }
         optimizer.atomic_json(self.config, self.initial)
 
-    def controller(self, *, mode="rule", mixed_port=7890, port=0, secret="", redirect_to=None):
+    def controller(self, *, mode="rule", mixed_port=7890, port=0, secret="", redirect_to=None,
+                   version="test-mihomo", connections=(), extra_group=False):
         calls = []
+        headers = []
         general = {"mode": mode, "mixed-port": mixed_port, "port": port, "socks-port": 7891}
         proxies = {
             "Main": {"type": "Selector", "all": ["JP one"], "now": "JP one"},
@@ -68,9 +71,12 @@ class ClientConnectionTests(unittest.TestCase):
             "Auto": {"type": "URLTest", "all": ["JP one"], "now": "JP one"},
             "JP one": {"type": "Trojan"}, "DIRECT": {"type": "Direct"},
         }
+        if extra_group:
+            proxies["Other"] = {"type": "Selector", "all": ["JP one"], "now": "JP one"}
 
         class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
+                headers.append(self.headers.get("Authorization"))
                 authorized = not secret or self.headers.get("Authorization") == "Bearer " + secret
                 calls.append(("GET", self.path, authorized))
                 if authorized and redirect_to is not None:
@@ -79,7 +85,8 @@ class ClientConnectionTests(unittest.TestCase):
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                payload = general if self.path == "/configs" else {"proxies": proxies}
+                payload = {"/version": {"version": version}, "/configs": general,
+                           "/connections": {"connections": list(connections)}}.get(self.path, {"proxies": proxies})
                 data = json.dumps(payload).encode()
                 self.send_response(200 if authorized else 401)
                 self.send_header("Content-Length", str(len(data)))
@@ -95,6 +102,8 @@ class ClientConnectionTests(unittest.TestCase):
 
         server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.ports.add(server.server_port)
+        endpoint = f"http://127.0.0.1:{server.server_port}"
+        self.auth_headers[endpoint] = headers
         thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
         thread.start()
 
@@ -105,13 +114,53 @@ class ClientConnectionTests(unittest.TestCase):
             self.assertFalse(thread.is_alive(), "temporary controller thread did not stop")
 
         self.addCleanup(close)
-        return f"http://127.0.0.1:{server.server_port}", calls
+        return endpoint, calls
 
     def fields(self, endpoint, **updates):
         return {"controller": endpoint, "controller_secret_env": "", "group": "Main", **updates}
 
     def assert_config_unchanged(self):
         self.assertEqual(optimizer.read_json(self.config, None), self.initial)
+
+    def test_automatic_discovery_verifies_api_and_does_not_broadcast_auth(self):
+        current, calls = self.controller(secret=self.secret)
+        other, other_calls = self.controller(secret=self.secret)
+        fields = self.fields(current, controller_secret_env=self.secret_env)
+        with patch.object(optimizer.client_detection, "controller_addresses", return_value=[current, other]):
+            result = optimizer.discover_clients(fields)
+        self.assertEqual(result["selected_controller"], current)
+        self.assertEqual([item["verified"] for item in result["candidates"]], [True, False])
+        self.assertTrue(result["candidates"][1]["needs_auth"])
+        self.assertTrue(all(header == "Bearer " + self.secret for header in self.auth_headers[current]))
+        self.assertEqual(self.auth_headers[other], [None])
+        self.assertTrue(all(method == "GET" for method, _, _ in calls + other_calls))
+        self.assert_config_unchanged()
+
+    def test_automatic_discovery_rejects_non_clash_service(self):
+        endpoint, calls = self.controller(version=None)
+        with patch.object(optimizer.client_detection, "controller_addresses", return_value=[endpoint]):
+            result = optimizer.discover_clients(self.fields(endpoint))
+        self.assertEqual(result["candidates"], [])
+        self.assertIsNone(result["selected_controller"])
+        self.assertEqual(calls, [("GET", "/version", True)])
+
+    def test_target_connection_disambiguates_missing_group_without_switching(self):
+        endpoint, calls = self.controller(extra_group=True, connections=[
+            {"metadata": {"host": "chatgpt.com"}, "chains": ["JP one", "Main"]},
+            {"metadata": {"host": "example.com"}, "chains": ["JP one", "Other"]}])
+        info = optimizer.inspect_controller(self.fields(endpoint, group="Missing"), adaptive=True)
+        self.assertIsNone(info["active_group"])
+        self.assertEqual(info["recommended_group"], "Main")
+        self.assertEqual(info["nearby_regions"], ["JP"])
+        self.assertTrue(all(method == "GET" for method, _, _ in calls))
+        self.assertEqual(calls[-1][1], "/connections")
+
+    def test_manual_auto_flags_can_change_without_stopping_valid_client(self):
+        saved = optimizer.configure_client({"auto_detect_client": False, "auto_select_group": False})
+        self.assertFalse(saved["auto_detect_client"])
+        self.assertFalse(saved["auto_select_group"])
+        self.assertTrue(saved["enabled"])
+        self.stop.assert_not_called()
 
     def test_discovery_is_authenticated_read_only_and_keeps_controller_ports_distinct(self):
         endpoint_a, calls_a = self.controller(secret=self.secret)

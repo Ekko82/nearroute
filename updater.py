@@ -30,7 +30,7 @@ SOURCE_URL = f"https://github.com/{REPOSITORY}.git"
 CHECK_INTERVAL_SECONDS = 6 * 3600
 MAX_PACKAGE_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 100 * 1024 * 1024
-REQUIRED_FILES = {"VERSION", "optimizer.py", "dashboard.py", "updater.py", "tray_icon.py",
+REQUIRED_FILES = {"VERSION", "optimizer.py", "client_detection.py", "dashboard.py", "updater.py", "tray_icon.py",
                   "windows_app.py", "launch.ps1", "install.ps1", "uninstall.ps1",
                   "config.example.json", "README.md", "LICENSE", "assets/nearroute.ico"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -604,7 +604,11 @@ def _run_installer(prepared, root, parent_pid, python_exe):
             raise UpdateError("后台尚未退出，已取消更新")
         spec = importlib.util.spec_from_file_location("nearroute_update_core", root / "optimizer.py")
         core = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(core)
+        sys.path.insert(0, str(root))
+        try:
+            spec.loader.exec_module(core)
+        finally:
+            sys.path.pop(0)
         helper_lock = core.InstanceLock()
         if not helper_lock.acquire():
             raise UpdateError("后台已重新启动，已取消更新")

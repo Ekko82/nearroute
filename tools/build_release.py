@@ -13,6 +13,7 @@ import zipfile
 RELEASE_FILES = (
     "VERSION",
     "optimizer.py",
+    "client_detection.py",
     "dashboard.py",
     "tray_icon.py",
     "windows_app.py",

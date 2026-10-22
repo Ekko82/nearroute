@@ -27,16 +27,19 @@ class ClientDialogTests(unittest.TestCase):
                                      client_busy=False, client_dialog=None, client_saved=Mock(), cancel_service_start=Mock(), started_helpers=[])
         self.interpreter = tk.Tcl()
         string_var = tk.StringVar
+        boolean_var = tk.BooleanVar
         self.workers = []
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
         self.patches.enter_context(patch.object(dashboard, "CONFIG", self.config))
         self.patches.enter_context(patch.object(dashboard.tk, "Toplevel"))
         self.patches.enter_context(patch.object(dashboard.tk, "StringVar", side_effect=lambda **kwargs: string_var(master=self.interpreter, **kwargs)))
+        self.patches.enter_context(patch.object(dashboard.tk, "BooleanVar", side_effect=lambda **kwargs: boolean_var(master=self.interpreter, **kwargs)))
         self.patches.enter_context(patch.object(dashboard, "ttk"))
         self.patches.enter_context(patch.object(dashboard.threading, "Thread", side_effect=self.thread))
         self.inspection = {"mode": "rule", "groups": ["PROXY", "GLOBAL"], "active_group": "PROXY", "proxy_port": 7890}
         self.inspect = self.patches.enter_context(patch.object(dashboard.core, "inspect_controller", return_value=self.inspection))
+        self.discovery = self.patches.enter_context(patch.object(dashboard.core, "discover_clients"))
         self.configure = self.patches.enter_context(patch.object(dashboard.core, "configure_client"))
         self.wait_for_startup = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
         self.start_daemon = self.patches.enter_context(patch.object(dashboard, "start_daemon", side_effect=AssertionError("real helper forbidden")))
@@ -67,7 +70,8 @@ class ClientDialogTests(unittest.TestCase):
         self.workers.pop(0)()
         self.assertEqual(self.dialog.message.get(), before)  # Worker never touches Tcl.
         self.dialog.poll_results()
-        self.inspect.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "TEST_CLASH_SECRET", "group": dashboard.core.DEFAULTS["group"]})
+        self.inspect.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "TEST_CLASH_SECRET", "group": dashboard.core.DEFAULTS["group"],
+                                              "auto_detect_client": True, "auto_select_group": True})
         self.assertFalse(self.dialog.loading)
         self.assertEqual(self.dialog.selector_groups, ["PROXY", "GLOBAL"])
         self.assertEqual(self.dialog.group.get(), "PROXY")
@@ -130,7 +134,8 @@ class ClientDialogTests(unittest.TestCase):
         self.workers.pop(0)()
         self.owner.client_saved.assert_not_called()
         self.dialog.poll_results()
-        self.configure.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "", "group": "PROXY"}, expected_context=original)
+        self.configure.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "", "group": "PROXY",
+                                                "auto_detect_client": True, "auto_select_group": True}, expected_context=original)
         self.wait_for_startup.assert_called_once_with(self.owner.started_helpers)
         self.owner.client_saved.assert_called_once_with(saved)
         self.assertFalse(self.owner.client_busy)
@@ -159,7 +164,8 @@ class ClientDialogTests(unittest.TestCase):
                 self.finish()
 
                 self.configure.assert_called_once_with(
-                    {"controller": dashboard.core.DEFAULTS["controller"], "controller_secret_env": "", "group": "PROXY "},
+                    {"controller": dashboard.core.DEFAULTS["controller"], "controller_secret_env": "", "group": "PROXY ",
+                     "auto_detect_client": True, "auto_select_group": True},
                     expected_context=self.dialog.original_context,
                 )
                 self.assertTrue(self.dialog.closed)
@@ -206,8 +212,163 @@ class ClientDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.window.mock_calls, [])
         self.owner.client_saved.assert_not_called()
 
+    def candidate(self, address, **fields):
+        return self.inspection | {"controller": address, "verified": True, "needs_auth": False,
+                                  "recommended_group": "PROXY", "group_reason": "优先保留有效代理组。",
+                                  "nearby_regions": ["JP", "TW"]} | fields
+
+    def test_hidden_window_never_discovers_and_visible_window_starts_async_discovery(self):
+        self.discovery.assert_not_called()
+        self.assertEqual(self.workers, [])
+        self.dialog.close()
+        self.dialog = dashboard.ClientDialog(self.owner)
+        self.owner.client_dialog = self.dialog
+        self.assertTrue(self.dialog.loading)
+        self.discovery.assert_not_called()
+        self.assertEqual(len(self.workers), 1)
+
+    def test_discovery_preserves_current_verified_client_and_existing_group(self):
+        address = self.dialog.fields()["controller"]
+        self.dialog.group.set("GLOBAL")
+        self.discovery.return_value = {"candidates": [self.candidate(address), self.candidate("http://127.0.0.1:9090")],
+                                       "selected_controller": address, "message": "保留当前客户端。"}
+        self.dialog.discover_connections()
+        self.discovery.assert_not_called()
+        self.finish()
+        self.assertEqual(self.dialog.fields()["controller"], address)
+        self.assertEqual(self.dialog.group.get(), "GLOBAL")
+        self.assertEqual(self.dialog.verified_identity, (address, ""))
+        self.assertIn("JP、TW", self.dialog.message.get())
+        self.configure.assert_not_called()
+        self.inspect.assert_not_called()
+
+    def test_multiple_clients_require_choice_and_never_copy_secret_to_another_client(self):
+        original = self.dialog.fields()["controller"]
+        self.dialog.secret_env.set("ORIGINAL_SECRET")
+        address = "http://127.0.0.1:9090"
+        self.discovery.return_value = {"candidates": [self.candidate(address), self.candidate("http://127.0.0.1:9097")],
+                                       "selected_controller": None, "message": "发现多个客户端，请选择。"}
+        self.dialog.discover_connections()
+        self.finish()
+        self.assertEqual(self.dialog.fields()["controller"], original)
+        self.assertIsNone(self.dialog.verified_identity)
+        self.dialog.save()
+        self.assertEqual(self.workers, [])
+        self.dialog.controller.set(address)
+        self.dialog.select_discovered_client()
+        self.assertEqual(self.dialog.secret_env.get(), "")
+        self.assertEqual(self.dialog.verified_identity, (address, ""))
+        self.assertEqual(self.dialog.group.get(), "PROXY")
+        self.configure.assert_not_called()
+        self.inspect.assert_not_called()
+
+    def test_auth_required_candidate_cannot_be_saved_until_explicit_inspection(self):
+        address = "http://127.0.0.1:9090"
+        self.discovery.return_value = {"candidates": [self.candidate(address, verified=False, needs_auth=True)],
+                                       "selected_controller": None, "message": "控制地址需要认证。"}
+        self.dialog.discover_connections()
+        self.finish()
+        self.dialog.controller.set(address)
+        self.dialog.select_discovered_client()
+        self.assertIsNone(self.dialog.verified_identity)
+        self.assertIn("需要认证", self.dialog.message.get())
+        self.dialog.save()
+        self.assertEqual(self.workers, [])
+        self.dialog.secret_env.set("OTHER_CLIENT_SECRET")
+        self.dialog.inspect_connection()
+        self.finish()
+        self.assertEqual(self.dialog.verified_identity, (address, "OTHER_CLIENT_SECRET"))
+
+    def test_discovery_discards_result_after_address_edit_and_error_allows_retry(self):
+        address = self.dialog.fields()["controller"]
+        self.discovery.return_value = {"candidates": [self.candidate(address)], "selected_controller": address, "message": "已发现。"}
+        self.dialog.discover_connections()
+        self.dialog.controller.set("http://127.0.0.1:9097")
+        self.finish()
+        self.assertIsNone(self.dialog.verified_identity)
+        self.assertEqual(self.dialog.discovered_clients, {})
+        self.discovery.side_effect = dashboard.core.ControllerError("发现失败")
+        self.dialog.discover_connections()
+        self.finish()
+        self.assertFalse(self.dialog.loading)
+        self.assertIn("发现失败", self.dialog.message.get())
+
+    def test_recommendation_fills_missing_group_and_manual_automatic_preferences_are_saved(self):
+        self.inspect.return_value = self.inspection | {"recommended_group": "GLOBAL", "group_reason": "推荐包含邻近节点的组。", "nearby_regions": []}
+        self.dialog.group.set("missing")
+        self.dialog.inspect_connection()
+        self.finish()
+        self.assertEqual(self.dialog.group.get(), "GLOBAL")
+        self.assertIn("不会扩大", self.dialog.message.get())
+        self.dialog.auto_detect.set(False)
+        self.dialog.auto_group.set(False)
+        self.configure.return_value = dashboard.core.DEFAULTS | self.dialog.fields()
+        self.dialog.save()
+        self.finish()
+        saved = self.configure.call_args.args[0]
+        self.assertFalse(saved["auto_detect_client"])
+        self.assertFalse(saved["auto_select_group"])
+
+    def test_disabled_group_detection_keeps_missing_group_for_explicit_choice(self):
+        self.dialog.auto_group.set(False)
+        self.dialog.group.set("missing")
+        self.inspect.return_value = self.inspection | {"active_group": None, "recommended_group": "PROXY"}
+        self.dialog.inspect_connection()
+        self.finish()
+        self.assertEqual(self.dialog.group.get(), "")
+        self.dialog.save()
+        self.configure.assert_not_called()
+        self.assertEqual(self.workers, [])
+
+    def test_discovery_can_retry_when_no_group_was_selected(self):
+        self.dialog.group.set("")
+        self.discovery.return_value = {"candidates": [], "selected_controller": None, "message": "尚未发现客户端。"}
+        self.dialog.discover_connections()
+        self.finish()
+        self.assertEqual(self.discovery.call_args.args[0]["group"], self.dialog.original_context[2])
+        self.assertEqual(self.dialog.group.get(), "")
+        self.assertFalse(self.dialog.loading)
+
 
 class ClientDialogLifecycleTests(unittest.TestCase):
+    def test_discovery_controls_and_connection_message_fit_minimum_window(self):
+        try:
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-alpha", 0)
+        except tk.TclError as error:
+            self.skipTest(f"Tk display unavailable: {error}")
+        dialog = None
+        try:
+            dashboard.apply_theme(root)
+            with tempfile.TemporaryDirectory(prefix="nearroute-client-layout-") as directory:
+                config = Path(directory) / "config.json"
+                config.write_text(json.dumps({"enabled": False}), encoding="utf-8")
+                owner = SimpleNamespace(root=root, client_dialog=None)
+                with patch.object(dashboard, "CONFIG", config):
+                    dialog = dashboard.ClientDialog(owner, visible=False)
+                owner.client_dialog = dialog
+                dialog.message.set("连接成功，HTTP 代理端口 7890，读取 8 个代理组。规则模式使用所选代理组。优先保留有效代理组。邻近地区：JP、TW、SG、HK、PH。")
+                dialog.window.attributes("-alpha", 0)
+                dialog.window.geometry("720x640+0+0")
+                root.deiconify()
+                dialog.window.deiconify()
+                root.update()
+                for widget in (dialog.address_entry, dialog.discover_button, dialog.secret_entry,
+                               dialog.auto_detect_button, dialog.groups, dialog.inspect_button,
+                               dialog.auto_group_button, dialog.save_button, dialog.cancel_button):
+                    self.assertTrue(widget.winfo_ismapped(), str(widget))
+                    x = widget.winfo_rootx() - dialog.window.winfo_rootx()
+                    y = widget.winfo_rooty() - dialog.window.winfo_rooty()
+                    self.assertGreaterEqual(x, 0, str(widget))
+                    self.assertGreaterEqual(y, 0, str(widget))
+                    self.assertLessEqual(x + widget.winfo_width(), dialog.window.winfo_width(), str(widget))
+                    self.assertLessEqual(y + widget.winfo_height(), dialog.window.winfo_height(), str(widget))
+        finally:
+            if dialog is not None:
+                dialog.close()
+            root.destroy()
+
     def test_close_releases_variable_traces_and_dialog_after_apply_finishes(self):
         try:
             root = tk.Tk()
@@ -379,6 +540,22 @@ class ClientContextTests(unittest.TestCase):
         self.app.node_count_value.set.assert_called_with("—")
         self.app.ensure_service.assert_not_called()
         self.assertIn("立即测速", self.app.notify.call_args.args[0])
+
+    def test_saving_only_automatic_preferences_preserves_live_nodes_and_selection(self):
+        self.app.manual_request_id = "pending-current-client-request"
+        mode = self.app.node_mode
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                cfg = dashboard.core.DEFAULTS | {"enabled": enabled, "auto_detect_client": False, "auto_select_group": False}
+                self.app.client_saved(cfg)
+                self.assertEqual(self.app.node_context, self.context)
+                self.assertEqual(self.app.node_mode, mode)
+                self.assertEqual(self.app.node_signature, "old nodes")
+                self.assertEqual(self.app.manual_request_id, "pending-current-client-request")
+                self.app.render_nodes.assert_not_called()
+                self.app.ensure_service.assert_not_called()
+                self.app.policy.set.assert_called_with(dashboard.policy_summary(cfg))
+                self.assertIn("当前节点和优选开关保持", self.app.notify.call_args.args[0])
 
     def test_client_save_busy_blocks_node_actions_and_auto_install(self):
         self.app.client_busy = True

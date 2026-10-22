@@ -33,6 +33,8 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from functools import partial
 
+import client_detection
+
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
 CONFIG = ROOT / "config.json"
@@ -46,6 +48,8 @@ DEFAULTS = {
     "controller": "http://127.0.0.1:9790",
     "controller_secret_env": "",
     "group": "猫猫云",
+    "auto_detect_client": True,
+    "auto_select_group": True,
     "probe_url": PROBE_URL,
     "probe_expected_statuses": [405],
     "scan_interval_seconds": 300,
@@ -207,8 +211,11 @@ def validate_config(raw):
         raise ValueError("enabled 必须为 true 或 false")
     if type(cfg["prefer_japan"]) is not bool:
         raise ValueError("prefer_japan 必须为 true 或 false")
-    if cfg["scan_mode"] not in ("regions", "nodes", "all"):
-        raise ValueError("scan_mode 必须为 regions、nodes 或 all")
+    for key in ("auto_detect_client", "auto_select_group"):
+        if type(cfg[key]) is not bool:
+            raise ValueError(key + " 必须为 true 或 false")
+    if cfg["scan_mode"] not in ("adaptive", "regions", "nodes", "all"):
+        raise ValueError("scan_mode 必须为 adaptive、regions、nodes 或 all")
     regions = cfg["scan_regions"]
     if not isinstance(regions, list) or any(not isinstance(region, str) or not re.fullmatch(r"[A-Za-z]{2}|UNKNOWN", region.upper()) for region in regions):
         raise ValueError("scan_regions 必须为两字母地区码或 UNKNOWN 的列表")
@@ -324,6 +331,8 @@ def filter_scan_candidates(names, allowed_regions):
 
 
 def scan_candidates(names, cfg):
+    if cfg["scan_mode"] == "adaptive":
+        return filter_scan_candidates(names, client_detection.nearby_regions(names, node_region))
     if cfg["scan_mode"] == "all":
         return list(names)
     if cfg["scan_mode"] == "nodes":
@@ -639,18 +648,28 @@ def local_proxy_endpoint(general):
     raise ControllerError("HTTP 代理端口未绑定本机回环地址，请在客户端使用 127.0.0.1、[::1] 或通配地址")
 
 
-def inspect_controller(fields):
+def inspect_controller(fields, *, timeout=5, adaptive=False):
     """Read a local Clash-compatible client's groups without changing its state."""
     cfg = validate_config(fields)
     _check_client_environment(cfg)
     api = Controller(cfg)
-    general = api.request("/configs")
-    proxy_response = api.request("/proxies")
+    if adaptive:
+        version = api.request("/version", timeout=timeout)
+        if not isinstance(version, dict) or not isinstance(version.get("version"), str) or not version["version"]:
+            raise ControllerError("接口未返回有效的 Clash／Mihomo 版本")
+    general = api.request("/configs", timeout=timeout)
+    proxy_response = api.request("/proxies", timeout=timeout)
     if not isinstance(general, dict) or not isinstance(proxy_response, dict):
         raise ControllerError("控制接口未返回有效的代理配置")
     proxies = proxy_response.get("proxies")
     if not isinstance(proxies, dict):
         raise ControllerError("控制接口未返回有效的代理组列表")
+    for name, item in proxies.items():
+        if (not isinstance(name, str) or not isinstance(item, dict)
+                or ("all" in item and (not isinstance(item["all"], list)
+                                      or any(not isinstance(member, str) for member in item["all"])))
+                or (item.get("type") == "Selector" and "all" not in item)):
+            raise ControllerError("控制接口返回的代理组或节点格式无效")
     mode = general.get("mode", "rule")
     if not isinstance(mode, str) or mode.lower() not in ("rule", "global", "direct"):
         raise ControllerError("代理客户端返回了不支持的代理模式")
@@ -661,7 +680,32 @@ def inspect_controller(fields):
     active_group = None if mode == "direct" else ("GLOBAL" if mode == "global" else cfg["group"])
     if active_group not in groups:
         active_group = None
-    return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port}
+    chains = []
+    target_host = urllib.parse.urlsplit(cfg["probe_url"]).hostname
+    if adaptive and active_group is None and mode == "rule":
+        try:
+            connections = api.request("/connections", timeout=timeout)
+            for connection in connections.get("connections", []):
+                if not isinstance(connection, dict):
+                    continue
+                metadata = connection.get("metadata", {})
+                if isinstance(metadata, dict) and metadata.get("host", "").lower().rstrip(".") == target_host:
+                    chain = connection.get("chains", [])
+                    if isinstance(chain, list) and all(isinstance(name, str) for name in chain):
+                        chains.append(chain)
+        except (ControllerError, AttributeError, TypeError):
+            pass  # Active connection evidence is optional; ambiguity stays a user choice.
+    recommendation = client_detection.recommend_group(proxies, cfg["group"], connection_chains=chains,
+                                                      target_host=target_host, mode=mode)
+    group = active_group or recommendation["recommended_group"]
+    regions = client_detection.nearby_regions(flatten_candidates(proxies, group), node_region) if group else []
+    return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port,
+            **recommendation, "nearby_regions": regions}
+
+
+def discover_clients(fields):
+    """Discover compatible local endpoints using GET requests only."""
+    return client_detection.discover_clients(validate_config(fields), inspect_controller)
 
 
 class _ProbeCancelled(Exception):
@@ -984,6 +1028,7 @@ class Optimizer:
         self.recovery_scan_pending = False
         self.observed_selection = None
         self.tentative = False
+        self.last_client_detection = -math.inf
         self.sync_probe_history()
         self.prune_probe_history()
         self.write_status()
@@ -1032,6 +1077,56 @@ class Optimizer:
             self.next_scan = 0
         if self.cfg["codex_log_db"] != previous["codex_log_db"]:
             self.signals = LogSignals(self.cfg["codex_log_db"])
+
+    def adapt_client(self):
+        """Recover an unavailable client/group while this helper owns the writer lock."""
+        cfg = dict(self.cfg)
+        if (self.dry_run or self.tentative or self.stopping()
+                or not (cfg["auto_detect_client"] or cfg["auto_select_group"])
+                or time.monotonic() - self.last_client_detection < 30
+                or (STATE / "pending-selection.json").exists()
+                or (STATE / "select.request.json").exists()):
+            return False
+        self.last_client_detection = time.monotonic()
+        if cfg["auto_detect_client"]:
+            result = discover_clients(cfg)
+        else:
+            info = inspect_controller(cfg, timeout=0.6, adaptive=True)
+            result = {"candidates": [{"controller": cfg["controller"], "verified": True, **info}],
+                      "selected_controller": cfg["controller"], "message": ""}
+        endpoint = result.get("selected_controller")
+        info = next((item for item in result["candidates"]
+                     if item["controller"] == endpoint and item.get("verified")), None)
+        self.status["client_detection_message"] = result.get("message", "")
+        if info is None or info.get("mode") == "direct":
+            return False
+        group = cfg["group"]
+        if info.get("mode") != "global" and group not in info["groups"]:
+            if not cfg["auto_select_group"] or not info.get("recommended_group"):
+                self.status["client_detection_message"] = "无法唯一判断代理组，请在连接设置中选择"
+                return False
+            group = info["recommended_group"]
+        fields = {"controller": endpoint, "group": group,
+                  "controller_secret_env": cfg["controller_secret_env"] if endpoint == cfg["controller"] else ""}
+        if state_context(cfg | fields) == state_context(cfg):
+            self.status["client_detection_message"] = ""
+            return False
+        # Never move an unfinished rollback or a queued user choice to another client.
+        with _manual_request_lock(), config_update_lock():
+            current = load_config()
+            if (current != cfg or self.stopping() or self.tentative
+                    or (STATE / "pending-selection.json").exists()
+                    or (STATE / "select.request.json").exists()):
+                return False
+            candidate = validate_config(current | fields)
+            atomic_json(CONFIG, candidate)
+        self.reload_config()
+        self.write_status(phase="starting" if self.cfg["enabled"] else "paused", controller_available=False,
+                          client_detection_message="已自动应用唯一可靠的代理连接", last_error=None,
+                          message="已识别代理客户端，正在读取当前线路")
+        event("client_detected", group_changed=cfg["group"] != group,
+              controller_changed=cfg["controller"] != endpoint)
+        return True
 
     def sync_runtime_context(self):
         context = state_context(self.cfg)
@@ -1164,8 +1259,15 @@ class Optimizer:
             self.publish_active_path(general, proxies, group, phase="paused", health=None,
                                      message="已暂停自动测速和切换")
         except (ControllerError, ValueError, OSError) as error:
+            if isinstance(error, ControllerError):
+                try:
+                    if self.adapt_client():
+                        return
+                except (ControllerError, ValueError, OSError):
+                    self.status["client_detection_message"] = "自动识别暂未成功，将稍后重试"
+            detail = self.status.get("client_detection_message", "")
             self.write_status(phase="paused", controller_available=False, last_error=str(error),
-                              message="已暂停；无法读取客户端当前状态")
+                              message="已暂停；无法读取客户端当前状态" + ("；" + detail if detail else ""))
 
     def refresh_cancelled_mode(self, message="代理模式已改变，本轮选点已取消", *, clear_nodes=True):
         # GLOBAL can select the original rule group, so rollback may also change
@@ -1576,18 +1678,20 @@ class Optimizer:
         current = resolve_leaf(proxies, previous)
         all_names = flatten_candidates(proxies, group)
         names = scan_candidates(all_names, self.cfg)
+        regions = (client_detection.nearby_regions(all_names, node_region)
+                   if self.cfg["scan_mode"] == "adaptive" else self.cfg["scan_regions"])
         self.scan_display_names = list(names)
         if current and current not in names and current in all_names:
             self.scan_display_names.insert(0, current)
         if not names:
-            self.write_status(nodes=[], scan_regions=self.cfg["scan_regions"], scan_node_count=0,
+            self.write_status(nodes=[], scan_regions=regions, scan_node_count=0,
                               excluded_node_count=len(all_names))
-            raise ControllerError("代理组中没有符合地区范围的节点；保留当前选择")
+            raise ControllerError("代理组中没有符合" + ("邻近地区" if self.cfg["scan_mode"] == "adaptive" else "地区范围") + "的节点；保留当前选择")
         self.observe_selection(path)
         endpoint = self.require_proxy_endpoint(general, proxies, group) if self.cfg["enabled"] and not self.dry_run else None
         self.write_status(controller_available=True, mode=mode[0], group=group, selected=current or previous,
                           phase="scanning", message="开始对所选范围测速", last_error=None,
-                          nodes=self.statistics(self.scan_display_names), scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
+                          nodes=self.statistics(self.scan_display_names), scan_regions=regions, scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"],
                           scan_node_count=len(names), excluded_node_count=len(all_names) - len(names),
                           region_counts=dict(collections.Counter(node_region(name) for name in names)))
         fresh = self.measure_round(names, "所选节点初测", forced=forced)
@@ -1731,7 +1835,7 @@ class Optimizer:
                           message=reason, enabled=self.cfg["enabled"],
                           next_scan_at=iso(self.next_scan) if self.next_scan else iso())
         event("scan_completed", candidates=len(names), selected=selected, message=reason,
-              scan_regions=self.cfg["scan_regions"], scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"])
+              scan_regions=regions, scan_mode=self.cfg["scan_mode"], prefer_japan=self.cfg["prefer_japan"])
 
     def tick_health(self):
         self.recover_pending()
@@ -1806,7 +1910,15 @@ class Optimizer:
                 # The guard already published the live controller state.
                 pass
             except (ControllerError, ValueError, OSError) as exc:
-                self.write_status(phase="waiting", controller_available=False, message=str(exc), last_error=str(exc))
+                if isinstance(exc, ControllerError):
+                    try:
+                        if self.adapt_client():
+                            continue
+                    except (ControllerError, ValueError, OSError):
+                        self.status["client_detection_message"] = "自动识别暂未成功，将稍后重试；也可在连接设置中手动检查"
+                detail = self.status.get("client_detection_message", "")
+                self.write_status(phase="waiting", controller_available=False,
+                                  message=str(exc) + ("；" + detail if detail else ""), last_error=str(exc))
                 self.next_scan = time.time() + 15
                 self.last_health = time.time()
             except Exception as exc:
@@ -1843,7 +1955,7 @@ def configure_client(fields, expected_context=None):
     Discovery is a separate read-only action. This function validates local
     settings, serializes updates, and never sends controller requests.
     """
-    allowed = {"controller", "controller_secret_env", "group"}
+    allowed = {"controller", "controller_secret_env", "group", "auto_detect_client", "auto_select_group"}
     if not isinstance(fields, dict) or set(fields) - allowed:
         raise ValueError("连接设置仅接受控制接口、密钥环境变量名和代理组")
     load_config()  # First-run creation must happen before the non-reentrant lock.

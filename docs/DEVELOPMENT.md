@@ -8,6 +8,7 @@
 nearroute/
 ├─ dashboard.py          # 桌面窗口与用户操作入口
 ├─ optimizer.py          # 节点探测、优选及后台命令入口
+├─ client_detection.py   # 本机控制接口发现与代理组判断
 ├─ updater.py            # 应用内更新与安装工作进程
 ├─ tray_icon.py          # Windows 系统托盘
 ├─ windows_app.py        # Windows 应用标识及窗口图标

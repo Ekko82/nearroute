@@ -75,6 +75,9 @@ class SettingsPersistenceTests(unittest.TestCase):
         self.assertIn("200, 204", first)
         self.assertIn("指定节点（2 个）", dashboard.policy_summary({"scan_mode": "nodes", "scan_nodes": ["A", "B"]}))
         self.assertIn("US、UNKNOWN", dashboard.policy_summary({"scan_regions": ["US", "UNKNOWN"]}))
+        adaptive = dashboard.policy_summary({"scan_mode": "adaptive", "scan_regions": ["US"]})
+        self.assertIn("自动邻近地区", adaptive)
+        self.assertNotIn("US", adaptive)
 
     def test_runtime_discovery_uses_path_when_sys_executable_empty(self):
         with patch.object(dashboard.sys, "executable", ""), patch.object(dashboard.shutil, "which", return_value="python-from-path"):
@@ -196,6 +199,21 @@ class SettingsWindowTests(unittest.TestCase):
         self.assertNotIn("disabled", self.dialog.region_entry.state())
         self.dialog.regions.set("US, UNKNOWN")
         self.assertEqual(self.dialog.fields()["scan_regions"], ["US", "UNKNOWN"])
+
+    def test_adaptive_scope_preserves_manual_ranges_and_pause(self):
+        self.dialog.regions.set("US, TW")
+        self.dialog.mode.set("adaptive")
+        self.dialog.update_mode()
+        self.assertIn("disabled", self.dialog.region_entry.state())
+        self.assertEqual(str(self.dialog.node_list.cget("state")), "disabled")
+        self.assertEqual(self.dialog.fields()["scan_regions"], ["US", "TW"])
+        self.assertEqual(set(self.dialog.fields()["scan_nodes"]), {"JP-online", "SG-offline"})
+        self.dialog.save()
+        saved = self.owner.settings_saved.call_args.args[0]
+        self.assertEqual(saved["scan_mode"], "adaptive")
+        self.assertEqual(saved["scan_regions"], ["US", "TW"])
+        self.assertFalse(saved["enabled"])
+        self.assertTrue(saved["prefer_japan"])
 
 
 if __name__ == "__main__":
