@@ -38,6 +38,65 @@ WINDOW_TITLE = "近舟 NearRoute"
 STATUS_STALE_SECONDS = 120
 
 
+def apply_theme(root):
+    """Use Tk's bundled theme so colors and spacing agree across Windows versions."""
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    background, surface, ink, muted = "#f3f6fb", "#ffffff", "#17243b", "#6b7a90"
+    style.configure(".", font=("Microsoft YaHei UI", 10), background=background, foreground=ink)
+    style.configure("TFrame", background=background)
+    style.configure("Surface.TFrame", background=surface)
+    style.configure("Card.TFrame", background=surface, borderwidth=1, relief="solid",
+                    bordercolor="#e0e7f1", lightcolor=surface, darkcolor=surface)
+    style.configure("TLabel", background=background, foreground=ink)
+    style.configure("Surface.TLabel", background=surface)
+    style.configure("Muted.TLabel", foreground=muted)
+    style.configure("SurfaceMuted.TLabel", background=surface, foreground=muted, font=("Microsoft YaHei UI", 9))
+    style.configure("Title.TLabel", font=("Microsoft YaHei UI", 21, "bold"), foreground=ink)
+    style.configure("Section.TLabel", background=surface, font=("Microsoft YaHei UI", 11, "bold"))
+    style.configure("PageSection.TLabel", background=background, font=("Microsoft YaHei UI", 11, "bold"))
+    style.configure("Node.TLabel", background=surface, font=("Microsoft YaHei UI", 16, "bold"))
+    style.configure("Metric.TLabel", background=surface, font=("Microsoft YaHei UI", 18, "bold"))
+    style.configure("Status.TLabel", background="#eaf6ef", foreground="#227446",
+                    font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 5))
+    style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(13, 8),
+                    background=surface, foreground="#34445f", borderwidth=1, relief="flat",
+                    bordercolor="#dce4ef", lightcolor=surface, darkcolor=surface, focuscolor="#c4d5f5")
+    style.map("TButton", background=[("disabled", "#f1f4f8"), ("pressed", "#e3eaf5"), ("active", "#edf2fa")],
+              foreground=[("disabled", "#9aa6b6")], bordercolor=[("active", "#bccce3")])
+    style.configure("Primary.TButton", background="#2563eb", foreground=surface,
+                    bordercolor="#2563eb", lightcolor="#2563eb", darkcolor="#2563eb")
+    style.map("Primary.TButton", background=[("disabled", "#e8edf5"), ("pressed", "#1d4ed8"), ("active", "#3474f5")],
+              foreground=[("disabled", "#9aa6b6"), ("!disabled", surface)],
+              bordercolor=[("disabled", "#e0e7f1"), ("!disabled", "#2563eb")])
+    style.configure("Danger.TButton", foreground="#b04444")
+    style.configure("Quiet.TButton", padding=(9, 5), background=background, bordercolor=background)
+    style.configure("TEntry", fieldbackground=surface, padding=(9, 7), bordercolor="#dce4ef", lightcolor=surface, darkcolor=surface)
+    style.configure("TCombobox", fieldbackground=surface, padding=(9, 6), bordercolor="#dce4ef", arrowsize=13)
+    style.map("TCombobox", fieldbackground=[("disabled", "#f1f4f8"), ("readonly", surface)],
+              selectbackground=[("readonly", surface)], selectforeground=[("readonly", ink)])
+    for control in ("TCheckbutton", "TRadiobutton"):
+        style.configure(control, background=background, padding=(0, 3))
+        style.configure("Surface." + control, background=surface)
+        style.map("Surface." + control, background=[("active", surface)])
+    style.configure("Treeview", background=surface, fieldbackground=surface, foreground=ink,
+                    font=("Microsoft YaHei UI", 9), rowheight=35, borderwidth=0, relief="flat")
+    style.map("Treeview", background=[("selected", "#dceafe")], foreground=[("selected", "#174ea6")])
+    style.configure("Treeview.Heading", background="#f5f8fc", foreground="#63738c",
+                    font=("Microsoft YaHei UI", 9, "bold"), padding=(10, 9), borderwidth=0, relief="flat")
+    style.map("Treeview.Heading", background=[("active", "#edf2f9")])
+    style.configure("TScrollbar", background="#cfdae9", troughcolor="#f4f7fb", borderwidth=0,
+                    arrowsize=11, arrowcolor="#6b7a90", relief="flat", bordercolor="#f4f7fb",
+                    lightcolor="#f4f7fb", darkcolor="#f4f7fb", gripcount=0)
+    style.configure("TNotebook", background=background, borderwidth=0, bordercolor="#e0e7f1",
+                    lightcolor="#e0e7f1", darkcolor="#e0e7f1")
+    style.configure("TNotebook.Tab", padding=(16, 9), background="#eaf0f8", borderwidth=0,
+                    bordercolor="#e0e7f1", lightcolor="#e0e7f1", darkcolor="#e0e7f1")
+    style.map("TNotebook.Tab", background=[("selected", surface)], foreground=[("selected", "#2563eb")])
+    return style
+
+
 class WindowInstance:
     """Keep one control window per installation; bring it forward on relaunch."""
 
@@ -398,7 +457,7 @@ class SettingsDialog:
         self.window.title("测速设置 · 近舟 NearRoute")
         self.window.geometry("840x760")
         self.window.minsize(760, 690)
-        self.window.configure(background="#f4f6f9")
+        self.window.configure(background="#f3f6fb")
         self.window.transient(owner.root)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         if not visible:
@@ -410,60 +469,75 @@ class SettingsDialog:
         self.prefer_japan = tk.BooleanVar(value=cfg.get("prefer_japan", True))
         self.node_message = tk.StringVar(value=f"已保留 {len(self.selected_nodes)} 个已选节点，等待读取客户端。")
 
-        form = ttk.Frame(self.window, padding=22)
+        form = ttk.Frame(self.window, padding=(24, 20, 24, 20))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
-        form.rowconfigure(7, weight=1)
-        ttk.Label(form, text="测速链接", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.url).grid(row=1, column=0, sticky="ew", pady=(6, 10))
-        response = ttk.Frame(form)
-        response.grid(row=2, column=0, sticky="ew")
-        ttk.Label(response, text="预期 HTTP 状态码").pack(side="left", padx=(0, 10))
-        ttk.Entry(response, textvariable=self.expected, width=24).pack(side="left")
-        ttk.Label(response, text="逗号分隔，例如 200,204", style="Muted.TLabel").pack(side="left", padx=(12, 0))
-        help_label = ttk.Label(
-            form, text="状态码须与目标地址匹配：常见连通性地址返回 204 或 200；Codex responses 地址的 GET 探测通常返回 405。修改链接不会自动修改状态码。",
-            wraplength=790, style="Muted.TLabel",
-        )
-        help_label.grid(row=3, column=0, sticky="ew", pady=(8, 18))
+        form.rowconfigure(1, weight=1)
+        header = ttk.Frame(form)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        ttk.Label(header, text="测速与选点", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(header, text="设置测试目标与候选范围，让优选更贴近你的使用习惯。", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
 
-        scope = ttk.Frame(form)
-        scope.grid(row=4, column=0, sticky="ew", pady=(0, 8))
-        ttk.Label(scope, text="测试节点范围", font=("Microsoft YaHei UI", 11, "bold")).pack(side="left", padx=(0, 16))
+        tabs = ttk.Notebook(form)
+        tabs.grid(row=1, column=0, sticky="nsew")
+        probe = ttk.Frame(tabs, style="Surface.TFrame", padding=18)
+        probe.columnconfigure(0, weight=1)
+        ttk.Label(probe, text="测速目标", style="Section.TLabel", background="#ffffff").grid(row=0, column=0, sticky="w")
+        ttk.Entry(probe, textvariable=self.url).grid(row=1, column=0, sticky="ew", pady=(10, 12))
+        response = ttk.Frame(probe, style="Surface.TFrame")
+        response.grid(row=2, column=0, sticky="ew")
+        ttk.Label(response, text="预期 HTTP 状态码", style="Surface.TLabel").pack(side="left", padx=(0, 12))
+        ttk.Entry(response, textvariable=self.expected, width=19).pack(side="left")
+        ttk.Label(response, text="逗号分隔，例如 200, 204", style="Surface.TLabel", foreground="#64748b").pack(side="left", padx=(12, 0))
+        help_label = ttk.Label(
+            probe, text="状态码需要与地址匹配。常见连通性地址返回 200 / 204；Codex responses 的 GET 探测通常返回 405。修改地址后，请同步确认状态码。",
+            wraplength=730, style="Surface.TLabel", foreground="#64748b",
+        )
+        help_label.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+
+        candidates = ttk.Frame(tabs, style="Surface.TFrame", padding=18)
+        tabs.add(candidates, text="节点范围")
+        tabs.add(probe, text="测试目标")
+        candidates.columnconfigure(0, weight=1)
+        candidates.rowconfigure(5, weight=1)
+        scope = ttk.Frame(candidates, style="Surface.TFrame")
+        scope.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        ttk.Label(scope, text="候选节点", style="Section.TLabel", background="#ffffff").pack(side="left", padx=(0, 20))
         for value, label in (("regions", "按地区"), ("nodes", "指定节点"), ("all", "全部节点")):
-            ttk.Radiobutton(scope, text=label, variable=self.mode, value=value, command=self.update_mode).pack(side="left", padx=(0, 14))
-        region_row = ttk.Frame(form)
-        region_row.grid(row=5, column=0, sticky="ew")
+            ttk.Radiobutton(scope, text=label, style="Surface.TRadiobutton", variable=self.mode, value=value, command=self.update_mode).pack(side="left", padx=(0, 16))
+        ttk.Checkbutton(scope, text="日本优先", style="Surface.TCheckbutton", variable=self.prefer_japan).pack(side="right")
+        region_row = ttk.Frame(candidates, style="Surface.TFrame")
+        region_row.grid(row=2, column=0, sticky="ew")
         region_row.columnconfigure(1, weight=1)
-        ttk.Label(region_row, text="地区代码").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        ttk.Label(region_row, text="地区代码", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 12))
         self.region_entry = ttk.Entry(region_row, textvariable=self.regions)
         self.region_entry.grid(row=0, column=1, sticky="ew")
-        self.preset_button = ttk.Button(region_row, text="日本 / 台湾 / 新加坡 / 香港", command=lambda: self.regions.set("JP, TW, SG, HK"))
+        self.preset_button = ttk.Button(region_row, text="常用邻近地区", command=lambda: self.regions.set("JP, TW, SG, HK"))
         self.preset_button.grid(row=0, column=2, padx=(10, 0))
         region_help = ttk.Label(
-            form, text="可填任意两字母地区代码（如 US, DE）；UNKNOWN 包含无法识别地区的节点。地区来自节点名标记，不保证物理位置。",
-            style="Muted.TLabel", wraplength=790,
+            candidates, text="使用 JP, TW 等两字母代码，地区按节点名识别；UNKNOWN 为未知地区。日本优先仍遵守范围与稳定性门槛。",
+            style="Surface.TLabel", foreground="#64748b", wraplength=730,
         )
-        region_help.grid(row=6, column=0, sticky="ew", pady=(6, 12))
+        region_help.grid(row=3, column=0, sticky="ew", pady=(8, 12))
 
-        node_frame = ttk.Frame(form)
-        node_frame.grid(row=7, column=0, sticky="nsew")
+        node_frame = ttk.Frame(candidates, style="Surface.TFrame")
+        node_frame.grid(row=5, column=0, sticky="nsew")
         node_frame.columnconfigure(0, weight=1)
         node_frame.rowconfigure(1, weight=1)
-        node_actions = ttk.Frame(node_frame)
-        node_actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 6))
-        ttk.Label(node_actions, text="指定节点（可多选）").pack(side="left", padx=(0, 12))
-        self.refresh_button = ttk.Button(node_actions, text="刷新客户端节点", command=self.refresh_nodes)
-        self.refresh_button.pack(side="left", padx=(0, 6))
-        self.all_button = ttk.Button(node_actions, text="全选列表", command=self.select_all_nodes)
-        self.all_button.pack(side="left", padx=(0, 6))
+        node_actions = ttk.Frame(node_frame, style="Surface.TFrame")
+        node_actions.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 10))
+        ttk.Label(node_actions, text="节点名单", style="Surface.TLabel").pack(side="left")
         self.clear_button = ttk.Button(node_actions, text="清空选择", command=self.clear_nodes)
-        self.clear_button.pack(side="left")
+        self.clear_button.pack(side="right")
+        self.all_button = ttk.Button(node_actions, text="全选", command=self.select_all_nodes)
+        self.all_button.pack(side="right", padx=(0, 6))
+        self.refresh_button = ttk.Button(node_actions, text="刷新节点", command=self.refresh_nodes)
+        self.refresh_button.pack(side="right", padx=(0, 6))
         self.node_list = tk.Listbox(
             node_frame, selectmode=tk.EXTENDED, exportselection=False,
             font=("Microsoft YaHei UI", 10), height=8,
-            background="#ffffff", foreground="#263445", selectbackground="#2364a1", selectforeground="#ffffff",
-            relief="solid", borderwidth=1, activestyle="none",
+            background="#ffffff", foreground="#1e293b", selectbackground="#dbeafe", selectforeground="#1e40af",
+            relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#dbe3ee", activestyle="none",
         )
         self.node_list.grid(row=1, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(node_frame, orient="vertical", command=self.node_list.yview)
@@ -472,14 +546,13 @@ class SettingsDialog:
         horizontal.grid(row=2, column=0, sticky="ew")
         self.node_list.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
         self.node_list.bind("<<ListboxSelect>>", self.selection_changed)
-        node_status = ttk.Label(form, textvariable=self.node_message, style="Muted.TLabel", wraplength=790)
-        node_status.grid(row=8, column=0, sticky="ew", pady=(6, 10))
-        ttk.Checkbutton(form, text="日本优先（仍遵守当前测试范围和稳定性门槛）", variable=self.prefer_japan).grid(row=9, column=0, sticky="w")
+        node_status = ttk.Label(candidates, textvariable=self.node_message, style="Surface.TLabel", foreground="#64748b", wraplength=730)
+        node_status.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         footer = ttk.Frame(form)
-        footer.grid(row=10, column=0, sticky="ew", pady=(16, 0))
+        footer.grid(row=2, column=0, sticky="ew", pady=(18, 0))
         ttk.Label(footer, text="保存后重新测速；已暂停时保持暂停。", style="Muted.TLabel").pack(side="left")
-        ttk.Button(footer, text="保存设置", command=self.save).pack(side="right")
-        ttk.Button(footer, text="取消", command=self.close).pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="保存设置", style="Primary.TButton", command=self.save).pack(side="right")
+        ttk.Button(footer, text="取消", style="Secondary.TButton", command=self.close).pack(side="right", padx=(0, 8))
         form.bind("<Configure>", lambda event: self.resize_text(event.width, (help_label, region_help, node_status)))
         self.render_nodes()
         self.update_mode()
@@ -492,7 +565,7 @@ class SettingsDialog:
     @staticmethod
     def resize_text(width: int, labels: tuple) -> None:
         for label in labels:
-            label.configure(wraplength=max(400, width - 44))
+            label.configure(wraplength=max(400, width - 86))
 
     def update_mode(self) -> None:
         regions_active = self.mode.get() == "regions"
@@ -646,8 +719,9 @@ class ClientDialog:
         self.after_id = None
         self.window = tk.Toplevel(owner.root)
         self.window.title("客户端连接 · 近舟 NearRoute")
-        self.window.geometry("720x480")
-        self.window.minsize(650, 440)
+        self.window.geometry("760x610")
+        self.window.minsize(680, 560)
+        self.window.configure(background="#f3f6fb")
         self.window.transient(owner.root)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         if not visible:
@@ -656,34 +730,53 @@ class ClientDialog:
         self.secret_env = tk.StringVar(value=cfg["controller_secret_env"])
         self.group = tk.StringVar(value=cfg["group"])
         self.message = tk.StringVar(value="填写客户端的外部控制地址，然后读取可选择的代理组。")
-        form = ttk.Frame(self.window, padding=22)
+        form = ttk.Frame(self.window, padding=(24, 20, 24, 20))
         form.pack(fill="both", expand=True)
-        form.columnconfigure(1, weight=1)
+        form.columnconfigure(0, weight=1)
+        form.rowconfigure(2, weight=1)
+        header = ttk.Frame(form)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+        ttk.Label(header, text="连接代理客户端", style="Title.TLabel").pack(anchor="w")
         help_text = ("支持 Clash Verge Rev、Clash Party（原 Mihomo Party）等本机 Mihomo/Clash 客户端。"
-                     "在客户端中开启 HTTP 外部控制，并提供 HTTP 或 mixed 代理端口。")
-        ttk.Label(form, text=help_text, wraplength=650, style="Muted.TLabel").grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 18))
-        ttk.Label(form, text="控制地址").grid(row=1, column=0, sticky="w", padx=(0, 12))
-        self.address_entry = ttk.Entry(form, textvariable=self.controller)
-        self.address_entry.grid(row=1, column=1, sticky="ew")
-        ttk.Label(form, text="例如 http://127.0.0.1:9090；填写外部控制端口，不是代理端口。", style="Muted.TLabel", wraplength=650).grid(row=2, column=0, columnspan=2, sticky="w", pady=(6, 14))
-        ttk.Label(form, text="密钥环境变量").grid(row=3, column=0, sticky="w", padx=(0, 12))
-        self.secret_entry = ttk.Entry(form, textvariable=self.secret_env)
-        self.secret_entry.grid(row=3, column=1, sticky="ew")
-        ttk.Label(form, text="无需认证时留空。需要认证时填写已有环境变量的名称（如 CLASH_SECRET），不填写密钥本身；设置后重新打开近舟。", wraplength=650, style="Muted.TLabel").grid(row=4, column=0, columnspan=2, sticky="ew", pady=(6, 14))
-        ttk.Label(form, text="规则模式代理组").grid(row=5, column=0, sticky="w", padx=(0, 12))
-        self.groups = ttk.Combobox(form, textvariable=self.group, state="readonly")
-        self.groups.grid(row=5, column=1, sticky="ew")
-        self.inspect_button = ttk.Button(form, text="测试连接并读取代理组", command=self.inspect_connection)
-        self.inspect_button.grid(row=6, column=0, columnspan=2, sticky="w", pady=(14, 10))
-        ttk.Label(form, textvariable=self.message, wraplength=650, style="Muted.TLabel").grid(row=7, column=0, columnspan=2, sticky="ew")
-        form.rowconfigure(7, weight=1)
+                     "请先在客户端开启 HTTP 外部控制，并启用 HTTP 或 mixed 代理端口。")
+        help_label = ttk.Label(header, text=help_text, wraplength=690, style="Muted.TLabel")
+        help_label.pack(anchor="w", fill="x", pady=(6, 0))
+
+        connection = ttk.Frame(form, style="Card.TFrame", padding=14)
+        connection.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        connection.columnconfigure(1, weight=1)
+        ttk.Label(connection, text="控制地址", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 14))
+        self.address_entry = ttk.Entry(connection, textvariable=self.controller)
+        self.address_entry.grid(row=0, column=1, sticky="ew")
+        address_help = ttk.Label(connection, text="例如 http://127.0.0.1:9090，使用客户端的外部控制端口。", style="Surface.TLabel", foreground="#64748b", wraplength=650)
+        address_help.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 10))
+        ttk.Label(connection, text="密钥环境变量", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 14))
+        self.secret_entry = ttk.Entry(connection, textvariable=self.secret_env)
+        self.secret_entry.grid(row=2, column=1, sticky="ew")
+        secret_help = ttk.Label(connection, text="如 CLASH_SECRET，请填变量名，不填写密钥本身；无需认证时留空。设置变量后重开近舟。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
+        secret_help.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        selection = ttk.Frame(form, style="Card.TFrame", padding=16)
+        selection.grid(row=2, column=0, sticky="nsew")
+        selection.columnconfigure(0, weight=1)
+        ttk.Label(selection, text="选择代理组", style="Section.TLabel", background="#ffffff").grid(row=0, column=0, columnspan=2, sticky="w")
+        self.groups = ttk.Combobox(selection, textvariable=self.group, state="readonly")
+        self.groups.grid(row=1, column=0, sticky="ew", pady=(10, 12))
+        self.inspect_button = ttk.Button(selection, text="测试连接 · 读取代理组", command=self.inspect_connection)
+        self.inspect_button.grid(row=1, column=1, sticky="e", padx=(10, 0), pady=(10, 12))
+        message_label = ttk.Label(selection, textvariable=self.message, wraplength=650, style="Surface.TLabel", foreground="#64748b")
+        message_label.grid(row=2, column=0, columnspan=2, sticky="ew")
         actions = ttk.Frame(form)
-        actions.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        actions.grid(row=3, column=0, sticky="ew", pady=(18, 0))
         ttk.Label(actions, text="更换连接会停止后台并暂停自动优选。", style="Muted.TLabel").pack(side="left")
-        self.save_button = ttk.Button(actions, text="保存连接", command=self.save)
+        self.save_button = ttk.Button(actions, text="保存连接", style="Primary.TButton", command=self.save)
         self.save_button.pack(side="right")
-        self.cancel_button = ttk.Button(actions, text="取消", command=self.close)
+        self.cancel_button = ttk.Button(actions, text="取消", style="Secondary.TButton", command=self.close)
         self.cancel_button.pack(side="right", padx=8)
+        form.bind("<Configure>", lambda event: (
+            help_label.configure(wraplength=max(400, event.width - 48)),
+            [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, message_label)],
+        ))
         self._variable_traces = [
             (self.controller, self.controller.trace_add("write", self.invalidate_connection)),
             (self.secret_env, self.secret_env.trace_add("write", self.invalidate_connection)),
@@ -821,29 +914,38 @@ class DiagnosticDialog:
         self.summary = diagnostic_summary()
         self.window = tk.Toplevel(owner.window)
         self.window.title("诊断信息 · 近舟 NearRoute")
-        self.window.geometry("700x560")
+        self.window.geometry("720x580")
+        self.window.minsize(580, 440)
+        self.window.configure(background="#f3f6fb")
         self.window.transient(owner.window)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
         if not visible:
             self.window.withdraw()
-        form = ttk.Frame(self.window, padding=18)
+        form = ttk.Frame(self.window, padding=24)
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
-        form.rowconfigure(1, weight=1)
-        ttk.Label(form, text="可预览后手动复制。事件为本安装的历史；摘要不会自动发送。", wraplength=650).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
-        self.text = tk.Text(form, wrap="word", font=("Consolas", 10))
-        self.text.grid(row=1, column=0, sticky="nsew")
+        form.rowconfigure(2, weight=1)
+        ttk.Label(form, text="诊断信息", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        description = ttk.Label(form, text="查看本安装的运行摘要，复制后可用于排查连接或更新问题。\n摘要不会自动发送。", style="Muted.TLabel", wraplength=650)
+        description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 18))
+        self.text = tk.Text(form, wrap="word", font=("Consolas", 10), background="#ffffff", foreground="#334155", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#e2e8f0", padx=16, pady=14, spacing3=3)
+        self.text.grid(row=2, column=0, sticky="nsew")
         self.text.insert("1.0", self.summary)
         self.text.configure(state="disabled")
         scrollbar = ttk.Scrollbar(form, command=self.text.yview)
-        scrollbar.grid(row=1, column=1, sticky="ns")
+        scrollbar.grid(row=2, column=1, sticky="ns")
         self.text.configure(yscrollcommand=scrollbar.set)
         actions = ttk.Frame(form)
-        actions.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        actions.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(18, 0))
         self.copy_message = tk.StringVar(value="")
-        ttk.Label(actions, textvariable=self.copy_message).pack(side="left")
-        ttk.Button(actions, text="复制摘要", command=self.copy_summary).pack(side="right")
-        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=8)
+        ttk.Label(actions, textvariable=self.copy_message, style="Muted.TLabel").pack(side="left")
+        ttk.Button(actions, text="复制摘要", style="Primary.TButton", command=self.copy_summary).pack(side="right")
+        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=(0, 10))
+        def resize_description(event):
+            if event.widget is self.window:
+                description.configure(wraplength=max(320, event.width - 64))
+
+        self.window.bind("<Configure>", resize_description, add="+")
 
     def copy_summary(self):
         self.copy_message.set("")
@@ -871,49 +973,66 @@ class UpdateDialog:
         self.closed = False
         self.diagnostic_dialog = None
         self.window = tk.Toplevel(owner.root)
-        self.window.title("近舟更新")
-        self.window.geometry("660x530")
-        self.window.minsize(520, 420)
+        self.window.title("版本与更新 · 近舟 NearRoute")
+        self.window.geometry("720x620")
+        self.window.minsize(580, 540)
+        self.window.configure(background="#f3f6fb")
         self.window.transient(owner.root)
         self.window.protocol("WM_DELETE_WINDOW", self.close)
-        form = ttk.Frame(self.window, padding=20)
+        form = ttk.Frame(self.window, padding=24)
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
         form.rowconfigure(2, weight=1)
+        header = ttk.Frame(form)
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        header.columnconfigure(0, weight=1)
+        ttk.Label(header, text="版本与更新", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.check_button = ttk.Button(header, text="立即检查", command=lambda: owner.check_updates(manual=True))
+        self.check_button.grid(row=0, column=1, sticky="e", padx=(16, 0))
         self.summary = tk.StringVar()
-        ttk.Label(form, textvariable=self.summary, wraplength=610).grid(row=0, column=0, sticky="ew")
-        ttk.Label(form, text="更新说明", style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(14, 5))
+        summary_label = ttk.Label(header, textvariable=self.summary, style="Muted.TLabel", wraplength=650)
+        summary_label.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        ttk.Label(form, text="更新说明", style="PageSection.TLabel").grid(row=1, column=0, sticky="w", pady=(0, 8))
         notes_frame = ttk.Frame(form)
         notes_frame.grid(row=2, column=0, sticky="nsew")
         notes_frame.columnconfigure(0, weight=1)
         notes_frame.rowconfigure(0, weight=1)
-        self.notes = tk.Text(notes_frame, wrap="word", height=8, font=("Microsoft YaHei UI", 10))
+        self.notes = tk.Text(notes_frame, wrap="word", height=8, font=("Microsoft YaHei UI", 10), background="#ffffff", foreground="#334155", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#e2e8f0", padx=14, pady=12, spacing3=5)
         self.notes.grid(row=0, column=0, sticky="nsew")
         scrollbar = ttk.Scrollbar(notes_frame, command=self.notes.yview)
         scrollbar.grid(row=0, column=1, sticky="ns")
         self.notes.configure(yscrollcommand=scrollbar.set)
         self.auto_check = tk.BooleanVar(value=owner.update_preferences["auto_check"])
         self.mode = tk.StringVar(value=owner.update_preferences["mode"])
-        ttk.Checkbutton(form, text="自动检查新版本（每 6 小时）", variable=self.auto_check).grid(row=3, column=0, sticky="w", pady=(14, 4))
-        modes = ttk.Frame(form)
-        modes.grid(row=4, column=0, sticky="w")
+        preferences = ttk.Frame(form, style="Card.TFrame", padding=16)
+        preferences.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        preferences.columnconfigure(0, weight=1)
+        ttk.Label(preferences, text="自动更新", style="Surface.TLabel", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Checkbutton(preferences, text="每 6 小时检查新版本", style="Surface.TCheckbutton", variable=self.auto_check).grid(row=0, column=1, sticky="e", padx=(12, 0))
+        modes = ttk.Frame(preferences, style="Surface.TFrame")
+        modes.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         for label, value in (("提醒后由我安装", "notify"), ("自动下载，提醒安装", "download"), ("空闲时自动安装并重启", "install")):
-            button = ttk.Radiobutton(modes, text=label, value=value, variable=self.mode)
-            button.pack(anchor="w", pady=2)
+            button = ttk.Radiobutton(modes, text=label, value=value, variable=self.mode, style="Surface.TRadiobutton")
+            button.pack(anchor="w", pady=3)
             if value != "notify" and not owner.update_can_install:
                 button.state(["disabled"])
         update_help = ("支持在软件内更新，本地源码有改动时会保留并提示。" if owner.update_can_install
                        else "当前目录不能安全地在软件内更新，请使用官方安装目录。")
-        ttk.Label(form, text=update_help, style="Muted.TLabel", wraplength=610).grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        help_label = ttk.Label(preferences, text=update_help, style="Surface.TLabel", foreground="#64748b", wraplength=620)
+        help_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         actions = ttk.Frame(form)
-        actions.grid(row=6, column=0, sticky="ew", pady=(16, 0))
-        self.check_button = ttk.Button(actions, text="立即检查", command=lambda: owner.check_updates(manual=True))
-        self.check_button.pack(side="left")
-        self.install_button = ttk.Button(actions, command=owner.request_update_install)
-        self.install_button.pack(side="left", padx=8)
-        ttk.Button(actions, text="保存设置", command=self.save).pack(side="right")
-        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=8)
-        ttk.Button(form, text="诊断信息", command=self.open_diagnostics).grid(row=7, column=0, sticky="w", pady=(12, 0))
+        actions.grid(row=4, column=0, sticky="ew", pady=(20, 0))
+        ttk.Button(actions, text="诊断信息", command=self.open_diagnostics).pack(side="left")
+        self.install_button = ttk.Button(actions, style="Primary.TButton", command=owner.request_update_install)
+        self.install_button.pack(side="right")
+        ttk.Button(actions, text="保存设置", command=self.save).pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=(0, 8))
+        def resize_description(event):
+            if event.widget is self.window:
+                for label in (summary_label, help_label):
+                    label.configure(wraplength=max(320, event.width - 88))
+
+        self.window.bind("<Configure>", resize_description, add="+")
         self.refresh()
 
     def open_diagnostics(self):
@@ -1003,91 +1122,105 @@ class Dashboard:
                 root.iconbitmap(default=str(ICON_PATH))
             except tk.TclError:
                 pass  # A missing icon must not prevent opening the dashboard.
-        root.geometry("1080x710")
-        root.minsize(900, 610)
-        root.configure(background="#f4f6f9")
+        root.geometry("1120x780")
+        root.minsize(920, 650)
+        root.configure(background="#f3f6fb")
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
-        style = ttk.Style(root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure("TFrame", background="#f4f6f9")
-        style.configure("TLabel", background="#f4f6f9", font=("Microsoft YaHei UI", 10))
-        style.configure("Title.TLabel", font=("Microsoft YaHei UI", 20, "bold"), foreground="#182536")
-        style.configure("Muted.TLabel", foreground="#64748b")
-        style.configure("Status.TLabel", font=("Microsoft YaHei UI", 11, "bold"))
-        style.configure("TButton", font=("Microsoft YaHei UI", 10), padding=(14, 7))
-        style.configure("Treeview", font=("Microsoft YaHei UI", 9), rowheight=31)
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"))
+        apply_theme(root)
 
-        container = ttk.Frame(root, padding=24)
+        container = ttk.Frame(root, padding=(24, 16))
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
-        container.rowconfigure(5, weight=1)
-        self.wrapping_labels = []
+        container.rowconfigure(3, weight=1)
         header = ttk.Frame(container)
-        header.grid(row=0, column=0, sticky="ew")
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
-        ttk.Label(header, text=WINDOW_TITLE, style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        self.badge = tk.StringVar(value="正在读取状态")
-        self.badge_label = ttk.Label(header, textvariable=self.badge, style="Status.TLabel")
-        self.badge_label.grid(row=0, column=1, sticky="e")
-        ttk.Button(header, text="客户端连接", command=self.open_client).grid(row=0, column=2, padx=(14, 0))
-        self.policy = tk.StringVar(value="正在读取测速设置…")
-        policy_label = ttk.Label(
-            container,
-            textvariable=self.policy,
-            style="Muted.TLabel", wraplength=1010,
-        )
-        policy_label.grid(row=1, column=0, sticky="w", pady=(5, 18))
-        self.wrapping_labels.append(policy_label)
+        brand = ttk.Frame(header)
+        brand.grid(row=0, column=0, sticky="w")
+        ttk.Label(brand, text=WINDOW_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(brand, text="线路概览", style="Muted.TLabel").pack(side="left", padx=(14, 0), pady=(8, 0))
+        self.client_button = ttk.Button(header, text="客户端连接", command=self.open_client)
+        self.client_button.grid(row=0, column=1, padx=(0, 8))
+        self.settings_button = ttk.Button(header, text="测速设置", command=self.open_settings)
+        self.settings_button.grid(row=0, column=2)
 
-        controls = ttk.Frame(container)
-        controls.grid(row=2, column=0, sticky="ew", pady=(0, 16))
-        self.enable_button = ttk.Button(controls, text="启用自动优选", command=self.enable)
-        self.enable_button.pack(side="left", padx=(0, 8))
-        self.pause_button = ttk.Button(controls, text="暂停自动切换", command=self.pause)
-        self.pause_button.pack(side="left", padx=(0, 8))
-        self.scan_button = ttk.Button(controls, text="立即测速", command=self.scan)
-        self.scan_button.pack(side="left", padx=(0, 8))
-        self.restore_button = ttk.Button(controls, text="恢复原节点", command=self.restore)
-        self.restore_button.pack(side="left")
-        self.settings_button = ttk.Button(controls, text="测速设置", command=self.open_settings)
-        self.settings_button.pack(side="right")
-        self.exit_button = ttk.Button(controls, text="退出程序", command=self.request_exit)
-        self.exit_button.pack(side="right", padx=(0, 8))
-
-        summary = ttk.Frame(container)
-        summary.grid(row=3, column=0, sticky="ew", pady=(0, 12))
-        summary.columnconfigure(0, weight=1)
         self.current = tk.StringVar(value="当前节点：等待代理客户端连接")
         self.health = tk.StringVar(value="控制接口：等待检测")
         self.timings = tk.StringVar(value="最近测速：—    下次测速：—    最近切换：—")
-        current_label = ttk.Label(summary, textvariable=self.current, wraplength=1010)
-        current_label.grid(row=0, column=0, sticky="w")
-        self.wrapping_labels.append(current_label)
-        ttk.Label(summary, textvariable=self.health, style="Muted.TLabel").grid(row=1, column=0, sticky="w", pady=(6, 0))
-        timing_label = ttk.Label(summary, textvariable=self.timings, style="Muted.TLabel", wraplength=1010)
-        timing_label.grid(row=2, column=0, sticky="w", pady=(6, 0))
-        self.wrapping_labels.append(timing_label)
+        for field in ("node_title", "node_meta", "connection_value", "node_count_value", "error_value",
+                      "scan_time_value", "switch_time_value", "next_scan_value", "update_time_value"):
+            setattr(self, field, tk.StringVar(value="—"))
+        self.node_title.set("等待代理客户端连接")
+        hero = ttk.Frame(container, style="Card.TFrame", padding=(18, 12))
+        hero.grid(row=1, column=0, sticky="ew", pady=(0, 12))
+        hero.columnconfigure(0, weight=1)
+        node = ttk.Frame(hero, style="Surface.TFrame")
+        node.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
+        ttk.Label(node, text="当前线路", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
+        node.columnconfigure(0, weight=1)
+        node_label = ttk.Label(node, textvariable=self.node_title, style="Node.TLabel", width=1, wraplength=600)
+        node_label.grid(row=1, column=0, sticky="ew", pady=(2, 4))
+        node_label.bind("<Configure>", lambda event: node_label.configure(wraplength=max(180, event.width)))
+        meta_label = ttk.Label(node, textvariable=self.node_meta, style="SurfaceMuted.TLabel", width=1, wraplength=600)
+        meta_label.grid(row=2, column=0, sticky="ew")
+        meta_label.bind("<Configure>", lambda event: meta_label.configure(wraplength=max(180, event.width)))
+        automatic = ttk.Frame(hero, style="Surface.TFrame")
+        automatic.grid(row=0, column=1, sticky="ne")
+        self.badge = tk.StringVar(value="正在读取状态")
+        self.badge_label = ttk.Label(automatic, textvariable=self.badge, style="Status.TLabel")
+        self.badge_label.pack(anchor="e", pady=(0, 13))
+        controls = ttk.Frame(automatic, style="Surface.TFrame")
+        controls.pack(anchor="e")
+        self.enable_button = ttk.Button(controls, text="启用优选", command=self.enable)
+        self.enable_button.pack(side="left", padx=(0, 8))
+        self.pause_button = ttk.Button(controls, text="暂停优选", command=self.pause)
+        self.pause_button.pack(side="left")
 
+        metrics = ttk.Frame(container)
+        metrics.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        for index, title, value, caption in (
+                (0, "控制接口", self.connection_value, self.scan_time_value),
+                (1, "可选节点", self.node_count_value, self.switch_time_value),
+                (2, "近期网络错误", self.error_value, self.update_time_value)):
+            metrics.columnconfigure(index, weight=1, uniform="metrics")
+            card = ttk.Frame(metrics, style="Card.TFrame", padding=(16, 9))
+            card.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 6, 0 if index == 2 else 6))
+            card.columnconfigure(0, weight=1)
+            ttk.Label(card, text=title, style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
+            ttk.Label(card, textvariable=value, style="Metric.TLabel").grid(row=0, column=1, sticky="e")
+            ttk.Label(card, textvariable=caption, style="SurfaceMuted.TLabel").grid(row=1, column=0, columnspan=2, sticky="w", pady=(3, 0))
+
+        table_card = ttk.Frame(container, style="Card.TFrame", padding=(16, 10))
+        table_card.grid(row=3, column=0, sticky="nsew")
+        table_card.columnconfigure(0, weight=1)
+        table_card.rowconfigure(2, weight=1)
+        table_heading = ttk.Frame(table_card, style="Surface.TFrame")
+        table_heading.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        table_heading.columnconfigure(0, weight=1)
+        ttk.Label(table_heading, text="节点列表", style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(table_heading, textvariable=self.next_scan_value, style="SurfaceMuted.TLabel").grid(row=0, column=1, padx=12)
+        self.restore_button = ttk.Button(table_heading, text="恢复原节点", command=self.restore)
+        self.restore_button.grid(row=0, column=2, padx=(0, 8))
+        self.scan_button = ttk.Button(table_heading, text="立即测速", command=self.scan, style="Primary.TButton")
+        self.scan_button.grid(row=0, column=3)
         self.message = tk.StringVar(value="服务正在启动，请稍候…")
-        message_label = ttk.Label(container, textvariable=self.message, wraplength=1010)
-        message_label.grid(row=4, column=0, sticky="ew", pady=(0, 10))
-        self.wrapping_labels.append(message_label)
+        message_label = ttk.Label(table_card, textvariable=self.message, style="SurfaceMuted.TLabel", width=1, wraplength=1000)
+        message_label.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        message_label.bind("<Configure>", lambda event: message_label.configure(wraplength=max(200, event.width)))
 
-        table_frame = ttk.Frame(container)
-        table_frame.grid(row=5, column=0, sticky="nsew")
+        table_frame = ttk.Frame(table_card, style="Surface.TFrame")
+        table_frame.grid(row=2, column=0, sticky="nsew")
         table_frame.columnconfigure(0, weight=1)
         table_frame.rowconfigure(0, weight=1)
         columns = ("name", "score", "median", "success", "jitter", "samples", "eligible")
-        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse")
+        self.table = ttk.Treeview(table_frame, columns=columns, show="headings", selectmode="browse", height=7)
         headings = ("节点", "综合分 / ms", "中位延迟 / ms", "成功率", "波动 / ms", "样本", "状态 / 原因")
-        widths = (240, 100, 110, 80, 90, 65, 210)
+        widths = (245, 100, 110, 80, 90, 60, 200)
         for key, title, width in zip(columns, headings, widths):
             self.table.heading(key, text=title)
             self.table.column(key, width=width, minwidth=55, anchor="w" if key in ("name", "eligible") else "center", stretch=key in ("name", "eligible"))
-        self.table.tag_configure("selected", background="#e5f1ff", foreground="#174b80")
-        self.table.tag_configure("unavailable", foreground="#8a919b")
+        self.table.tag_configure("selected", background="#edf4ff", foreground="#1d55a6")
+        self.table.tag_configure("unavailable", foreground="#91a0b5")
         self.table.grid(row=0, column=0, sticky="nsew")
         vertical = ttk.Scrollbar(table_frame, orient="vertical", command=self.table.yview)
         vertical.grid(row=0, column=1, sticky="ns")
@@ -1099,27 +1232,31 @@ class Dashboard:
         self.table.bind("<Double-1>", self.switch_clicked_node)
         self.table.bind("<Return>", self.switch_selected_node)
         self.table.bind("<Button-3>", self.show_node_menu)
+        table_footer = ttk.Frame(table_card, style="Surface.TFrame")
+        table_footer.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        table_footer.columnconfigure(0, weight=1)
+        ttk.Label(table_footer, text="HTTP 探测延迟 · 双击 / Enter / 右键切换节点 · 关闭窗口后在托盘运行", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
 
-        footer_label = ttk.Label(
-            container,
-            text="双击节点、按 Enter 或右键可手动切换；暂停自动优选时也可使用。延迟为 HTTP 线路探测结果。\n点击 × 收起到右下角托盘，双击托盘图标重新打开；退出程序会停止后台优选。",
-            style="Muted.TLabel", wraplength=1010,
-        )
-        footer_label.grid(row=6, column=0, sticky="ew", pady=(14, 0))
-        self.wrapping_labels.append(footer_label)
-        update_row = ttk.Frame(container)
-        update_row.grid(row=7, column=0, sticky="ew", pady=(8, 0))
-        update_row.columnconfigure(0, weight=1)
+        footer = ttk.Frame(container)
+        footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
+        footer.columnconfigure(0, weight=1)
         self.update_text = tk.StringVar(value=f"版本 {updater.current_version(root=ROOT)}")
         if self.update_release is not None:
-            action = "查看并安装" if self.update_can_install else "查看更新说明"
-            self.update_text.set(f"发现新版本 {self.update_release.version}，点击“版本与更新”{action}。")
-        self.update_label = ttk.Label(update_row, textvariable=self.update_text, style="Muted.TLabel", wraplength=790)
-        self.update_label.grid(row=0, column=0, sticky="w")
-        self.wrapping_labels.append(self.update_label)
-        self.update_button = ttk.Button(update_row, text="版本与更新", command=self.open_updates)
-        self.update_button.grid(row=0, column=1, sticky="e")
-        container.bind("<Configure>", self.resize_text)
+            self.update_text.set(f"发现新版本 {self.update_release.version}，可在“版本与更新”中查看。")
+        self.update_label = ttk.Label(footer, textvariable=self.update_text, style="Muted.TLabel", wraplength=650, width=1)
+        self.update_label.grid(row=0, column=0, sticky="ew")
+        self.update_label.bind("<Configure>", lambda event: self.update_label.configure(wraplength=max(200, event.width)))
+        self.policy = tk.StringVar(value="正在读取测速设置…")
+        self.policy_button = ttk.Button(footer, text="测速策略", style="Quiet.TButton", command=self.toggle_policy)
+        self.policy_button.grid(row=0, column=1, padx=(8, 0))
+        self.update_button = ttk.Button(footer, text="版本与更新", command=self.open_updates, style="Quiet.TButton")
+        self.update_button.grid(row=0, column=2, padx=(4, 0))
+        self.exit_button = ttk.Button(footer, text="退出程序", command=self.request_exit, style="Quiet.TButton")
+        self.exit_button.grid(row=0, column=3, padx=(4, 0))
+        self.policy_label = ttk.Label(footer, textvariable=self.policy, style="Muted.TLabel", wraplength=1000, width=1)
+        self.policy_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.policy_label.grid_remove()
+        self.policy_label.bind("<Configure>", lambda event: self.policy_label.configure(wraplength=max(200, event.width)))
         try:
             if start_service:
                 self.service_after_id = root.after(100, self.ensure_service)
@@ -1311,9 +1448,13 @@ class Dashboard:
                 self.update_auto_install_attempted = release.tag
                 self.begin_update_install()
 
-    def resize_text(self, event: tk.Event) -> None:
-        for label in self.wrapping_labels:
-            label.configure(wraplength=max(400, event.width - 48))
+    def toggle_policy(self):
+        if self.policy_label.winfo_ismapped():
+            self.policy_label.grid_remove()
+            self.policy_button.configure(text="测速策略")
+        else:
+            self.policy_label.grid()
+            self.policy_button.configure(text="收起策略")
 
     def ensure_service(self) -> bool:
         if self.closed or self.exiting or self.restore_busy or getattr(self, "client_busy", False):
@@ -1348,6 +1489,12 @@ class Dashboard:
             self.render_nodes("—", [])
             self.current.set("当前节点：等待客户端状态")
             self.health.set("控制接口：等待检测")
+            self.node_title.set("等待客户端状态")
+            self.node_meta.set("连接后显示当前线路")
+            self.connection_value.set("等待检测")
+            for field in ("node_count_value", "error_value", "scan_time_value", "switch_time_value",
+                          "next_scan_value", "update_time_value"):
+                getattr(self, field).set("—")
         self.policy.set(policy_summary(saved))
         message = ("客户端连接已保存，自动优选保持暂停。可点击“立即测速”检查，再启用自动优选。"
                    if not saved["enabled"] else "客户端连接设置已保存，原有优选开关保持。")
@@ -1640,12 +1787,15 @@ class Dashboard:
         else:
             badge, color = "自动优选已启用", "#267042"
         self.badge.set(badge)
-        self.badge_label.configure(foreground=color)
+        tint = "#eaf6ef" if color == "#267042" else "#fff5df" if color == "#8b6508" else "#eaf2ff"
+        self.badge_label.configure(foreground=color, background=tint)
         selected = str(status.get("selected") or "—")
         group = str(status.get("group") or "—")
         last_known = stale or stopped or starting or status.get("controller_available") is False
         node_label = "上次记录节点" if last_known else "当前节点"
         self.current.set(f"{node_label}：{selected}    代理组：{group}")
+        self.node_title.set(selected if selected != "—" else "等待代理客户端连接")
+        self.node_meta.set(f"{node_label}  ·  代理组：{group}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
         try:
             scores_match = status.get("nodes_probe_identity") == core.probe_identity(core.validate_config(config))
@@ -1658,6 +1808,13 @@ class Dashboard:
         errors = status.get("network_errors_recent", 0)
         connection_label = "状态待更新" if stale or stopped or starting else ("已连接" if connected else "未连接")
         self.health.set(f"控制接口：{connection_label}    最近网络错误：{errors}    可选节点：{usable} / {len(nodes)}")
+        self.connection_value.set(connection_label)
+        self.node_count_value.set(f"{usable} / {len(nodes)}")
+        self.error_value.set(str(errors))
+        self.scan_time_value.set("最近测速  " + display_time(status.get("last_scan_at") if scores_match else None))
+        self.switch_time_value.set("最近切换  " + display_time(status.get("last_switch_at")))
+        self.next_scan_value.set("下次测速  " + display_time(status.get("next_scan_at")))
+        self.update_time_value.set("状态更新  " + display_time(status.get("updated_at")))
         self.timings.set(
             f"最近测速：{display_time(status.get('last_scan_at') if scores_match else None)}    "
             f"下次测速：{display_time(status.get('next_scan_at'))}    "

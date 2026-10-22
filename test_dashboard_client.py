@@ -259,7 +259,10 @@ class ClientContextTests(unittest.TestCase):
         self.app.manual_request_name = ""
         self.app.manual_request_started = self.app.started_at = self.app.notice_until = 0
         self.app.node_signature = "old nodes"
-        for field in ("current", "health", "policy", "timings", "message", "badge", "badge_label", "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button", "client_button"):
+        for field in ("current", "health", "policy", "timings", "message", "badge", "badge_label",
+                      "node_title", "node_meta", "connection_value", "node_count_value", "error_value",
+                      "scan_time_value", "switch_time_value", "next_scan_value", "update_time_value",
+                      "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button", "client_button"):
             setattr(self.app, field, Mock())
         self.app.notify = Mock()
         self.app.render_nodes = Mock()
@@ -371,6 +374,9 @@ class ClientContextTests(unittest.TestCase):
         self.assertIsNone(self.app.node_context)
         self.assertIsNone(self.app.node_mode)
         self.app.render_nodes.assert_called_once_with("—", [])
+        self.app.node_title.set.assert_called_with("等待客户端状态")
+        self.app.connection_value.set.assert_called_with("等待检测")
+        self.app.node_count_value.set.assert_called_with("—")
         self.app.ensure_service.assert_not_called()
         self.assertIn("立即测速", self.app.notify.call_args.args[0])
 

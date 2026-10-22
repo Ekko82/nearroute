@@ -312,6 +312,8 @@ class StatusFreshnessTests(unittest.TestCase):
         self.app.notice_until = 0
         self.app.started_at = 0
         for name in ("policy", "badge", "badge_label", "current", "health", "timings", "message",
+                     "node_title", "node_meta", "connection_value", "node_count_value", "error_value",
+                     "scan_time_value", "switch_time_value", "next_scan_value", "update_time_value",
                      "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button", "client_button"):
             setattr(self.app, name, Mock())
         self.app.render_nodes = Mock()

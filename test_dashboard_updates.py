@@ -537,6 +537,7 @@ class UpdateDialogLayoutTests(unittest.TestCase):
         try:
             root = tk.Tk()
             root.withdraw()
+            dashboard.apply_theme(root)
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
         original_toplevel = tk.Toplevel
@@ -573,13 +574,16 @@ class UpdateDialogLayoutTests(unittest.TestCase):
                 collect(dialog.window)
                 buttons = [widget for widget in widgets if widget.winfo_class() == "TButton"]
                 diagnostic = next(button for button in buttons if button.cget("text") == "诊断信息")
-                self.assertEqual(diagnostic.grid_info()["row"], 7)
+                self.assertEqual(diagnostic.master, dialog.install_button.master)
                 for widget in widgets:
                     if widget.winfo_class() == "TRadiobutton":
                         self.assertFalse(widget.instate(["disabled"]))
                 # Allocate a transparent test window without showing its withdrawn owner.
                 dialog.window.transient("")
-                for width, height in ((660, 530), (520, 420)):
+                dialog.window.deiconify()
+                root.update()
+                default_size = tuple(map(int, dialog.window.geometry().split("+", 1)[0].split("x")))
+                for width, height in (default_size, dialog.window.minsize()):
                     dialog.window.geometry(f"{width}x{height}")
                     dialog.window.deiconify()
                     root.update()
@@ -592,6 +596,7 @@ class UpdateDialogLayoutTests(unittest.TestCase):
                         self.assertGreaterEqual(y, 0)
                         self.assertLessEqual(x + button.winfo_width(), width)
                         self.assertLessEqual(y + button.winfo_height(), height)
+                    self.assertGreaterEqual(dialog.notes.winfo_height(), 64)
         finally:
             if dialog is not None:
                 dialog.close()
