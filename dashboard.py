@@ -294,13 +294,14 @@ def status_is_stale(status: dict) -> bool:
         return True
 
 
-def diagnostic_summary(root=None) -> str:
+def diagnostic_summary(root=None, *, event_times=None) -> str:
     """Build a shareable whitelist from local records without changing the installation."""
     root = ROOT if root is None else Path(root)
 
     def document(name):
         try:
-            return "ok", read_json(root / name)
+            value = read_json(root / name)
+            return ("ok", value) if isinstance(value, dict) else ("invalid", {})
         except FileNotFoundError:
             return "missing", {}
         except (ValueError, UnicodeError):
@@ -325,6 +326,13 @@ def diagnostic_summary(root=None) -> str:
             return value
         except (ValueError, updater.UpdateError):
             return None
+
+    error_times = []
+    if isinstance(event_times, (list, tuple)):
+        for value in event_times[:20]:
+            at = timestamp(value)
+            if at is not None:
+                error_times.append(datetime.fromisoformat(at))
 
     version, version_file = None, "ok"
     try:
@@ -382,9 +390,11 @@ def diagnostic_summary(root=None) -> str:
     }
     event_types = {"started", "stopped", "manual_selection", "external_selection_change", "switched", "rollback",
                    "selection_changed_during_validation", "candidate_rejected", "scan_completed", "restore", "error"}
-    event_files, events = {}, []
+    event_files, events, near_events = {}, [], []
+    near_events_truncated = False
     for name in ("events.jsonl", "events.previous.jsonl"):
-        if name == "events.previous.jsonl" and len(events) >= 8:
+        recent_needed = name == "events.jsonl" or len(events) < 8
+        if not recent_needed and not error_times:
             event_files[name] = "not_needed"
             continue
         try:
@@ -398,13 +408,28 @@ def diagnostic_summary(root=None) -> str:
                         continue
                     at = timestamp(item.get("at"))
                     if at is not None:
-                        events.append({"type": item["event"], "time": at})
+                        event = {"type": item["event"], "time": at}
+                        if recent_needed:
+                            events.append(event)
+                        moment = datetime.fromisoformat(at)
+                        # Rotation can expose the same sanitized event in both files.
+                        if (any(abs((moment - error_time).total_seconds()) <= 120 for error_time in error_times)
+                                and event not in near_events):
+                            near_events.append(event)
+                            if len(near_events) > 256:
+                                near_events.sort(key=lambda row: datetime.fromisoformat(row["time"]))
+                                del near_events[:-256]
+                                near_events_truncated = True
             event_files[name] = "ok"
         except FileNotFoundError:
             event_files[name] = "missing"
         except OSError:
             event_files[name] = "unreadable"
     events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
+    event_summary = {"files": event_files, "installation_recent_events": events[-8:]}
+    if event_times is not None:
+        near_events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
+        event_summary.update(near_error_events=near_events, near_error_events_truncated=near_events_truncated)
     if os.name == "nt":
         system_name = "Windows"
         system_version = ".".join(str(value) for value in sys.getwindowsversion()[:3])
@@ -420,7 +445,7 @@ def diagnostic_summary(root=None) -> str:
             "helper_matches_installed": helper_version == version if current and helper_version is not None and version is not None else None,
         },
         "config": config, "status": status,
-        "events": {"files": event_files, "installation_recent_events": events[-8:]},
+        "events": event_summary,
     }, ensure_ascii=False, indent=2)
 
 
@@ -1086,14 +1111,16 @@ class DiagnosticDialog:
                 result = {"state": "unreadable", "window_seconds": 7200, "error_count": 0,
                           "errors": [], "transports": [], "truncated": False}
             result["source"] = source
-            results.put(result)
+            snapshot = diagnostic_summary(event_times=[error["at"] for error in result["errors"]])
+            results.put((snapshot, result))
 
         try:
             threading.Thread(target=work, daemon=True).start()
         except RuntimeError:
-            source = "configured" if json.loads(self.summary)["config"].get("codex_log_configured") else "default"
-            results.put({"state": "unreadable", "window_seconds": 7200, "error_count": 0,
-                         "errors": [], "transports": [], "truncated": False, "source": source})
+            snapshot = diagnostic_summary(event_times=[])
+            source = "configured" if json.loads(snapshot)["config"].get("codex_log_configured") else "default"
+            results.put((snapshot, {"state": "unreadable", "window_seconds": 7200, "error_count": 0,
+                                    "errors": [], "transports": [], "truncated": False, "source": source}))
         self.after_id = self.window.after(100, self.poll_codex_summary)
 
     def poll_codex_summary(self):
@@ -1101,14 +1128,14 @@ class DiagnosticDialog:
         if self.closed:
             return
         try:
-            result = self.results.get_nowait()
+            snapshot, result = self.results.get_nowait()
         except queue.Empty:
             self.after_id = self.window.after(100, self.poll_codex_summary)
             return
         self.reading_codex = False
         self.codex_button.state(["!disabled"])
-        summary = json.loads(self.summary)
-        events = summary["events"]["installation_recent_events"]
+        summary = json.loads(snapshot)
+        events = summary["events"].get("near_error_events", [])
         for error in result["errors"]:
             at = datetime.fromisoformat(error["at"])
             nearby = []
@@ -1119,13 +1146,14 @@ class DiagnosticDialog:
             error["nearby_events"] = nearby
         summary["codex_connection"] = result
         self.summary = json.dumps(summary, ensure_ascii=False, indent=2)
+        self.version_note.set(self.runtime_note(summary))
         self.text.configure(state="normal")
         self.text.delete("1.0", "end")
         self.text.insert("1.0", self.summary)
         self.text.configure(state="disabled")
         self.copy_message.set("")
         messages = {
-            "ok": "已读取。仅对照当前摘要已有助手事件，不能据此判断原因或重试结果。",
+            "ok": "已读取并刷新近舟状态。已对照错误前后的本地事件，不能据此判断原因或重试结果。",
             "not_configured": "未配置日志路径，未读取 Codex 日志。",
             "missing": "本机日志暂不存在。",
             "busy": "日志正忙，请稍后重试。",
@@ -1135,6 +1163,8 @@ class DiagnosticDialog:
         message = messages[result["state"]]
         if result["truncated"]:
             message += " 摘要已截断；错误数仅为已读取范围内的观察数，不代表近 2 小时完整错误数或最终失败数。"
+        if summary["events"].get("near_error_events_truncated"):
+            message += " 近舟事件对照已截断。"
         self.codex_message.set(message)
 
     def copy_summary(self):

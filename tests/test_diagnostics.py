@@ -326,6 +326,78 @@ class DiagnosticDialogTests(unittest.TestCase):
             dialog.copy_summary()
         append.assert_called_once_with(dialog.summary)
 
+    def test_each_explicit_read_refreshes_local_snapshot_and_replaces_previous_report(self):
+        fixture, dialog = self.make_dialog()
+        workers = []
+
+        def thread(**kwargs):
+            workers.append(kwargs["target"])
+            return Mock()
+
+        with patch.object(dashboard.threading, "Thread", side_effect=thread), \
+             patch.object(optimizer, "codex_connection_summary") as connection:
+            for index, (version, region, kind) in enumerate((
+                    ("0.2.224", "SG", "decode"), ("0.2.225", "HK", "websocket"))):
+                with self.subTest(read=index + 1):
+                    previous_summary, previous_note = dialog.summary, dialog.version_note.get()
+                    dialog.codex_button.invoke()
+                    self.assertEqual(len(workers), 1)
+                    message_while_reading = dialog.codex_message.get()
+
+                    # Changes after the click must be captured when the delayed worker reads.
+                    event_at = (fixture.now - timedelta(minutes=20 - index * 5)).isoformat()
+                    error_at = (datetime.fromisoformat(event_at) + timedelta(seconds=1)).isoformat()
+                    fixture.write("VERSION", version + "\n")
+                    fixture.cfg["scan_regions"] = [region]
+                    fixture.write("config.json", fixture.cfg)
+                    fixture.status.update(runtime_version=version, network_errors_recent=index + 8,
+                                          last_switch_at=event_at)
+                    fixture.write("state/status.json", fixture.status)
+                    recorded_events = [{
+                        "event": "switched", "at": event_at, "selected": "NODE_NAME_MARKER",
+                        "metadata": {"secret": "EVENT_METADATA_MARKER"},
+                    }] + [{"event": "scan_completed", "at": (fixture.now - timedelta(minutes=5)
+                                                            + timedelta(seconds=offset)).isoformat()}
+                          for offset in range(10)]
+                    fixture.write("state/events.jsonl", "\n".join(json.dumps(row) for row in recorded_events) + "\n")
+                    before_files = fixture.files()
+                    connection.return_value = self.connection_result([{
+                        "at": error_at, "kind": kind, "retry": 1,
+                        "max_retries": 5, "retry_wait_ms": 200,
+                    }])
+                    workers.pop()()
+                    self.assertEqual(dialog.summary, previous_summary)
+                    self.assertEqual(dialog.text.get("1.0", "end-1c"), previous_summary)
+                    self.assertEqual(dialog.version_note.get(), previous_note)
+                    self.assertEqual(dialog.codex_message.get(), message_while_reading)
+                    self.assertTrue(dialog.reading_codex)
+                    self.assertIn("disabled", dialog.codex_button.state())
+                    self.receive_summary(dialog)
+
+                    summary = json.loads(dialog.summary)
+                    self.assertEqual(summary["installed_version"], version)
+                    self.assertEqual(summary["config"]["scan_regions"], [region])
+                    self.assertEqual(summary["status"]["helper_runtime_version"], version)
+                    self.assertEqual(summary["status"]["network_errors_recent"], index + 8)
+                    event = {"type": "switched", "time": event_at}
+                    self.assertNotIn(event, summary["events"]["installation_recent_events"])
+                    self.assertEqual(len(summary["events"]["installation_recent_events"]), 8)
+                    self.assertEqual(summary["events"]["near_error_events"], [event])
+                    report = summary["codex_connection"]
+                    self.assertEqual(report["error_count"], 1)
+                    self.assertEqual(len(report["errors"]), 1)
+                    self.assertEqual(report["errors"][0]["kind"], kind)
+                    self.assertEqual(report["errors"][0]["nearby_events"], [
+                        {**event, "seconds_from_event": 1.0},
+                    ])
+                    self.assertEqual(dialog.version_note.get(), dialog.runtime_note(summary))
+                    self.assertNotEqual(dialog.version_note.get(), previous_note)
+                    self.assertNotIn("disabled", dialog.codex_button.state())
+                    self.assertEqual(fixture.files(), before_files)
+                    for marker in fixture.markers:
+                        self.assertNotIn(marker, dialog.summary)
+            self.assertEqual(connection.call_count, 2)
+
     def test_default_path_is_resolved_only_after_click_and_respects_codex_home(self):
         for codex_home in ("", r"C:\ENV_USER_MARKER\codex-private"):
             with self.subTest(codex_home=codex_home), \
@@ -396,7 +468,7 @@ class DiagnosticDialogTests(unittest.TestCase):
         self.assertNotIn("disabled", dialog.codex_button.state())
         result = self.connection_result()
         result.update(truncated=True, source="configured")
-        dialog.results.put(result)
+        dialog.results.put((dashboard.diagnostic_summary(fixture.root), result))
         self.receive_summary(dialog)
         self.assertIn("摘要已截断", dialog.codex_message.get())
         self.assertIn("已读取范围内的观察数", dialog.codex_message.get())
