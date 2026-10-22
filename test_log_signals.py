@@ -19,6 +19,8 @@ DECODE = "error decoding response body"
 WS_CLOSE = "stream disconnected before completion: websocket closed by server before response.completed"
 RESET_ZH = "stream disconnected before completion: IO error: 远程主机强迫关闭了一个现有的连接。 (os error 10054)"
 RESET_EN = "stream disconnected before completion: IO error: An existing connection was forcibly closed by the remote host. (os error 10054)"
+TLS_EOF = "stream disconnected before completion: tls handshake eof"
+COMPACT_DECODE = "stream disconnected before completion: Transport error: network error: error decoding response body"
 
 
 def body(kind=SEND, turn=TURN_A, retry=1, endpoint=ENDPOINT):
@@ -28,6 +30,12 @@ def body(kind=SEND, turn=TURN_A, retry=1, endpoint=ENDPOINT):
 def sampling_retry(error):
     return ("stream disconnected - retrying sampling request (1/1 in 204ms)... "
             f"turn_id={TURN_A} retries=1 max_retries=1 sampling_error={error}")
+
+
+def compact_retry(error=COMPACT_DECODE):
+    # Source-derived RemoteCompactionV2 log shape, not a captured SQLite row.
+    return ("remote compaction v2 stream failed; retrying request after delay "
+            f"turn_id={TURN_A} retries=1 max_retries=1 compact_error={error}")
 
 
 class LogSignalsTests(unittest.TestCase):
@@ -88,22 +96,31 @@ class LogSignalsTests(unittest.TestCase):
         self.assertEqual(self.signals.poll(), 4)
         self.assertEqual(self.signals.last_new_error_at, 1000)
 
-    def test_sampling_websocket_close_and_windows_reset_are_new_transport_signals(self):
+    def test_sampling_websocket_close_windows_reset_and_tls_eof_are_new_transport_signals(self):
         self.prime()
-        for offset, error in enumerate((WS_CLOSE, RESET_ZH, RESET_EN)):
+        for offset, error in enumerate((WS_CLOSE, RESET_ZH, RESET_EN, TLS_EOF)):
             text = sampling_retry(error)
             if offset == 0:
                 text = text.replace("sampling_error", "\x1b[3msampling_error\x1b[0m")
             self.insert(text, stamp=1000 + offset)
-        self.clock.return_value = 1002
+        self.clock.return_value = 1003
 
-        self.assertEqual(self.signals.poll(), 3)
-        self.assertEqual(self.signals.last_new_error_at, 1002)
+        self.assertEqual(self.signals.poll(), 4)
+        self.assertEqual(self.signals.last_new_error_at, 1003)
         self.clock.return_value = 1007
-        self.assertEqual(self.signals.poll(), 3)
+        self.assertEqual(self.signals.poll(), 4)
         self.assertIsNone(self.signals.last_new_error_at, "a quiet poll must not extend recovery")
-        for error in (WS_CLOSE, RESET_ZH, RESET_EN):
+        for error in (WS_CLOSE, RESET_ZH, RESET_EN, TLS_EOF):
             self.assertNotIn(error, repr(vars(self.signals)))
+
+    def test_source_derived_compact_decode_uses_existing_transport_signal(self):
+        self.prime()
+        self.insert(compact_retry())
+        self.assertEqual(self.signals.poll(), 1)
+        self.assertEqual(self.signals.last_new_error_at, 1000)
+        self.clock.return_value = 1005
+        self.assertEqual(self.signals.poll(), 1)
+        self.assertIsNone(self.signals.last_new_error_at)
 
     def test_sampling_transport_signals_require_the_actual_error_field_and_source(self):
         cases = [
@@ -122,6 +139,12 @@ class LogSignalsTests(unittest.TestCase):
             ("reset in another field", sampling_retry("stream disconnected before completion: IO error: closed")
              + ' other_error="(os error 10054)"', RETRY),
             ("unrelated HTTP endpoint", body(endpoint="https://example.org/health") + " " + WS_CLOSE, CLIENT),
+            ("TLS quoted in authentication body", sampling_retry('authentication failed 401: "' + TLS_EOF + '"'), RETRY),
+            ("TLS in second error field", sampling_retry("unexpected status 503 Service Unavailable sampling_error=" + TLS_EOF), RETRY),
+            ("TLS from another logger", sampling_retry(TLS_EOF), "user_transcript"),
+            ("TLS in another field", sampling_retry("stream disconnected before completion: unrelated failure")
+             + ' other_error="' + TLS_EOF + '"', RETRY),
+            ("TLS without retry template", "sampling_error=" + TLS_EOF, RETRY),
         ]
         for label, text, target in cases:
             with self.subTest(case=label):
@@ -132,16 +155,16 @@ class LogSignalsTests(unittest.TestCase):
                 self.assertIsNone(signals.last_new_error_at)
 
     def test_wrapped_stream_errors_keep_existing_send_decode_pairing(self):
-        for legacy in (SEND, DECODE):
-            with self.subTest(kind=legacy):
+        for legacy, inner in ((legacy, inner) for legacy in (SEND, DECODE) for inner in (WS_CLOSE, TLS_EOF)):
+            with self.subTest(kind=legacy, inner=inner):
                 signals = optimizer.LogSignals(str(self.path))
                 self.assertEqual(signals.poll(), 0)
                 # A client send can include an inner decoding failure; keep the
-                # existing classification before considering the new WS suffix.
+                # existing classification before considering the inner error.
                 client_error = SEND if legacy == SEND else SEND + ": " + DECODE
                 self.insert(body(client_error), target=CLIENT)
                 self.assertEqual(signals.poll(), 1)
-                self.insert(sampling_retry(legacy + ": " + WS_CLOSE), stamp=1001)
+                self.insert(sampling_retry(legacy + ": " + inner), stamp=1001)
                 self.clock.return_value = 1001
                 self.assertEqual(signals.poll(), 1)
                 self.assertIsNone(signals.last_new_error_at)

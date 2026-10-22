@@ -886,6 +886,8 @@ class LogSignals:
         error = re.split(r'\s+[A-Za-z_][A-Za-z_0-9]*\s*=', body[field.end():], maxsplit=1)[0]
         error = error.strip().strip('\"\'')
         prefix = "stream disconnected before completion: "
+        if error == prefix + "tls handshake eof":
+            return "tls"
         if error == prefix + "websocket closed by server before response.completed":
             return "websocket"
         if error.startswith(prefix + "IO error: ") and error.endswith("(os error 10054)"):
@@ -914,7 +916,8 @@ class LogSignals:
                      OR (target='codex_http_client::client' AND feedback_log_body LIKE '%error sending request%')
                      OR (target='codex_core::responses_retry' AND
                          (feedback_log_body LIKE '%websocket closed by server before response.completed%'
-                          OR feedback_log_body LIKE '%(os error 10054)%')))
+                          OR feedback_log_body LIKE '%(os error 10054)%'
+                          OR feedback_log_body LIKE '%tls handshake eof%')))
                     ORDER BY id""", (self.last_id, highest)).fetchall()
                 for stamp, process, thread, target, raw in rows:
                     body = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw or '')

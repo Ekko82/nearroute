@@ -1,4 +1,4 @@
-"""Observed Codex retry logs drive recovery scheduling without network traffic."""
+"""Observed and source-derived Codex retry logs drive recovery without network traffic."""
 
 import unittest
 from unittest.mock import patch
@@ -9,9 +9,12 @@ import test_runtime
 
 
 class StreamRecoveryTests(unittest.TestCase):
-    def test_real_retry_rows_defer_measurement_and_switch_until_recovery_expires(self):
-        for error in (test_log_signals.WS_CLOSE, test_log_signals.RESET_ZH):
-            with self.subTest(error=error):
+    def test_retry_rows_defer_measurement_and_switch_until_recovery_expires(self):
+        rows = [test_log_signals.sampling_retry(error) for error in
+                (test_log_signals.WS_CLOSE, test_log_signals.RESET_ZH, test_log_signals.TLS_EOF)]
+        rows.append(test_log_signals.compact_retry())
+        for row in rows:
+            with self.subTest(row=row):
                 logs = test_log_signals.LogSignalsTests()
                 runtime = test_runtime.RuntimeTests()
                 try:
@@ -25,7 +28,7 @@ class StreamRecoveryTests(unittest.TestCase):
                     runtime.helper.cfg["codex_log_db"] = str(logs.path)
                     runtime.helper.signals = logs.signals
                     logs.prime()
-                    logs.insert(test_log_signals.sampling_retry(error))
+                    logs.insert(row)
                     runtime.helper.poll_transport_signals(force=True)
 
                     clock[0] = 1010.0
