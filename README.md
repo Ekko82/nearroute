@@ -176,8 +176,6 @@ Mihomo 的测速接口可能只报告耗时，无法保证 HTTP 状态符合预�
 
 公开仓库只提交源码、测试、样例配置和文档。不要提交或打包 `config.json`、`state/`、个人诊断脚本、订阅或凭据。`.gitignore` 不会移除已经跟踪的文件，发布前应检查实际提交内容。
 
-发布新版本时，先更新 `VERSION` 中的 `X.Y.Z` 和 `RELEASE_NOTES.md` 中的本次更新说明并提交，再推送匹配的 `vX.Y.Z` 标签。Release 工作流通过 Windows / Ubuntu 的六组测试后，生成白名单 ZIP 和 `nearroute-update.json` 校验清单，上传完整草稿再发布。应用只跟随正式 Release，不跟随每次 `main` 提交。维护者也可在 GitHub Release 中编辑面向用户的更新说明。
-
 ## 命令与卸载
 
 ```powershell
@@ -196,16 +194,6 @@ python -B optimizer.py restore
 
 ## 开发与许可
 
-```powershell
-python -B -m unittest discover -v
-```
-
-测试使用模拟控制器，不发送真实代理请求或切换节点。CI 在 Ubuntu 和 Windows 上测试 Python 3.10、3.12、3.13；没有图形显示时 Tk 窗口测试应跳过。Windows 安装、单实例锁和登录启动集成需在 Windows 上验证。
-
-Windows 隔离安装测试可设置 `NEARROUTE_INSTALL_SMOKE=1` 后运行 `python -B -m unittest test_install_lifecycle -v`。测试使用临时目录、临时注册表键和模拟后台，不修改实际桌面、登录启动项或代理节点；CI 的 Windows/Python 3.12 作业也运行这组检查。
-
-Windows 真实托盘测试可设置 `NEARROUTE_TRAY_SMOKE=1` 后运行 `python -B -m unittest test_tray_icon.WindowsTraySmokeTests -v`，需要可用的桌面会话与系统托盘。测试只创建唯一命名的临时图标，检查原生图标尺寸、透明像素、唤回消息、重建及退出资源回收，不操作现有近舟窗口或重启资源管理器。这项检查默认跳过，不包含在常规离线 CI 中。
-
-图标源和生成文件在 `assets/`。需要修改图标时，安装 Pillow 后运行 `python tools/build_icon.py`；预览输出到已忽略的 `state/icon-preview/`。普通运行直接使用仓库中的 ICO，无需 Pillow。
+源码和启动脚本保留在根目录，测试集中在 `tests/`，构建工具在 `tools/`，开发文档在 `docs/`。[开发指南](https://github.com/Ekko82/nearroute/blob/main/docs/DEVELOPMENT.md)包含完整目录说明、测试命令和发版流程。
 
 MIT License，见 [LICENSE](LICENSE)。欢迎贡献脱敏的复现步骤、离线测试和兼容性改进。

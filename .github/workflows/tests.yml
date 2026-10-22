@@ -33,4 +33,4 @@ jobs:
         if: matrix.os == 'windows-latest' && matrix.python == '3.12'
         env:
           NEARROUTE_INSTALL_SMOKE: '1'
-        run: python -B -m unittest test_install_lifecycle -v
+        run: python -B -m unittest tests.test_install_lifecycle -v
