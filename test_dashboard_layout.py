@@ -102,8 +102,16 @@ class DashboardLayoutTests(unittest.TestCase):
         for width, height, minimum_rows in ((1120, 780, 8), (920, 650, 4)):
             with self.subTest(size=(width, height)):
                 self.arrange(width, height)
-                self.assertEqual((self.root.winfo_width(), self.root.winfo_height()), (width, height))
-                self.assert_layout(minimum_rows * row_height)
+                actual_width, actual_height = self.root.winfo_width(), self.root.winfo_height()
+                minimum_width, minimum_height = self.root.minsize()
+                self.assertGreaterEqual(actual_width, minimum_width)
+                self.assertGreaterEqual(actual_height, minimum_height)
+                self.assertLessEqual(actual_width, width)
+                self.assertLessEqual(actual_height, height)
+                # The desktop can constrain a requested window on a smaller screen.
+                # Check the same controls and usable table within its realized size.
+                height_reduction = height - actual_height
+                self.assert_layout(max(4 * row_height, minimum_rows * row_height - height_reduction))
         self.app.policy_button.invoke()
         self.root.update()
         self.assertTrue(self.app.policy_label.winfo_ismapped())
