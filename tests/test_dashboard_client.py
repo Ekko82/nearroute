@@ -420,7 +420,7 @@ class ClientContextTests(unittest.TestCase):
         self.app.manual_request_name = ""
         self.app.manual_request_started = self.app.started_at = self.app.notice_until = 0
         self.app.node_signature = "old nodes"
-        for field in ("current", "health", "policy", "timings", "message", "badge", "badge_label",
+        for field in ("current", "health", "policy", "timings", "message", "badge", "badge_label", "runtime_text", "runtime_label",
                       "node_title", "node_meta", "connection_value", "node_count_value", "error_value",
                       "scan_time_value", "switch_time_value", "next_scan_value", "update_time_value",
                       "enable_button", "pause_button", "scan_button", "settings_button", "restore_button", "exit_button", "client_button"):

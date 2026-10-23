@@ -52,6 +52,7 @@ def apply_theme(root):
     style.configure("TLabel", background=background, foreground=ink)
     style.configure("Surface.TLabel", background=surface)
     style.configure("Muted.TLabel", foreground=muted)
+    style.configure("RuntimeWarning.TLabel", background="#fff5df", foreground="#8b6508", padding=(10, 6))
     style.configure("SurfaceMuted.TLabel", background=surface, foreground=muted, font=("Microsoft YaHei UI", 9))
     style.configure("Title.TLabel", font=("Microsoft YaHei UI", 21, "bold"), foreground=ink)
     style.configure("Section.TLabel", background=surface, font=("Microsoft YaHei UI", 11, "bold"))
@@ -294,6 +295,35 @@ def status_is_stale(status: dict) -> bool:
         return True
 
 
+def runtime_version(value):
+    try:
+        updater.version_tuple(value)
+        return value
+    except (ValueError, updater.UpdateError):
+        return None
+
+
+def runtime_version_notice(status, *, installed_version, gui_version):
+    installed = runtime_version(installed_version)
+    if installed is None:
+        return "安装版本无法读取，请在“版本与更新 → 诊断信息”中检查。"
+    gui = runtime_version(gui_version)
+    differences = []
+    if gui != installed:
+        differences.append(f"窗口仍运行 {gui}" if gui is not None else "窗口版本未知")
+    phase = status.get("phase")
+    if (status.get("pid") and isinstance(phase, str)
+            and phase in {"monitoring", "paused", "waiting", "scanning", "testing", "measuring", "verifying", "error"}
+            and not status_is_stale(status)):
+        helper = runtime_version(status.get("runtime_version"))
+        if helper != installed:
+            differences.append(f"后台仍运行 {helper}" if helper is not None else "后台版本未知")
+    if not differences:
+        return ""
+    return (f"已安装 {installed}；" + "；".join(differences)
+            + "。请点击“退出程序”后重新打开；× 仅收起到托盘。")
+
+
 def diagnostic_summary(root=None, *, event_times=None) -> str:
     """Build a shareable whitelist from local records without changing the installation."""
     root = ROOT if root is None else Path(root)
@@ -318,13 +348,6 @@ def diagnostic_summary(root=None, *, event_times=None) -> str:
                 parsed = parsed.replace(tzinfo=CHINA_TIME)
             return parsed.isoformat()
         except ValueError:
-            return None
-
-    def runtime_version(value):
-        try:
-            updater.version_tuple(value)
-            return value
-        except (ValueError, updater.UpdateError):
             return None
 
     error_times = []
@@ -1463,7 +1486,7 @@ class Dashboard:
         footer = ttk.Frame(container)
         footer.grid(row=4, column=0, sticky="ew", pady=(8, 0))
         footer.columnconfigure(0, weight=1)
-        self.update_text = tk.StringVar(value=f"版本 {updater.current_version(root=ROOT)}")
+        self.update_text = tk.StringVar(value=f"窗口版本 {core.RUNTIME_VERSION or '未知'}")
         if self.update_release is not None:
             self.update_text.set(f"发现新版本 {self.update_release.version}，可在“版本与更新”中查看。")
         self.update_label = ttk.Label(footer, textvariable=self.update_text, style="Muted.TLabel", wraplength=650, width=1)
@@ -1476,8 +1499,13 @@ class Dashboard:
         self.update_button.grid(row=0, column=2, padx=(4, 0))
         self.exit_button = ttk.Button(footer, text="退出程序", command=self.request_exit, style="Quiet.TButton")
         self.exit_button.grid(row=0, column=3, padx=(4, 0))
+        self.runtime_text = tk.StringVar()
+        self.runtime_label = ttk.Label(footer, textvariable=self.runtime_text, style="RuntimeWarning.TLabel", width=1, wraplength=1000)
+        self.runtime_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.runtime_label.grid_remove()
+        self.runtime_label.bind("<Configure>", lambda event: self.runtime_label.configure(wraplength=max(200, event.width - 20)))
         self.policy_label = ttk.Label(footer, textvariable=self.policy, style="Muted.TLabel", wraplength=1000, width=1)
-        self.policy_label.grid(row=1, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.policy_label.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         self.policy_label.grid_remove()
         self.policy_label.bind("<Configure>", lambda event: self.policy_label.configure(wraplength=max(200, event.width)))
         try:
@@ -1619,7 +1647,11 @@ class Dashboard:
                     previous = self.update_release
                     self.update_release = result
                     if result is None:
-                        self.update_text.set(f"当前已是最新版本 {updater.current_version(root=ROOT)}")
+                        try:
+                            version = updater.current_version(root=ROOT)
+                            self.update_text.set(f"已安装最新版本 {version}")
+                        except (updater.UpdateError, OSError, ValueError):
+                            self.update_text.set("未发现可用更新；安装版本信息暂不可读取。")
                     else:
                         if previous is None or previous.tag != result.tag:
                             self.update_prepared = None
@@ -1935,6 +1967,19 @@ class Dashboard:
 
         threading.Thread(target=worker, name="restore-node", daemon=True).start()
 
+    def refresh_runtime_notice(self, status) -> None:
+        try:
+            installed = updater.current_version(root=ROOT)
+        except (updater.UpdateError, OSError, ValueError):
+            installed = None
+        text = "" if self.exiting else runtime_version_notice(
+            status, installed_version=installed, gui_version=core.RUNTIME_VERSION)
+        self.runtime_text.set(text)
+        if text:
+            self.runtime_label.grid()
+        else:
+            self.runtime_label.grid_remove()
+
     def refresh(self) -> None:
         if self.closed:
             return
@@ -1975,6 +2020,7 @@ class Dashboard:
         self.poll_updates(status)
         if self.closed:
             return
+        self.refresh_runtime_notice(status)
         self.poll_manual_selection(status)
         stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))

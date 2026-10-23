@@ -35,6 +35,7 @@ class DashboardLayoutTests(unittest.TestCase):
         now = datetime.now(dashboard.CHINA_TIME)
         self.status = {
             "pid": 12345, "phase": "monitoring", "controller_available": True,
+            "runtime_version": "1.0.0",
             "controller_context": list(dashboard.core.state_context(self.config)),
             "nodes_probe_identity": dashboard.core.probe_identity(self.config),
             "mode": "rule", "group": self.config["group"],
@@ -51,6 +52,7 @@ class DashboardLayoutTests(unittest.TestCase):
             self.stack.enter_context(patch.object(dashboard, name, value))
         for name in ("start_daemon", "TrayIcon"):
             self.stack.enter_context(patch.object(dashboard, name, side_effect=AssertionError("offline UI fixture")))
+        self.stack.enter_context(patch.object(dashboard.core, "RUNTIME_VERSION", "1.0.0"))
         self.stack.enter_context(patch.object(dashboard.threading, "Thread", side_effect=AssertionError("offline UI fixture")))
         self.publish()
         self.app = dashboard.Dashboard(self.root, start_service=False, enable_tray=False, enable_updates=False)
@@ -132,6 +134,71 @@ class DashboardLayoutTests(unittest.TestCase):
                 self.arrange(width, height)
                 self.assertEqual(self.app.node_title.get(), long_name)
                 self.assert_layout(100)
+
+    def test_replaced_files_keep_restart_notice_visible_beside_update_messages(self):
+        self.assertFalse(self.app.runtime_label.winfo_ismapped())
+        (self.location / "VERSION").write_text("1.1.0", encoding="utf-8")
+        self.app.refresh()
+        self.app.update_text.set("已安装最新版本 1.1.0")
+        self.app.notify("正在切换测试节点", 30)
+        for width, height in ((1120, 780), (920, 650)):
+            with self.subTest(size=(width, height)):
+                self.arrange(width, height)
+                self.assertIn("窗口仍运行 1.0.0", self.app.runtime_text.get())
+                self.assertIn("后台仍运行 1.0.0", self.app.runtime_text.get())
+                self.assert_inside_window(self.app.runtime_label)
+                self.assert_layout(100)
+        self.app.policy_button.invoke()
+        self.root.update()
+        self.assert_inside_window(self.app.runtime_label)
+        self.assert_inside_window(self.app.policy_label)
+        self.assert_layout(80)
+
+        self.status["runtime_version"] = "1.1.0"
+        self.publish()
+        self.app.refresh()
+        self.assertNotIn("后台仍运行", self.app.runtime_text.get())
+        self.assertIn("窗口仍运行", self.app.runtime_text.get())
+        with patch.object(dashboard.core, "RUNTIME_VERSION", "1.1.0"):
+            self.app.refresh()
+        self.root.update()
+        self.assertEqual(self.app.runtime_text.get(), "")
+        self.assertFalse(self.app.runtime_label.winfo_ismapped())
+
+    def test_legacy_helper_requires_fresh_owned_status_and_exit_hides_restart_advice(self):
+        del self.status["runtime_version"]
+        self.publish()
+        self.app.refresh()
+        self.assertIn("后台版本未知", self.app.runtime_text.get())
+        self.app.update_busy = "prepare"
+        self.app.refresh()
+        self.assertIn("后台版本未知", self.app.runtime_text.get())
+        self.app.exiting = True
+        self.app.refresh()
+        self.assertEqual(self.app.runtime_text.get(), "")
+        self.app.exiting = False
+        self.app.refresh()
+        self.assertIn("后台版本未知", self.app.runtime_text.get())
+        self.status["controller_context"] = ["http://127.0.0.1:10101", "", "another fixture"]
+        self.publish()
+        self.app.refresh()
+        self.assertEqual(self.app.runtime_text.get(), "")
+
+    def test_unreadable_install_version_keeps_window_usable_without_raw_metadata(self):
+        (self.location / "VERSION").write_text("RAW_METADATA_MARKER", encoding="utf-8")
+        self.app.close()
+        self.root = tk.Tk()
+        self.root.withdraw()
+        self.root.attributes("-alpha", 0)
+        self.app = dashboard.Dashboard(self.root, start_service=False, enable_tray=False, enable_updates=False)
+        self.assertIn("安装版本无法读取", self.app.runtime_text.get())
+        self.assertNotIn("RAW_METADATA_MARKER", self.app.runtime_text.get())
+        (self.location / "VERSION").unlink()
+        self.app.refresh()
+        self.assertIn("安装版本无法读取", self.app.runtime_text.get())
+        (self.location / "VERSION").write_text("1.0.0", encoding="utf-8")
+        self.app.refresh()
+        self.assertEqual(self.app.runtime_text.get(), "")
 
     def test_scanning_refresh_keeps_rows_selection_and_scroll_position(self):
         self.arrange(920, 650)

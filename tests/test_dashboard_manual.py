@@ -30,6 +30,7 @@ def dashboard_state():
     app.settings_dialog = app.tray = None
     app.after_id = app.tray_after_id = app.service_after_id = None
     app.window_properties_configured = False
+    app.runtime_text = app.runtime_label = Mock()
     app.notify = Mock()
     app.ensure_service = Mock(return_value=True)
     app.table = Mock()
