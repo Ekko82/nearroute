@@ -23,6 +23,7 @@ from tkinter import messagebox, ttk
 
 import optimizer as core
 import updater
+import windows_app
 from tray_icon import ICON_PATH, TrayIcon, request_restore
 from windows_app import clear_window, configure_taskbar, configure_window
 
@@ -221,9 +222,12 @@ def policy_summary(raw: dict) -> str:
         scope = "地区 " + "、".join(cfg.get("scan_regions", []))
     preference = "日本优先" if cfg.get("prefer_japan", False) else "按线路评分择优"
     expected = ", ".join(str(value) for value in cfg.get("probe_expected_statuses", []))
+    compatible = cfg.get("controller_api_mode") == "selector"
+    check_label = "节点检查" if compatible else "健康检查"
+    probe_note = "兼容模式仅读取客户端测速耗时，不核对 HTTP 状态码" if compatible else f"预期 HTTP {expected}"
     return (
-        f"{preference} · 范围：{scope} · 健康检查 {cfg.get('health_interval_seconds')} 秒 / 测速 {cfg.get('scan_interval_seconds')} 秒\n"
-        f"测试：{cfg.get('probe_url', '')} · 预期 HTTP {expected}"
+        f"{preference} · 范围：{scope} · {check_label} {cfg.get('health_interval_seconds')} 秒 / 测速 {cfg.get('scan_interval_seconds')} 秒\n"
+        f"测试：{cfg.get('probe_url', '')} · {probe_note}"
     )
 
 
@@ -795,7 +799,7 @@ class ClientDialog:
         self.owner = owner
         cfg = core.DEFAULTS | (read_json(CONFIG) if CONFIG.exists() else {})
         self.original_context = core.state_context(cfg)
-        self.closed = self.loading = self.applying = False
+        self.closed = self.loading = self.applying = self.importing = False
         self.verified_identity = None
         self.selector_groups = []
         self.discovered_clients = {}
@@ -809,6 +813,7 @@ class ClientDialog:
         self.group = tk.StringVar(value=cfg["group"])
         self.auto_detect = tk.BooleanVar(value=cfg.get("auto_detect_client", True))
         self.auto_group = tk.BooleanVar(value=cfg.get("auto_select_group", True))
+        self.compatible = tk.BooleanVar(value=cfg.get("controller_api_mode", "standard") == "selector")
         self._saved_fields = self._draft_values()
         self.message = tk.StringVar(value="自动发现本机客户端，或填写控制地址后测试连接；检查过程不会切换节点。")
         form = ttk.Frame(self.window, padding=(16, 12))
@@ -819,7 +824,7 @@ class ClientDialog:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(header, text="连接代理客户端", style="Title.TLabel").pack(anchor="w")
         help_text = ("支持 Clash Verge Rev、Clash Party（原 Mihomo Party）等本机 Mihomo/Clash 客户端。"
-                     "请先在客户端开启 HTTP 外部控制，并启用 HTTP 或 mixed 代理端口。")
+                     "猫猫云 5.6 可使用下方代理组兼容模式。")
         help_label = ttk.Label(header, text=help_text, wraplength=690, style="Muted.TLabel")
         help_label.pack(anchor="w", fill="x", pady=(6, 0))
 
@@ -832,15 +837,21 @@ class ClientDialog:
         self.address_entry.bind("<<ComboboxSelected>>", self.select_discovered_client)
         self.discover_button = ttk.Button(connection, text="自动发现", command=self.discover_connections)
         self.discover_button.grid(row=0, column=2, padx=(10, 0))
-        address_help = ttk.Label(connection, text="优先保留当前有效地址；发现多个客户端时，请从下拉列表选择。也可手动填写 HTTP 控制地址。", style="Surface.TLabel", foreground="#64748b", wraplength=650)
+        address_help = ttk.Label(connection, text="自动发现保留当前有效地址；多个客户端时从下拉列表选择，也可手动填写。", style="Surface.TLabel", foreground="#64748b", wraplength=650)
         address_help.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(6, 10))
         ttk.Label(connection, text="密钥环境变量", style="Surface.TLabel").grid(row=2, column=0, sticky="w", padx=(0, 14))
         self.secret_entry = ttk.Entry(connection, textvariable=self.secret_env)
-        self.secret_entry.grid(row=2, column=1, columnspan=2, sticky="ew")
-        secret_help = ttk.Label(connection, text="如 CLASH_SECRET，请填变量名，不填写密钥本身；无需认证时留空。设置变量后重开近舟。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
+        self.secret_entry.grid(row=2, column=1, sticky="ew")
+        self.auth_button = ttk.Button(connection, text="导入猫猫云认证", command=self.import_auth)
+        self.auth_button.grid(row=2, column=2, padx=(10, 0))
+        secret_help = ttk.Label(connection, text="填写变量名，无需认证时留空。猫猫云导入需管理员确认，客户端重启后需重新导入。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
         secret_help.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.auto_detect_button = ttk.Checkbutton(connection, text="当前地址失效时自动发现本机客户端", variable=self.auto_detect, style="Surface.TCheckbutton")
         self.auto_detect_button.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.compatible_button = ttk.Checkbutton(connection, text="代理组兼容模式（猫猫云 5.6 等受限接口）", variable=self.compatible, style="Surface.TCheckbutton")
+        self.compatible_button.grid(row=5, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        compatible_help = ttk.Label(connection, text="仅按所选代理组优选；Codex 实际路径、HTTP 状态与流式连接未验证。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
+        compatible_help.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
         selection = ttk.Frame(form, style="Card.TFrame", padding=10)
         selection.grid(row=2, column=0, sticky="nsew")
@@ -865,11 +876,12 @@ class ClientDialog:
         self.discard_button.pack(side="right")
         form.bind("<Configure>", lambda event: (
             help_label.configure(wraplength=max(400, event.width - 48)),
-            [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, message_label)],
+            [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, compatible_help, message_label)],
         ))
         self._variable_traces = [
             (self.controller, self.controller.trace_add("write", self.invalidate_connection)),
             (self.secret_env, self.secret_env.trace_add("write", self.invalidate_connection)),
+            (self.compatible, self.compatible.trace_add("write", self.invalidate_connection)),
             (self.group, self.group.trace_add("write", lambda *_: self.update_buttons())),
         ]
         self.update_buttons()
@@ -880,18 +892,20 @@ class ClientDialog:
     def fields(self) -> dict:
         return {"controller": self.controller.get().strip().rstrip("/"),
                 "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get(),
-                "auto_detect_client": self.auto_detect.get(), "auto_select_group": self.auto_group.get()}
+                "auto_detect_client": self.auto_detect.get(), "auto_select_group": self.auto_group.get(),
+                "controller_api_mode": "selector" if self.compatible.get() else "standard"}
 
     def _draft_values(self) -> tuple:
         return (self.controller.get(), self.secret_env.get(), self.group.get(),
-                self.auto_detect.get(), self.auto_group.get())
+                self.auto_detect.get(), self.auto_group.get(), self.compatible.get())
 
     def has_unsaved_changes(self) -> bool:
         return self._draft_values() != self._saved_fields
 
     def identity(self):
         fields = self.fields()
-        return fields["controller"], fields["controller_secret_env"]
+        identity = fields["controller"], fields["controller_secret_env"]
+        return (*identity, "selector") if fields["controller_api_mode"] == "selector" else identity
 
     def invalidate_connection(self, *_args) -> None:
         self.verified_identity = None
@@ -904,10 +918,11 @@ class ClientDialog:
         busy = self.loading or self.applying
         self.inspect_button.state(["disabled"] if busy else ["!disabled"])
         self.discover_button.state(["disabled"] if busy else ["!disabled"])
+        self.auth_button.state(["disabled"] if busy or os.name != "nt" else ["!disabled"])
         ready = not busy and self.verified_identity == self.identity() and self.group.get() in self.selector_groups
         self.save_button.state(["!disabled"] if ready else ["disabled"])
         for widget in (self.address_entry, self.secret_entry, self.auto_detect_button, self.auto_group_button,
-                       self.cancel_button, self.discard_button):
+                       self.compatible_button, self.cancel_button, self.discard_button):
             widget.state(["disabled"] if self.applying else ["!disabled"])
         self.groups.configure(state="disabled" if self.applying else "readonly")
 
@@ -930,6 +945,7 @@ class ClientDialog:
         expected_env = identity[1] if identity and candidate["controller"] == identity[0] else ""
         self.secret_env.set(expected_env)
         if candidate.get("verified"):
+            self.compatible.set(candidate.get("controller_api_mode") == "selector")
             self.apply_inspection(candidate, self.identity())
         else:
             self.verified_identity = None
@@ -948,14 +964,17 @@ class ClientDialog:
             suggested = result.get("recommended_group") if self.auto_group.get() else None
             suggested = suggested or result.get("active_group")
             self.group.set(suggested if suggested in self.selector_groups else "")
-        note = ("当前为全局模式，实际控制 GLOBAL。" if result["mode"] == "global" else
+        compatible = result.get("controller_api_mode") == "selector" or result.get("verification_scope") == "selector"
+        note = ("代理组兼容模式：当前模式未知，仅控制所选代理组；未验证 Codex 实际出站路径或流式连接。" if compatible else
+                "当前为全局模式，实际控制 GLOBAL。" if result["mode"] == "global" else
                 "当前为直连模式，优选前请改为规则或全局模式。" if result["mode"] == "direct" else "规则模式使用所选代理组。")
         if result.get("group_reason"):
             note += " " + result["group_reason"]
         if "nearby_regions" in result:
             nearby = result["nearby_regions"]
             note += " 邻近地区：" + "、".join(nearby) + "。" if nearby else " 未识别到邻近地区，自动范围不会扩大。"
-        self.message.set(f"连接成功，HTTP 代理端口 {result['proxy_port']}，读取 {len(self.selector_groups)} 个代理组。{note}")
+        connection = "连接成功" if compatible else f"连接成功，HTTP 代理端口 {result['proxy_port']}"
+        self.message.set(f"{connection}，读取 {len(self.selector_groups)} 个代理组。{note}")
 
     def start_worker(self, operation, identity, work) -> None:
         def worker():
@@ -979,6 +998,17 @@ class ClientDialog:
         self.update_buttons()
         identity = self.identity()
         self.start_worker("inspect", identity, lambda: core.inspect_controller(fields))
+
+    def import_auth(self) -> None:
+        if (self.closed or self.loading or self.applying or self.owner.exiting
+                or self.owner.restore_busy or self.owner.manual_busy):
+            return
+        controller = self.fields()["controller"]
+        self.applying = self.importing = self.owner.client_busy = True
+        self.verified_identity = None
+        self.message.set("等待 Windows 管理员确认，读取所选猫猫云的本机控制认证；不修改客户端或节点…")
+        self.update_buttons()
+        self.start_worker("auth", self.identity(), lambda: windows_app.import_maomao_auth(controller))
 
     def save(self) -> None:
         if (self.closed or self.loading or self.applying or self.owner.exiting
@@ -1007,7 +1037,16 @@ class ClientDialog:
         try:
             while True:
                 operation, identity, success, result = self.results.get_nowait()
-                if operation in ("inspect", "discover"):
+                if operation == "auth":
+                    self.applying = self.importing = self.owner.client_busy = False
+                    if identity != self.identity():
+                        self.message.set("连接参数已改变；本次认证未应用到当前草稿，请重新导入。")
+                    elif success:
+                        self.secret_env.set(result)
+                        self.message.set("认证已导入。请测试连接并选择代理组，然后保存连接。")
+                    else:
+                        self.message.set("认证未导入：" + result)
+                elif operation in ("inspect", "discover"):
                     self.loading = False
                     if identity != self.identity():
                         self.message.set("连接参数已改变，请重新测试连接。")
@@ -1443,7 +1482,7 @@ class Dashboard:
         hero.columnconfigure(0, weight=1)
         node = ttk.Frame(hero, style="Surface.TFrame")
         node.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
-        ttk.Label(node, text="近舟 NearRoute · 当前线路", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(node, text="近舟 NearRoute · 所选节点", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
         node.columnconfigure(0, weight=1)
         node_label = ttk.Label(node, textvariable=self.node_title, style="Node.TLabel", width=1, wraplength=600)
         node_label.grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -2076,6 +2115,7 @@ class Dashboard:
             config = {}
             enabled = bool(status.get("enabled", True))
             self.policy.set(policy_summary({}))
+        selector_only = config.get("controller_api_mode") == "selector"
         context = tuple(core.state_context(core.DEFAULTS | config))
         if status.get("controller_context") != list(context):
             status = {}
@@ -2087,7 +2127,11 @@ class Dashboard:
             self.node_mode = (core.active_mode(status, group)
                               if status.get("phase") != "starting"
                               and status.get("controller_available") is True
-                              and isinstance(mode, str) and mode.lower() in ("rule", "global")
+                              and isinstance(mode, str)
+                              and (mode.lower() in ("rule", "global") or
+                                   (mode.lower() == "unknown" and selector_only
+                                    and (status.get("controller_api_mode") == "selector"
+                                         or status.get("verification_scope") == "selector")))
                               and isinstance(group, str) and group else None)
         self.poll_updates(status)
         if self.closed:
@@ -2111,7 +2155,8 @@ class Dashboard:
             for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button):
                 button.state(["disabled"])
         if client_busy:
-            badge, color = "正在保存客户端连接", "#1b66b0"
+            importing = getattr(getattr(self, "client_dialog", None), "importing", False)
+            badge, color = "正在导入客户端认证" if importing else "正在保存客户端连接", "#1b66b0"
         elif self.manual_busy:
             badge, color = "正在手动切换", "#1b66b0"
         elif stale:
@@ -2134,10 +2179,12 @@ class Dashboard:
         selected = str(status.get("selected") or "—")
         group = str(status.get("group") or "—")
         last_known = stale or stopped or starting or status.get("controller_available") is False
-        node_label = "上次记录节点" if last_known else "当前节点"
+        node_label = (("上次记录的组内选择" if last_known else "组内选择") if selector_only else
+                      "上次记录节点" if last_known else "当前节点")
         self.current.set(f"{node_label}：{selected}    代理组：{group}")
         self.node_title.set(selected if selected != "—" else "等待代理客户端连接")
-        self.node_meta.set(f"{node_label}  ·  代理组：{group}")
+        scope_note = "  ·  兼容模式：Codex 实际路径未验证" if selector_only else ""
+        self.node_meta.set(f"{node_label}  ·  代理组：{group}{scope_note}")
         nodes = [item for item in (status.get("nodes") or []) if isinstance(item, dict)]
         try:
             scores_match = status.get("nodes_probe_identity") == core.probe_identity(core.validate_config(config))

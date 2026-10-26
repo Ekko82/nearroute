@@ -2,6 +2,7 @@
   "enabled": false,
   "controller": "http://127.0.0.1:9790",
   "controller_secret_env": "",
+  "controller_api_mode": "standard",
   "auto_detect_client": true,
   "auto_select_group": true,
   "group": "猫猫云",

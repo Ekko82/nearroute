@@ -34,6 +34,7 @@ from datetime import datetime, timedelta, timezone
 from functools import partial
 
 import client_detection
+import windows_app
 
 ROOT = Path(__file__).resolve().parent
 STATE = ROOT / "state"
@@ -53,6 +54,7 @@ DEFAULTS = {
     "enabled": True,
     "controller": "http://127.0.0.1:9790",
     "controller_secret_env": "",
+    "controller_api_mode": "standard",
     "group": "猫猫云",
     "auto_detect_client": True,
     "auto_select_group": True,
@@ -162,21 +164,23 @@ def request_manual_selection(name, expected_context=None, expected_mode=None):
     """Queue a user choice for the helper, which serializes all controller PUTs."""
     if not isinstance(name, str) or not name.strip():
         raise ValueError("请选择要切换的节点")
+    cfg = load_config()
     if expected_mode is not None:
         if not isinstance(expected_mode, (list, tuple)) or len(expected_mode) != 2:
             raise ValueError("节点列表的代理模式无效，请刷新后重新选择")
         mode, group = expected_mode
         valid_group = group is None if mode == "direct" else isinstance(group, str) and bool(group.strip())
-        if mode not in ("rule", "global", "direct") or not valid_group:
+        allowed_modes = ("rule", "global", "direct", "unknown") if cfg["controller_api_mode"] == "selector" else ("rule", "global", "direct")
+        if mode not in allowed_modes or not valid_group:
             raise ValueError("节点列表的代理模式无效，请刷新后重新选择")
         expected_mode = list(expected_mode)
-    cfg = load_config()
     _check_expected_context(cfg, expected_context)
     request_id = uuid.uuid4().hex
     with _manual_request_lock():
         atomic_json(STATE / "select.request.json", {
             "request_id": request_id, "name": name,
             **controller_identity(cfg), "group": cfg["group"],
+            "controller_api_mode": cfg["controller_api_mode"],
             **({"expected_mode": expected_mode} if expected_mode is not None else {}),
         })
     return request_id
@@ -211,6 +215,8 @@ def validate_config(raw):
     secret_env = cfg["controller_secret_env"]
     if not isinstance(secret_env, str) or (secret_env and not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", secret_env)):
         raise ValueError("密钥环境变量须为合法变量名或留空，不要填写密钥本身")
+    if cfg["controller_api_mode"] not in ("standard", "selector"):
+        raise ValueError("controller_api_mode 必须为 standard 或 selector")
     if not isinstance(cfg["group"], str) or not cfg["group"].strip():
         raise ValueError("请选择非空的代理组名称")
     if type(cfg["enabled"]) is not bool:
@@ -357,7 +363,8 @@ def same_controller(record, cfg):
 
 
 def state_context(cfg):
-    return (cfg["controller"], cfg["controller_secret_env"], cfg["group"])
+    context = (cfg["controller"], cfg["controller_secret_env"], cfg["group"])
+    return context + ("selector",) if cfg.get("controller_api_mode") == "selector" else context
 
 
 def _check_expected_context(cfg, expected_context):
@@ -368,8 +375,26 @@ def _check_expected_context(cfg, expected_context):
 
 def _check_client_environment(cfg):
     name = cfg["controller_secret_env"]
-    if name and not os.environ.get(name):
+    if name and not _controller_secret(cfg):
+        if re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_[0-9]+", name):
+            raise ValueError("未找到有效的猫猫云认证，请在客户端连接中点击“导入猫猫云认证”")
         raise ValueError("当前进程未找到非空的密钥环境变量 " + name + "，请设置后重新启动近舟")
+
+
+def _controller_secret(cfg):
+    name = cfg.get("controller_secret_env", "")
+    managed = re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_([0-9]+)", name)
+    if windows_app.IS_WINDOWS and managed:
+        # Import refreshes HKCU while an existing helper retains its old process
+        # environment. Managed credentials are read afresh, including revocation.
+        if int(managed[1]) != (urllib.parse.urlsplit(cfg["controller"]).port or 80):
+            return ""
+        try:
+            credential = windows_app._read_user_environment(name)
+            return credential if re.fullmatch(r"[0-9a-fA-F]{48}", credential) else ""
+        except (OSError, ValueError, TypeError, ImportError):
+            return ""
+    return os.environ.get(name, "")
 
 
 def owned_records(data):
@@ -569,6 +594,8 @@ class ModeChanged(PathChanged):
 
 
 def active_mode(general, group):
+    if general.get("controller_api_mode") == "selector":
+        return "unknown", group
     return general.get("mode", "rule").lower(), group
 
 
@@ -586,9 +613,11 @@ class _NoControllerRedirect(urllib.request.HTTPRedirectHandler):
 class Controller:
     def __init__(self, cfg):
         self.base = cfg["controller"].rstrip("/")
-        self.secret = os.environ.get(cfg.get("controller_secret_env", ""), "")
+        self.secret = _controller_secret(cfg)
         self.timeout_ms = int(cfg["probe_timeout_ms"])
         self.probe_url = cfg["probe_url"]
+        self.api_mode = cfg.get("controller_api_mode", "standard")
+        self.expected_statuses = cfg.get("probe_expected_statuses", [405])
 
     def request(self, path, method="GET", body=None, timeout=5):
         headers = {"Content-Type": "application/json"}
@@ -611,7 +640,16 @@ class Controller:
             raise ControllerError("无法连接代理客户端控制接口") from None
 
     def snapshot(self, cfg, *, allow_direct=False):
-        general = self.request("/configs")
+        if cfg.get("controller_api_mode") == "selector":
+            proxies = self.request("/proxies")["proxies"]
+            group = cfg["group"]
+            if proxies.get(group, {}).get("type") != "Selector":
+                raise ControllerError("未找到可控制的代理组: " + group)
+            # This is a capability marker, not a fabricated General response.
+            return {"controller_api_mode": "selector"}, proxies, group
+        general = dict(self.request("/configs"))
+        # Only our explicit compatibility branch can establish this marker.
+        general.pop("controller_api_mode", None)
         proxies = self.request("/proxies")["proxies"]
         mode = general.get("mode", "rule").lower()
         if mode == "direct":
@@ -624,7 +662,10 @@ class Controller:
         return general, proxies, group
 
     def delay(self, name):
-        query = urllib.parse.urlencode({"url": self.probe_url, "timeout": self.timeout_ms})
+        fields = {"url": self.probe_url, "timeout": self.timeout_ms}
+        if self.api_mode == "selector":
+            fields["expected"] = ",".join(str(code) for code in self.expected_statuses)
+        query = urllib.parse.urlencode(fields)
         try:
             result = self.request("/proxies/" + urllib.parse.quote(name, safe="") + "/delay?" + query,
                                   timeout=self.timeout_ms / 1000 * 2 + 3)
@@ -672,7 +713,8 @@ def inspect_controller(fields, *, timeout=5, adaptive=False):
         version = api.request("/version", timeout=timeout)
         if not isinstance(version, dict) or not isinstance(version.get("version"), str) or not version["version"]:
             raise ControllerError("接口未返回有效的 Clash／Mihomo 版本")
-    general = api.request("/configs", timeout=timeout)
+    selector_only = cfg["controller_api_mode"] == "selector"
+    general = {"controller_api_mode": "selector"} if selector_only else api.request("/configs", timeout=timeout)
     proxy_response = api.request("/proxies", timeout=timeout)
     if not isinstance(general, dict) or not isinstance(proxy_response, dict):
         raise ControllerError("控制接口未返回有效的代理配置")
@@ -685,11 +727,12 @@ def inspect_controller(fields, *, timeout=5, adaptive=False):
                                       or any(not isinstance(member, str) for member in item["all"])))
                 or (item.get("type") == "Selector" and "all" not in item)):
             raise ControllerError("控制接口返回的代理组或节点格式无效")
-    mode = general.get("mode", "rule")
-    if not isinstance(mode, str) or mode.lower() not in ("rule", "global", "direct"):
+    mode = "unknown" if selector_only else general.get("mode", "rule")
+    allowed_modes = ("rule", "global", "direct", "unknown") if selector_only else ("rule", "global", "direct")
+    if not isinstance(mode, str) or mode.lower() not in allowed_modes:
         raise ControllerError("代理客户端返回了不支持的代理模式")
     mode = mode.lower()
-    _, port = local_proxy_endpoint(general)
+    port = None if selector_only else local_proxy_endpoint(general)[1]
     groups = sorted(name for name, item in proxies.items()
                     if isinstance(item, dict) and item.get("type") == "Selector")
     active_group = None if mode == "direct" else ("GLOBAL" if mode == "global" else cfg["group"])
@@ -715,7 +758,8 @@ def inspect_controller(fields, *, timeout=5, adaptive=False):
     group = active_group or recommendation["recommended_group"]
     regions = client_detection.nearby_regions(flatten_candidates(proxies, group), node_region) if group else []
     return {"mode": mode, "groups": groups, "active_group": active_group, "proxy_port": port,
-            **recommendation, "nearby_regions": regions}
+            **recommendation, "nearby_regions": regions,
+            **({"controller_api_mode": "selector", "verification_scope": "selector"} if selector_only else {})}
 
 
 def discover_clients(fields):
@@ -1195,6 +1239,8 @@ class Optimizer:
                 self.status["last_scan_at"] = None
             self.status["nodes_probe_identity"] = self.history_probe
         self.status.update(updates)
+        self.status["controller_api_mode"] = self.cfg.get("controller_api_mode", "standard")
+        self.status["verification_scope"] = "selector" if self.cfg.get("controller_api_mode") == "selector" else "path"
         self.status["runtime_version"] = RUNTIME_VERSION
         self.status["controller_context"] = list(self.state_context)
         self.status["updated_at"] = iso()
@@ -1260,7 +1306,8 @@ class Optimizer:
                 return False
             group = info["recommended_group"]
         fields = {"controller": endpoint, "group": group,
-                  "controller_secret_env": cfg["controller_secret_env"] if endpoint == cfg["controller"] else ""}
+                  "controller_secret_env": cfg["controller_secret_env"] if endpoint == cfg["controller"] else "",
+                  "controller_api_mode": info.get("controller_api_mode", "standard")}
         if state_context(cfg | fields) == state_context(cfg):
             self.status["client_detection_message"] = ""
             return False
@@ -1328,6 +1375,31 @@ class Optimizer:
                     return not load_config()["enabled"]
                 return False
 
+        if self.cfg.get("controller_api_mode") == "selector" and general.get("controller_api_mode") == "selector":
+            # Restricted controllers cannot prove the application route or a
+            # reusable HTTPS stream. Only retest the selected independent leaf.
+            result = {"verification_scope": "selector", "request_ms": []}
+            _, proxies, group = self.api.snapshot(self.cfg)
+            leaf = resolve_leaf(proxies, proxies[group].get("now"))
+            if leaf not in flatten_candidates(proxies, group):
+                return result | {"ok": False, "reason": "所选代理组当前未使用可测速的独立节点"}
+            for check in range(3 if idle_seconds else 1):
+                if check:
+                    deadline = time.monotonic() + idle_seconds
+                    while time.monotonic() < deadline:
+                        if cancel():
+                            return result | {"ok": False, "cancelled": True, "reason": "节点复测已取消"}
+                        time.sleep(min(0.1, max(0, deadline - time.monotonic())))
+                if cancel():
+                    return result | {"ok": False, "cancelled": True, "reason": "节点复测已取消"}
+                delay = self.api.delay(leaf)
+                if cancel():
+                    return result | {"ok": False, "cancelled": True, "reason": "节点复测已取消"}
+                if not isinstance(delay, (int, float)) or isinstance(delay, bool) or not math.isfinite(delay) or delay <= 0:
+                    return result | {"ok": False, "reason": "所选代理组节点探测失败；实际出站路径未验证"}
+                result["request_ms"].append(delay)
+            return result | {"ok": True, "reason": "所选代理组节点探测通过；实际出站路径未验证"}
+
         return verify_current_path(general, idle_seconds, cancel,
                                    probe_url=self.cfg["probe_url"], expected_statuses=self.cfg["probe_expected_statuses"])
 
@@ -1360,10 +1432,13 @@ class Optimizer:
 
     def publish_active_path(self, general, proxies, group, **updates):
         selected = resolve_leaf(proxies, proxies[group].get("now")) if group else "DIRECT"
-        self.write_status(mode=general.get("mode", "rule").lower(), group=group, selected=selected,
+        self.write_status(mode=active_mode(general, group)[0], group=group, selected=selected,
                           controller_available=True, last_error=None, **updates)
 
     def require_proxy_endpoint(self, general, proxies, group, expected=None):
+        if self.cfg.get("controller_api_mode") == "selector" and general.get("controller_api_mode") == "selector":
+            # Explicit group-only operation has no local proxy/route evidence.
+            return None
         message = None
         try:
             endpoint = local_proxy_endpoint(general)
@@ -1467,6 +1542,8 @@ class Optimizer:
             self.reload_config()
             if not same_controller(request, self.cfg) or request.get("group") != self.cfg["group"]:
                 raise ValueError("代理设置已改变，请重新选择节点")
+            if request.get("controller_api_mode", "standard") != self.cfg.get("controller_api_mode", "standard"):
+                raise ValueError("控制接口模式已改变，请重新选择节点")
             self.recover_pending()
             general, proxies, group = self.api.snapshot(self.cfg)
             mode = active_mode(general, group)
@@ -1663,7 +1740,7 @@ class Optimizer:
             return False
         policy = selection_policy(self.cfg)
         mode = active_mode(general, group)
-        self.write_status(phase="verifying", message="正在验证候选线路：" + candidate)
+        self.write_status(phase="verifying", message=("正在复测候选节点：" if mode[0] == "unknown" else "正在验证候选线路：") + candidate)
         self.tentative = True
         committed = False
         put_attempted = False
@@ -1875,7 +1952,7 @@ class Optimizer:
                 if row["name"] not in selectable:
                     row.update(eligible=False, reason="该节点不在主代理组可直接选择的列表中")
                 if self.failures >= 2 and row["name"] == current:
-                    row.update(eligible=False, reason="当前实际连接连续失败")
+                    row.update(eligible=False, reason="所选组节点探测连续失败" if mode[0] == "unknown" else "当前实际连接连续失败")
             rows = apply_region_policy(rows, self.cfg["prefer_japan"], self.cfg["japan_poor_latency_ms"],
                                        self.cfg["japan_fallback_score_ratio"])
             return sorted(rows, key=lambda row: (not row["eligible"], row["score_ms"] if row["score_ms"] is not None else math.inf, row["name"]))
@@ -1943,7 +2020,8 @@ class Optimizer:
                 attempts += 1
             if changed:
                 healthy_path = self.observed_selection
-                reason = "已选用通过连接验证的低延迟节点"
+                reason = ("已优选所选代理组；Codex 实际出站未验证" if mode[0] == "unknown"
+                          else "已选用通过连接验证的低延迟节点")
                 self.recover_pending()
                 break
             self.recover_pending()
@@ -2111,7 +2189,7 @@ def configure_client(fields, expected_context=None):
     Discovery is a separate read-only action. This function validates local
     settings, serializes updates, and never sends controller requests.
     """
-    allowed = {"controller", "controller_secret_env", "group", "auto_detect_client", "auto_select_group"}
+    allowed = {"controller", "controller_secret_env", "controller_api_mode", "group", "auto_detect_client", "auto_select_group"}
     if not isinstance(fields, dict) or set(fields) - allowed:
         raise ValueError("连接设置仅接受控制接口、密钥环境变量名和代理组")
     load_config()  # First-run creation must happen before the non-reentrant lock.
@@ -2236,7 +2314,9 @@ def _restore_original_locked():
     try:
         general, proxies, group = api.snapshot(cfg, allow_direct=True)
         selected = resolve_leaf(proxies, proxies[group].get("now")) if group else "DIRECT"
-        state.update(mode=general.get("mode", "rule").lower(), group=group, selected=selected,
+        state.update(mode=active_mode(general, group)[0], group=group, selected=selected,
+                     controller_api_mode=cfg.get("controller_api_mode", "standard"),
+                     verification_scope="selector" if cfg.get("controller_api_mode") == "selector" else "path",
                      controller_available=True, health=None, last_error=None)
     except (ControllerError, ValueError, OSError) as error:
         # Restoration has already committed; a status read cannot undo it.

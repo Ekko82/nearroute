@@ -31,7 +31,7 @@ CHECK_INTERVAL_SECONDS = 6 * 3600
 MAX_PACKAGE_BYTES = 50 * 1024 * 1024
 MAX_UNPACKED_BYTES = 100 * 1024 * 1024
 REQUIRED_FILES = {"VERSION", "optimizer.py", "client_detection.py", "dashboard.py", "updater.py", "tray_icon.py",
-                  "windows_app.py", "launch.ps1", "install.ps1", "uninstall.ps1",
+                  "windows_app.py", "controller_auth.ps1", "launch.ps1", "install.ps1", "uninstall.ps1",
                   "config.example.json", "README.md", "LICENSE", "assets/nearroute.ico"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 

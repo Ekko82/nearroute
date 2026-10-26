@@ -42,6 +42,7 @@ class ClientDialogTests(unittest.TestCase):
         self.inspect = self.patches.enter_context(patch.object(dashboard.core, "inspect_controller", return_value=self.inspection))
         self.discovery = self.patches.enter_context(patch.object(dashboard.core, "discover_clients"))
         self.configure = self.patches.enter_context(patch.object(dashboard.core, "configure_client"))
+        self.import_auth = self.patches.enter_context(patch.object(dashboard.windows_app, "import_maomao_auth", create=True))
         self.wait_for_startup = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
         self.start_daemon = self.patches.enter_context(patch.object(dashboard, "start_daemon", side_effect=AssertionError("real helper forbidden")))
         self.dialog = dashboard.ClientDialog(self.owner, parent=self.parent, visible=False)
@@ -72,7 +73,7 @@ class ClientDialogTests(unittest.TestCase):
         self.assertEqual(self.dialog.message.get(), before)  # Worker never touches Tcl.
         self.dialog.poll_results()
         self.inspect.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "TEST_CLASH_SECRET", "group": dashboard.core.DEFAULTS["group"],
-                                              "auto_detect_client": True, "auto_select_group": True})
+                                              "auto_detect_client": True, "auto_select_group": True, "controller_api_mode": "standard"})
         self.assertFalse(self.dialog.loading)
         self.assertEqual(self.dialog.selector_groups, ["PROXY", "GLOBAL"])
         self.assertEqual(self.dialog.group.get(), "PROXY")
@@ -136,7 +137,7 @@ class ClientDialogTests(unittest.TestCase):
         self.owner.client_saved.assert_not_called()
         self.dialog.poll_results()
         self.configure.assert_called_once_with({"controller": "http://127.0.0.1:9090", "controller_secret_env": "", "group": "PROXY",
-                                                "auto_detect_client": True, "auto_select_group": True}, expected_context=original)
+                                                "auto_detect_client": True, "auto_select_group": True, "controller_api_mode": "standard"}, expected_context=original)
         self.wait_for_startup.assert_called_once_with(self.owner.started_helpers)
         self.owner.client_saved.assert_called_once_with(saved)
         self.assertFalse(self.owner.client_busy)
@@ -171,7 +172,7 @@ class ClientDialogTests(unittest.TestCase):
 
                 self.configure.assert_called_once_with(
                     {"controller": dashboard.core.DEFAULTS["controller"], "controller_secret_env": "", "group": "PROXY ",
-                     "auto_detect_client": True, "auto_select_group": True},
+                     "auto_detect_client": True, "auto_select_group": True, "controller_api_mode": "standard"},
                     expected_context=original,
                 )
                 self.assertFalse(self.dialog.closed)
@@ -301,6 +302,27 @@ class ClientDialogTests(unittest.TestCase):
         self.finish()
         self.assertEqual(self.dialog.verified_identity, (address, "OTHER_CLIENT_SECRET"))
 
+    def test_selecting_standard_discovered_client_resets_compatible_draft_to_verified_contract(self):
+        self.dialog.compatible.set(True)
+        original = self.dialog.controller.get()
+        address = "http://127.0.0.1:9090"
+        candidate = self.candidate(address, controller_api_mode="standard")
+        self.discovery.return_value = {"candidates": [candidate], "selected_controller": None,
+                                       "message": "请选择客户端。"}
+        self.dialog.discover_connections()
+        self.finish()
+        self.assertEqual(self.dialog.controller.get(), original)
+        self.assertTrue(self.dialog.compatible.get())
+        self.dialog.controller.set(address)
+        self.dialog.select_discovered_client()
+        self.assertFalse(self.dialog.compatible.get())
+        self.assertEqual(self.dialog.fields()["controller_api_mode"], "standard")
+        self.assertEqual(self.dialog.verified_identity, (address, ""))
+        self.assertIn("规则模式", self.dialog.message.get())
+        self.assertNotIn("代理组兼容模式", self.dialog.message.get())
+        self.inspect.assert_not_called()
+        self.configure.assert_not_called()
+
     def test_unsupported_config_read_is_explained_and_cannot_be_saved(self):
         # The generic ttk fixture shares a Button mock; this control needs an
         # independent identity so other buttons cannot overwrite its state call.
@@ -372,6 +394,90 @@ class ClientDialogTests(unittest.TestCase):
         self.assertEqual(self.discovery.call_args.args[0]["group"], self.dialog.original_context[2])
         self.assertEqual(self.dialog.group.get(), "")
         self.assertFalse(self.dialog.loading)
+
+    def test_compatible_mode_requires_opt_in_and_discards_old_standard_inspection(self):
+        self.assertFalse(self.dialog.compatible.get())
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.inspect_connection()
+        self.dialog.compatible.set(True)
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.finish()
+        self.assertIsNone(self.dialog.verified_identity)
+        self.dialog.save()
+        self.configure.assert_not_called()
+
+        self.inspect.return_value = self.inspection | {
+            "mode": "unknown", "proxy_port": None,
+            "controller_api_mode": "selector", "verification_scope": "selector",
+        }
+        self.dialog.inspect_connection()
+        self.finish()
+        self.assertEqual(self.dialog.verified_identity, (self.dialog.controller.get(), "", "selector"))
+        self.assertEqual(self.inspect.call_args.args[0]["controller_api_mode"], "selector")
+        self.assertIn("当前模式未知", self.dialog.message.get())
+        self.assertIn("未验证 Codex 实际出站路径", self.dialog.message.get())
+        self.assertNotIn("规则模式", self.dialog.message.get())
+        self.assertNotIn("端口 None", self.dialog.message.get())
+        self.configure.return_value = dashboard.core.DEFAULTS | self.dialog.fields()
+        self.dialog.save()
+        self.finish()
+        self.assertEqual(self.configure.call_args.args[0]["controller_api_mode"], "selector")
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.compatible.set(False)
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.assertIsNone(self.dialog.verified_identity)
+
+    def test_auth_import_is_explicit_async_and_requires_test_and_save(self):
+        self.import_auth.assert_not_called()
+        self.import_auth.return_value = "NEARROUTE_MAOMAO_SECRET_9790"
+        before = self.dialog.secret_env.get()
+        self.dialog.import_auth()
+        self.assertTrue(self.dialog.applying)
+        self.assertTrue(self.dialog.importing)
+        self.assertTrue(self.owner.client_busy)
+        self.import_auth.assert_not_called()
+        self.dialog.close()
+        self.dialog.discard_changes()
+        self.assertFalse(self.dialog.closed)
+        self.workers.pop(0)()
+        self.assertEqual(self.dialog.secret_env.get(), before)
+        self.dialog.poll_results()
+        self.import_auth.assert_called_once_with(self.dialog.controller.get())
+        self.assertEqual(self.dialog.secret_env.get(), "NEARROUTE_MAOMAO_SECRET_9790")
+        self.assertFalse(self.dialog.applying)
+        self.assertFalse(self.dialog.importing)
+        self.assertFalse(self.owner.client_busy)
+        self.assertIsNone(self.dialog.verified_identity)
+        self.assertIn("请测试连接", self.dialog.message.get())
+        self.inspect.assert_not_called()
+        self.configure.assert_not_called()
+        self.start_daemon.assert_not_called()
+        self.dialog.save()
+        self.configure.assert_not_called()
+
+    def test_cancelled_auth_import_preserves_fields_and_does_not_retry(self):
+        self.dialog.secret_env.set("KEEP_EXISTING_SECRET")
+        before = self.dialog.fields()
+        self.import_auth.side_effect = RuntimeError("已取消管理员确认")
+        self.dialog.import_auth()
+        self.finish()
+        self.assertEqual(self.dialog.fields(), before)
+        self.assertFalse(self.dialog.applying)
+        self.assertFalse(self.owner.client_busy)
+        self.assertIn("已取消管理员确认", self.dialog.message.get())
+        self.dialog.poll_results()
+        self.import_auth.assert_called_once()
+        self.configure.assert_not_called()
+
+    def test_auth_result_does_not_overwrite_another_connection_draft(self):
+        self.import_auth.return_value = "NEARROUTE_MAOMAO_SECRET_9790"
+        self.dialog.import_auth()
+        self.dialog.controller.set("http://127.0.0.1:9090")
+        self.dialog.secret_env.set("OTHER_CLIENT_SECRET")
+        self.finish()
+        self.assertEqual(self.dialog.secret_env.get(), "OTHER_CLIENT_SECRET")
+        self.assertIn("本次认证未应用", self.dialog.message.get())
+        self.configure.assert_not_called()
 
 
 class ClientDialogLifecycleTests(unittest.TestCase):
@@ -583,6 +689,23 @@ class ClientContextTests(unittest.TestCase):
                 self.app.switch_node("visible node")
             request.assert_not_called()
             self.app.ensure_service.assert_not_called()
+
+    def test_selector_scope_labels_unknown_route_and_allows_group_selection_only_with_marker(self):
+        cfg = dashboard.core.DEFAULTS | {"controller_api_mode": "selector"}
+        context = dashboard.core.state_context(cfg)
+        status = {"controller_context": list(context), "selected": "visible node", "nodes": [{"name": "visible node"}],
+                  "nodes_probe_identity": dashboard.core.probe_identity(cfg), "mode": "unknown", "group": cfg["group"],
+                  "verification_scope": "selector", "phase": "monitoring", "controller_available": True,
+                  "updated_at": datetime.now(dashboard.CHINA_TIME).isoformat()}
+        with patch.object(dashboard, "read_json", side_effect=lambda path: status if path == dashboard.STATUS else cfg):
+            self.app.refresh()
+            self.assertEqual(self.app.node_mode, ("unknown", cfg["group"]))
+            self.assertIn("组内选择", self.app.current.set.call_args.args[0])
+            self.assertIn("Codex 实际路径未验证", self.app.node_meta.set.call_args.args[0])
+            self.assertIn("不核对 HTTP 状态码", self.app.policy.set.call_args.args[0])
+            status.pop("verification_scope")
+            self.app.refresh()
+            self.assertIsNone(self.app.node_mode)
 
     def test_client_save_clears_old_nodes_and_leaves_background_stopped(self):
         cfg = dashboard.core.DEFAULTS | {"controller": "http://127.0.0.1:9090", "group": "PROXY", "enabled": False}

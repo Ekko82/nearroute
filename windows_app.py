@@ -6,6 +6,7 @@ https://learn.microsoft.com/windows/win32/api/shellapi/nf-shellapi-shgetproperty
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 import ctypes
 from ctypes import wintypes
@@ -13,8 +14,10 @@ import json
 import ntpath
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
+import urllib.parse
 import uuid
 
 
@@ -30,6 +33,97 @@ GPS_READWRITE = 2
 GA_ROOT = 2
 RPC_E_CHANGED_MODE = -2147417850
 LAUNCH_PREFIX = ("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File")
+
+
+def _read_user_environment(name):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+        value, kind = winreg.QueryValueEx(key, name)
+    if kind != winreg.REG_SZ or not isinstance(value, str):
+        raise ValueError("Invalid controller credential")
+    return value
+
+
+def import_maomao_auth(controller):
+    """Import the selected local client's credential after a user clicks Import.
+
+    The elevated helper validates the client and stores only a user environment
+    variable. Its name is returned; the credential never enters process arguments,
+    stdout, diagnostic messages, or the application configuration.
+    """
+    if not IS_WINDOWS:
+        raise RuntimeError("猫猫云认证导入仅支持 Windows")
+    try:
+        url = urllib.parse.urlsplit(controller)
+        if (url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1", "localhost")
+                or url.username is not None or url.password is not None
+                or url.path not in ("", "/") or "?" in controller or "#" in controller
+                or "\\" in controller or any(ord(char) <= 32 or ord(char) >= 127 for char in controller)
+                or url.netloc.endswith(":") or not 1 <= (80 if url.port is None else url.port) <= 65535):
+            raise ValueError
+        host, port = url.hostname, url.port or 80
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError("认证导入仅支持本机 HTTP 控制地址，不能含账号密码、路径或查询参数") from None
+    script = ROOT / "controller_auth.ps1"
+    if not script.is_file():
+        raise RuntimeError("缺少认证导入组件，请更新或重新安装近舟")
+    powershell = str(Path(os.environ.get("SystemRoot", r"C:\Windows"))
+                     / "System32/WindowsPowerShell/v1.0/powershell.exe")
+    # Quote PowerShell literals separately from the executable's argument list.
+    # Neither constructed command contains a controller credential.
+    quote = lambda value: "'" + value.replace("'", "''") + "'"
+    program = """
+$ErrorActionPreference = 'Stop'
+try {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $expires = [DateTime]::UtcNow.AddSeconds(60).Ticks
+    $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
+        %s, '-ControllerHost', %s, '-ControllerPort', '%d', '-ExpectedSid', $sid,
+        '-RequestExpiresUtcTicks', $expires)
+    $process = Start-Process -FilePath %s -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -PassThru
+    try {
+        if (-not $process.WaitForExit(60000)) { exit 124 }
+        exit $process.ExitCode
+    } finally { $process.Dispose() }
+} catch {
+    if ($_.Exception.NativeErrorCode -eq 1223 -or $_.Exception.InnerException.NativeErrorCode -eq 1223) {
+        exit 1223
+    }
+    exit 15
+}
+""" % (quote('"' + str(script) + '"'), quote(host), port, quote(powershell))
+    try:
+        result = subprocess.run(
+            [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+             base64.b64encode(program.encode("utf-16-le")).decode("ascii")],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=150, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("管理员确认或认证导入超时，请确认猫猫云仍在运行后重试") from None
+    except OSError:
+        raise RuntimeError("无法启动管理员认证导入，请确认 Windows PowerShell 可用") from None
+    errors = {
+        10: "所选控制端口没有唯一的猫猫云内核，无法导入认证",
+        11: "无法核对猫猫云进程的当前用户身份",
+        12: "所选端口不属于支持的猫猫云进程，无法导入认证",
+        13: "猫猫云控制认证验证失败，请重新检测客户端后重试",
+        14: "无法保存当前用户的认证变量",
+        15: "无法启动管理员认证导入",
+        124: "认证导入超时，请确认猫猫云仍在运行后重试",
+        1223: "已取消管理员确认，未导入猫猫云认证",
+    }
+    if result.returncode:
+        raise RuntimeError(errors.get(result.returncode, "猫猫云认证导入未完成，请重新检测客户端后重试"))
+    name = f"NEARROUTE_MAOMAO_SECRET_{port}"
+    try:
+        credential = _read_user_environment(name)
+        if not re.fullmatch(r"[0-9a-fA-F]{48}", credential):
+            raise ValueError
+        os.environ[name] = credential
+    except (OSError, ValueError, TypeError, ImportError):
+        raise RuntimeError("认证已导入，但当前窗口未能读取认证变量，请重新打开近舟后测试连接") from None
+    return name
 
 
 class GUID(ctypes.Structure):

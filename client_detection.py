@@ -14,7 +14,7 @@ COMMON_CONTROLLER_PORTS = (9090, 9097, 9790)
 MAX_CONTROLLER_ADDRESSES = 24
 CONFIG_READ_UNSUPPORTED_MESSAGE = (
     "已检测到控制接口，但它不支持读取运行配置（GET /configs 返回 HTTP 405）。"
-    "近舟无法安全验证当前模式和代理端口，请选择支持完整控制接口的客户端。"
+    "可在客户端连接中启用代理组兼容模式，仅优选所选组；当前模式和实际出站路径无法验证。"
 )
 _BUILTINS = {"DIRECT", "REJECT", "REJECTDROP", "PASS", "COMPATIBLE"}
 
@@ -44,7 +44,7 @@ def recommend_group(proxies, configured_group, *, connection_chains=(), target_h
         if (not isinstance(name, str) or not isinstance(item, dict) or item.get("type") != "Selector"
                 or not isinstance(item.get("all"), list)):
             continue
-        if (mode == "global") != (name == "GLOBAL"):
+        if mode != "unknown" and (mode == "global") != (name == "GLOBAL"):
             continue
         if any(_is_leaf(proxies, member) for member in item["all"] if isinstance(member, str)):
             safe.append(name)
@@ -149,6 +149,7 @@ def discover_clients(cfg, inspect_func):
         fields = dict(cfg, controller=address)
         if address != configured:
             fields["controller_secret_env"] = ""
+            fields["controller_api_mode"] = "standard"
         try:
             information = inspect_func(fields, timeout=0.6, adaptive=True)
             return dict(information, controller=address, verified=True, needs_auth=False)

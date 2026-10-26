@@ -17,6 +17,7 @@ RELEASE_FILES = (
     "dashboard.py",
     "tray_icon.py",
     "windows_app.py",
+    "controller_auth.ps1",
     "updater.py",
     "install.ps1",
     "launch.ps1",
