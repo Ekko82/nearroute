@@ -27,6 +27,9 @@ class ClientDialogTests(unittest.TestCase):
                                      client_busy=False, client_dialog=None, client_saved=Mock(), cancel_service_start=Mock(), started_helpers=[], show_tab=Mock())
         self.parent = Mock(name="client_tab")
         self.interpreter = tk.Tcl()
+        # Run after dialog disposal and patch restoration. Mock widget commands
+        # form cycles that retain StringVars and their thread-bound interpreter.
+        self.addCleanup(self.release_tcl_fixture)
         string_var = tk.StringVar
         boolean_var = tk.BooleanVar
         self.workers = []
@@ -57,6 +60,18 @@ class ClientDialogTests(unittest.TestCase):
         self.dialog.applying = False
         if not self.dialog.closed:
             self.dialog.dispose()
+
+    def release_tcl_fixture(self):
+        interpreter = weakref.ref(self.interpreter)
+        self.workers.clear()
+        for mock in (self.inspect, self.discovery, self.configure, self.import_auth):
+            # Raised synthetic errors retain worker frames through tracebacks.
+            mock.reset_mock(return_value=True, side_effect=True)
+        self.dialog = self.interpreter = None
+        # Finalize this fixture's Tcl graph on its creator thread, before a later
+        # real diagnostic worker can trigger cyclic collection in another thread.
+        gc.collect()
+        self.assertIsNone(interpreter(), "client fixture retained its Tcl interpreter")
 
     def finish(self):
         self.workers.pop(0)()
