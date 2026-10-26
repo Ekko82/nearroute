@@ -88,6 +88,7 @@ class DashboardTrayTests(unittest.TestCase):
     def settings(self):
         dialog = MagicMock(name="settings_dialog")
         dialog.closed = False
+        dialog.has_unsaved_changes.return_value = False
         self.app.settings_dialog = dialog
         return dialog
 
@@ -128,23 +129,23 @@ class DashboardTrayTests(unittest.TestCase):
         self.app.root.iconify.assert_called_once()
         self.assertFalse(self.app.hidden_to_tray)
 
-    def test_hiding_settings_releases_grab_and_hides_both_windows(self):
+    def test_hiding_settings_page_only_hides_the_main_window(self):
         dialog = self.settings()
         self.app.hide_to_tray()
-        dialog.window.grab_release.assert_called_once()
-        dialog.window.withdraw.assert_called_once()
+        dialog.window.grab_release.assert_not_called()
+        dialog.window.withdraw.assert_not_called()
         self.app.root.withdraw.assert_called_once()
 
-    def test_show_restores_main_window_and_existing_settings_modal(self):
+    def test_show_restores_main_window_without_reopening_a_child(self):
         dialog = self.settings()
         self.app.hidden_to_tray = True
         self.app.show_window()
         self.app.root.deiconify.assert_called_once()
         self.app.root.lift.assert_called_once()
         self.app.root.focus_force.assert_called_once()
-        dialog.window.deiconify.assert_called_once()
-        dialog.window.lift.assert_called_once()
-        dialog.window.grab_set.assert_called_once()
+        dialog.window.deiconify.assert_not_called()
+        dialog.window.lift.assert_not_called()
+        dialog.window.grab_set.assert_not_called()
         self.assertFalse(self.app.hidden_to_tray)
 
     def test_tray_thread_callback_only_queues_until_main_thread_polls(self):
@@ -308,7 +309,7 @@ class DashboardTrayTests(unittest.TestCase):
             self.app.root.after_cancel.call_args_list,
             [call("refresh-poll"), call("tray-poll"), call("service-start")],
         )
-        dialog.close.assert_called_once()
+        dialog.dispose.assert_called_once()
         self.assertEqual(self.app.tray.stop_calls, 1)
         self.app.root.destroy.assert_called_once()
         self.run.assert_not_called()

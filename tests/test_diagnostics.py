@@ -255,10 +255,17 @@ class DiagnosticDialogTests(unittest.TestCase):
         root_patch = patch.object(dashboard, "ROOT", fixture.root)
         root_patch.start()
         self.addCleanup(root_patch.stop)
-        owner = SimpleNamespace(window=root, diagnostic_dialog=None)
-        dialog = dashboard.DiagnosticDialog(owner, visible=False)
+        notebook = dashboard.ttk.Notebook(root)
+        notebook.pack(fill="both", expand=True)
+        parent = dashboard.ttk.Frame(notebook)
+        notebook.add(parent, text="诊断信息")
+        owner = SimpleNamespace(root=root, diagnostic_dialog=None, show_tab=Mock())
+        with patch.object(dashboard.tk, "Toplevel", side_effect=AssertionError("inline page must not create windows")):
+            dialog = dashboard.DiagnosticDialog(owner, parent=parent)
         owner.diagnostic_dialog = dialog
-        self.addCleanup(dialog.close)
+        self.addCleanup(dialog.dispose)
+        self.assertIs(dialog.window.master, parent)
+        self.assertEqual(dialog.window.winfo_class(), "TFrame")
         return fixture, dialog
 
     def receive_summary(self, dialog):
@@ -275,6 +282,26 @@ class DiagnosticDialogTests(unittest.TestCase):
         errors = [] if errors is None else errors
         return {"state": "ok", "window_seconds": 7200, "error_count": len(errors),
                 "errors": errors, "transports": [], "truncated": False}
+
+    def test_inline_diagnostic_preview_and_actions_fit_available_page(self):
+        fixture, dialog = self.make_dialog()
+        root = dialog.owner.root
+        dashboard.apply_theme(root)
+        root.attributes("-alpha", 0)
+        root.geometry("920x540")
+        root.deiconify()
+        root.update()
+        self.assertGreaterEqual(dialog.text.winfo_height(), 120)
+        for button in (dialog.codex_button, *dialog.text.master.grid_slaves(row=5)[0].winfo_children()):
+            if button.winfo_class() != "TButton":
+                continue
+            self.assertTrue(button.winfo_ismapped())
+            x = button.winfo_rootx() - dialog.window.winfo_rootx()
+            y = button.winfo_rooty() - dialog.window.winfo_rooty()
+            self.assertGreaterEqual(x, 0)
+            self.assertGreaterEqual(y, 0)
+            self.assertLessEqual(x + button.winfo_width(), dialog.window.winfo_width())
+            self.assertLessEqual(y + button.winfo_height(), dialog.window.winfo_height())
 
     def test_explicit_read_runs_off_tk_and_merges_safe_timing_preview_before_copy(self):
         fixture, dialog = self.make_dialog()
@@ -433,9 +460,9 @@ class DiagnosticDialogTests(unittest.TestCase):
                 for marker in ("ENV_USER_MARKER", "DEFAULT_USER_MARKER", "ABS_USER_MARKER"):
                     self.assertNotIn(marker, dialog.summary)
                 self.assertEqual(fixture.files(), before)
-                dialog.close()
+                dialog.dispose()
 
-    def test_close_cancels_pending_poll_and_worker_failure_contains_no_exception_details(self):
+    def test_back_retains_preview_and_dispose_cancels_pending_poll_after_worker_failure(self):
         fixture, dialog = self.make_dialog()
         workers = []
         with patch.object(dashboard.threading, "Thread", side_effect=lambda **kw: workers.append(kw["target"]) or Mock()), \
@@ -449,10 +476,19 @@ class DiagnosticDialogTests(unittest.TestCase):
             self.assertNotIn("ENV_TOKEN_MARKER", dialog.summary)
             dialog.read_codex_summary()
             callback = dialog.after_id
+            preview = dialog.summary
+            dialog.close()
+            self.assertFalse(dialog.closed)
+            self.assertIs(dialog.owner.diagnostic_dialog, dialog)
+            self.assertEqual(dialog.summary, preview)
+            self.assertEqual(dialog.after_id, callback)
+            dialog.owner.show_tab.assert_called_once_with("overview")
             with patch.object(dialog.window, "after_cancel", wraps=dialog.window.after_cancel) as cancel:
-                dialog.close()
+                dialog.dispose()
             cancel.assert_called_once_with(callback)
             self.assertIsNone(dialog.after_id)
+            dialog.owner.show_tab.assert_called_once_with("overview")
+            self.assertIsNone(dialog.owner.diagnostic_dialog)
             workers.pop()()
             dialog.poll_codex_summary()
             self.assertTrue(dialog.closed)
@@ -474,7 +510,7 @@ class DiagnosticDialogTests(unittest.TestCase):
         self.assertIn("已读取范围内的观察数", dialog.codex_message.get())
         self.assertIn("不代表近 2 小时完整错误数或最终失败数", dialog.codex_message.get())
 
-    def test_preview_copy_failure_and_parent_close_remain_local(self):
+    def test_preview_copy_failure_and_independent_page_disposal_remain_local(self):
         fixture = DiagnosticSummaryTests()
         self.addCleanup(fixture.doCleanups)
         fixture.setUp()
@@ -489,27 +525,27 @@ class DiagnosticDialogTests(unittest.TestCase):
             update_can_install=False, update_text=Mock(get=Mock(return_value="fixture")),
             update_release=None, update_busy=None, update_prepared=None, exiting=False,
             check_updates=Mock(), request_update_install=Mock(), update_dialog=None,
+            diagnostic_dialog=None, show_tab=Mock(), open_diagnostics=Mock(),
         )
         update = None
-        dialog_class = dashboard.DiagnosticDialog
+        diagnostic = None
         try:
+            update_parent = dashboard.ttk.Frame(root)
+            diagnostic_parent = dashboard.ttk.Frame(root)
             with patch.object(dashboard, "ROOT", fixture.root), \
                  patch.object(dashboard, "start_daemon", side_effect=AssertionError("must not start helper")), \
                  patch.object(dashboard.threading, "Thread", side_effect=AssertionError("must not start worker")), \
-                 patch.object(dashboard, "DiagnosticDialog", side_effect=lambda parent: dialog_class(parent, visible=False)) as create, \
                  patch.object(dashboard.messagebox, "showerror") as showerror:
-                update = dashboard.UpdateDialog(owner)
-                update.window.withdraw()
+                update = dashboard.UpdateDialog(owner, parent=update_parent)
                 owner.update_dialog = update
                 update.open_diagnostics()
-                diagnostic = update.diagnostic_dialog
-                with patch.object(diagnostic.window, "lift"):
-                    update.open_diagnostics()
-                create.assert_called_once()
+                owner.open_diagnostics.assert_called_once()
+                diagnostic = dashboard.DiagnosticDialog(owner, parent=diagnostic_parent)
+                owner.diagnostic_dialog = diagnostic
                 self.assertEqual(diagnostic.text.get("1.0", "end-1c"), diagnostic.summary)
                 self.assertEqual(json.loads(diagnostic.summary)["version"], "0.2.223")
                 self.assertEqual(str(diagnostic.text.cget("state")), "disabled")
-                self.assertEqual(diagnostic.window.state(), "withdrawn")
+                self.assertIs(diagnostic.window.master, diagnostic_parent)
 
                 with patch.object(diagnostic.window, "clipboard_clear") as clear, \
                      patch.object(diagnostic.window, "clipboard_append") as append:
@@ -523,15 +559,22 @@ class DiagnosticDialogTests(unittest.TestCase):
                     self.assertNotIn("ENV_TOKEN_MARKER", str(showerror.call_args))
                     self.assertEqual(diagnostic.copy_message.get(), "")
 
-                update.close()
-                self.assertTrue(diagnostic.closed)
-                self.assertFalse(diagnostic.window.winfo_exists())
-                self.assertIsNone(update.diagnostic_dialog)
+                update.dispose()
+                self.assertFalse(diagnostic.closed)
+                self.assertTrue(diagnostic.window.winfo_exists())
+                self.assertIs(owner.diagnostic_dialog, diagnostic)
                 self.assertIsNone(owner.update_dialog)
-                diagnostic.close()
+                owner.show_tab.assert_not_called()
+                replacement = object()
+                owner.diagnostic_dialog = replacement
+                diagnostic.dispose()
+                self.assertIs(owner.diagnostic_dialog, replacement)
+                owner.show_tab.assert_not_called()
         finally:
             if update is not None and not update.closed:
-                update.close()
+                update.dispose()
+            if diagnostic is not None and not diagnostic.closed:
+                diagnostic.dispose()
             root.destroy()
 
 

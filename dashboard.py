@@ -506,7 +506,7 @@ def percentage(value: object) -> str:
 class SettingsDialog:
     """Edit probe settings and scope; controller access here is read-only."""
 
-    def __init__(self, owner: "Dashboard", *, load_nodes: bool = True, visible: bool = True):
+    def __init__(self, owner: "Dashboard", *, parent: ttk.Frame, load_nodes: bool = True, visible: bool = True):
         self.owner = owner
         self.raw = read_json(CONFIG) if CONFIG.exists() else {}
         cfg = core.DEFAULTS | self.raw
@@ -520,34 +520,29 @@ class SettingsDialog:
         self.closed = False
         self.after_id = None
         self.results: queue.SimpleQueue[tuple[bool, object]] = queue.SimpleQueue()
-        self.window = tk.Toplevel(owner.root)
-        self.window.title("测速设置 · 近舟 NearRoute")
-        self.window.geometry("840x760")
-        self.window.minsize(760, 690)
-        self.window.configure(background="#f3f6fb")
-        self.window.transient(owner.root)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        if not visible:
-            self.window.withdraw()
+        self.window = ttk.Frame(parent)
+        self.window.pack(fill="both", expand=True)
         self.url = tk.StringVar(value=str(cfg.get("probe_url", "")))
         self.expected = tk.StringVar(value=", ".join(str(value) for value in cfg.get("probe_expected_statuses", [])))
         self.mode = tk.StringVar(value=cfg.get("scan_mode", "regions"))
         self.regions = tk.StringVar(value=", ".join(cfg.get("scan_regions", [])))
         self.prefer_japan = tk.BooleanVar(value=cfg.get("prefer_japan", True))
         self.node_message = tk.StringVar(value=f"已保留 {len(self.selected_nodes)} 个已选节点，等待读取客户端。")
+        self.save_message = tk.StringVar(value="保存后重新测速；已暂停时保持暂停。")
+        self._saved_fields = self._draft_values()
 
-        form = ttk.Frame(self.window, padding=(24, 20, 24, 20))
+        form = ttk.Frame(self.window, padding=(16, 12))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
         form.rowconfigure(1, weight=1)
         header = ttk.Frame(form)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 8))
         ttk.Label(header, text="测速与选点", style="Title.TLabel").pack(anchor="w")
         ttk.Label(header, text="设置测试目标与候选范围，让优选更贴近你的使用习惯。", style="Muted.TLabel").pack(anchor="w", pady=(6, 0))
 
         tabs = ttk.Notebook(form)
         tabs.grid(row=1, column=0, sticky="nsew")
-        probe = ttk.Frame(tabs, style="Surface.TFrame", padding=18)
+        probe = ttk.Frame(tabs, style="Surface.TFrame", padding=12)
         probe.columnconfigure(0, weight=1)
         ttk.Label(probe, text="测速目标", style="Section.TLabel", background="#ffffff").grid(row=0, column=0, sticky="w")
         ttk.Entry(probe, textvariable=self.url).grid(row=1, column=0, sticky="ew", pady=(10, 12))
@@ -562,7 +557,7 @@ class SettingsDialog:
         )
         help_label.grid(row=3, column=0, sticky="ew", pady=(10, 0))
 
-        candidates = ttk.Frame(tabs, style="Surface.TFrame", padding=18)
+        candidates = ttk.Frame(tabs, style="Surface.TFrame", padding=12)
         tabs.add(candidates, text="节点范围")
         tabs.add(probe, text="测试目标")
         candidates.columnconfigure(0, weight=1)
@@ -602,7 +597,7 @@ class SettingsDialog:
         self.refresh_button.pack(side="right", padx=(0, 6))
         self.node_list = tk.Listbox(
             node_frame, selectmode=tk.EXTENDED, exportselection=False,
-            font=("Microsoft YaHei UI", 10), height=8,
+            font=("Microsoft YaHei UI", 10), height=5,
             background="#ffffff", foreground="#1e293b", selectbackground="#dbeafe", selectforeground="#1e40af",
             relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#dbe3ee", activestyle="none",
         )
@@ -616,16 +611,15 @@ class SettingsDialog:
         node_status = ttk.Label(candidates, textvariable=self.node_message, style="Surface.TLabel", foreground="#64748b", wraplength=730)
         node_status.grid(row=6, column=0, sticky="ew", pady=(8, 0))
         footer = ttk.Frame(form)
-        footer.grid(row=2, column=0, sticky="ew", pady=(18, 0))
-        ttk.Label(footer, text="保存后重新测速；已暂停时保持暂停。", style="Muted.TLabel").pack(side="left")
+        footer.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        ttk.Label(footer, textvariable=self.save_message, style="Muted.TLabel").pack(side="left")
         ttk.Button(footer, text="保存设置", style="Primary.TButton", command=self.save).pack(side="right")
-        ttk.Button(footer, text="取消", style="Secondary.TButton", command=self.close).pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="返回概览", style="Secondary.TButton", command=self.close).pack(side="right", padx=(0, 8))
+        ttk.Button(footer, text="放弃修改", command=self.discard_changes).pack(side="right", padx=(0, 8))
         form.bind("<Configure>", lambda event: self.resize_text(event.width, (help_label, region_help, node_status)))
         self.render_nodes()
         self.update_mode()
         self.after_id = self.window.after(150, self.poll_results)
-        if visible:
-            self.window.grab_set()
         if load_nodes:
             self.refresh_nodes()
 
@@ -750,23 +744,45 @@ class SettingsDialog:
             "prefer_japan": self.prefer_japan.get(),
         }
 
+    def _draft_values(self) -> tuple:
+        return (self.url.get(), self.expected.get(), self.mode.get(), self.regions.get(),
+                self.prefer_japan.get(), frozenset(self.selected_nodes))
+
+    def has_unsaved_changes(self) -> bool:
+        return self._draft_values() != self._saved_fields
+
     def save(self) -> None:
+        if self.closed or any(getattr(self.owner, name, False) for name in
+                              ("exiting", "restore_busy", "manual_busy", "client_busy")):
+            self.save_message.set("当前操作尚未完成，请稍后保存设置。")
+            return
         try:
             saved = save_settings(self.fields())
         except (OSError, ValueError) as error:
             messagebox.showerror("设置未保存", str(error), parent=self.window)
             return
         self.owner.settings_saved(saved)
-        self.close()
+        self._saved_fields = self._draft_values()
+        self.save_message.set("设置已保存；可继续修改。")
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.owner.show_tab("overview")
+
+    def discard_changes(self) -> None:
+        if self.closed:
+            return
+        self.dispose()
+        self.owner.show_tab("overview")
+
+    def dispose(self) -> None:
+        if self.closed:
+            return
         self.closed = True
         if self.after_id is not None:
             self.window.after_cancel(self.after_id)
-        try:
-            self.window.grab_release()
-        except tk.TclError:
-            pass
+            self.after_id = None
         self.window.destroy()
         if getattr(self.owner, "settings_dialog", None) is self:
             self.owner.settings_dialog = None
@@ -775,7 +791,7 @@ class SettingsDialog:
 class ClientDialog:
     """Connect a local Mihomo/Clash API without changing proxy selections."""
 
-    def __init__(self, owner: "Dashboard", *, visible: bool = True):
+    def __init__(self, owner: "Dashboard", *, parent: ttk.Frame, visible: bool = True):
         self.owner = owner
         cfg = core.DEFAULTS | (read_json(CONFIG) if CONFIG.exists() else {})
         self.original_context = core.state_context(cfg)
@@ -786,35 +802,29 @@ class ClientDialog:
         self.discovery_identity = None
         self.results = queue.SimpleQueue()
         self.after_id = None
-        self.window = tk.Toplevel(owner.root)
-        self.window.title("客户端连接 · 近舟 NearRoute")
-        self.window.geometry("800x700")
-        self.window.minsize(720, 640)
-        self.window.configure(background="#f3f6fb")
-        self.window.transient(owner.root)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        if not visible:
-            self.window.withdraw()
+        self.window = ttk.Frame(parent)
+        self.window.pack(fill="both", expand=True)
         self.controller = tk.StringVar(value=cfg["controller"])
         self.secret_env = tk.StringVar(value=cfg["controller_secret_env"])
         self.group = tk.StringVar(value=cfg["group"])
         self.auto_detect = tk.BooleanVar(value=cfg.get("auto_detect_client", True))
         self.auto_group = tk.BooleanVar(value=cfg.get("auto_select_group", True))
+        self._saved_fields = self._draft_values()
         self.message = tk.StringVar(value="自动发现本机客户端，或填写控制地址后测试连接；检查过程不会切换节点。")
-        form = ttk.Frame(self.window, padding=(24, 20, 24, 20))
+        form = ttk.Frame(self.window, padding=(16, 12))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
         form.rowconfigure(2, weight=1)
         header = ttk.Frame(form)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 18))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(header, text="连接代理客户端", style="Title.TLabel").pack(anchor="w")
         help_text = ("支持 Clash Verge Rev、Clash Party（原 Mihomo Party）等本机 Mihomo/Clash 客户端。"
                      "请先在客户端开启 HTTP 外部控制，并启用 HTTP 或 mixed 代理端口。")
         help_label = ttk.Label(header, text=help_text, wraplength=690, style="Muted.TLabel")
         help_label.pack(anchor="w", fill="x", pady=(6, 0))
 
-        connection = ttk.Frame(form, style="Card.TFrame", padding=14)
-        connection.grid(row=1, column=0, sticky="ew", pady=(0, 14))
+        connection = ttk.Frame(form, style="Card.TFrame", padding=10)
+        connection.grid(row=1, column=0, sticky="ew", pady=(0, 10))
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text="控制地址", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 14))
         self.address_entry = ttk.Combobox(connection, textvariable=self.controller)
@@ -832,7 +842,7 @@ class ClientDialog:
         self.auto_detect_button = ttk.Checkbutton(connection, text="当前地址失效时自动发现本机客户端", variable=self.auto_detect, style="Surface.TCheckbutton")
         self.auto_detect_button.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
 
-        selection = ttk.Frame(form, style="Card.TFrame", padding=16)
+        selection = ttk.Frame(form, style="Card.TFrame", padding=10)
         selection.grid(row=2, column=0, sticky="nsew")
         selection.columnconfigure(0, weight=1)
         ttk.Label(selection, text="选择代理组", style="Section.TLabel", background="#ffffff").grid(row=0, column=0, columnspan=2, sticky="w")
@@ -845,12 +855,14 @@ class ClientDialog:
         message_label = ttk.Label(selection, textvariable=self.message, wraplength=650, style="Surface.TLabel", foreground="#64748b")
         message_label.grid(row=3, column=0, columnspan=2, sticky="ew")
         actions = ttk.Frame(form)
-        actions.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(actions, text="更换连接会停止后台并暂停自动优选。", style="Muted.TLabel").pack(side="left")
         self.save_button = ttk.Button(actions, text="保存连接", style="Primary.TButton", command=self.save)
         self.save_button.pack(side="right")
-        self.cancel_button = ttk.Button(actions, text="取消", style="Secondary.TButton", command=self.close)
+        self.cancel_button = ttk.Button(actions, text="返回概览", style="Secondary.TButton", command=self.close)
         self.cancel_button.pack(side="right", padx=8)
+        self.discard_button = ttk.Button(actions, text="放弃修改", command=self.discard_changes)
+        self.discard_button.pack(side="right")
         form.bind("<Configure>", lambda event: (
             help_label.configure(wraplength=max(400, event.width - 48)),
             [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, message_label)],
@@ -863,13 +875,19 @@ class ClientDialog:
         self.update_buttons()
         self.after_id = self.window.after(150, self.poll_results)
         if visible:
-            self.window.grab_set()
             self.discover_connections()
 
     def fields(self) -> dict:
         return {"controller": self.controller.get().strip().rstrip("/"),
                 "controller_secret_env": self.secret_env.get().strip(), "group": self.group.get(),
                 "auto_detect_client": self.auto_detect.get(), "auto_select_group": self.auto_group.get()}
+
+    def _draft_values(self) -> tuple:
+        return (self.controller.get(), self.secret_env.get(), self.group.get(),
+                self.auto_detect.get(), self.auto_group.get())
+
+    def has_unsaved_changes(self) -> bool:
+        return self._draft_values() != self._saved_fields
 
     def identity(self):
         fields = self.fields()
@@ -888,7 +906,8 @@ class ClientDialog:
         self.discover_button.state(["disabled"] if busy else ["!disabled"])
         ready = not busy and self.verified_identity == self.identity() and self.group.get() in self.selector_groups
         self.save_button.state(["!disabled"] if ready else ["disabled"])
-        for widget in (self.address_entry, self.secret_entry, self.auto_detect_button, self.auto_group_button, self.cancel_button):
+        for widget in (self.address_entry, self.secret_entry, self.auto_detect_button, self.auto_group_button,
+                       self.cancel_button, self.discard_button):
             widget.state(["disabled"] if self.applying else ["!disabled"])
         self.groups.configure(state="disabled" if self.applying else "readonly")
 
@@ -1007,17 +1026,30 @@ class ClientDialog:
                 else:
                     self.applying = self.owner.client_busy = False
                     if success:
+                        self.original_context = core.state_context(result)
                         self.owner.client_saved(result)
-                        self.close()
-                        return
-                    self.message.set("连接未保存：" + result)
+                        self._saved_fields = self._draft_values()
+                        self.message.set("客户端连接已保存；可继续修改或返回概览。")
+                    else:
+                        self.message.set("连接未保存：" + result)
                 self.update_buttons()
         except queue.Empty:
             pass
         self.after_id = self.window.after(150, self.poll_results)
 
     def close(self) -> None:
-        if self.applying:
+        if self.closed or self.applying:
+            return
+        self.owner.show_tab("overview")
+
+    def discard_changes(self) -> None:
+        if self.closed or self.applying:
+            return
+        self.dispose()
+        self.owner.show_tab("overview")
+
+    def dispose(self) -> None:
+        if self.closed:
             return
         for variable, token in self._variable_traces:
             variable.trace_remove("write", token)
@@ -1025,51 +1057,42 @@ class ClientDialog:
         self.closed = True
         if self.after_id is not None:
             self.window.after_cancel(self.after_id)
-        try:
-            self.window.grab_release()
-        except tk.TclError:
-            pass
+            self.after_id = None
         self.window.destroy()
         if getattr(self.owner, "client_dialog", None) is self:
             self.owner.client_dialog = None
 
 
 class DiagnosticDialog:
-    def __init__(self, owner, *, visible=True):
+    def __init__(self, owner: Dashboard, *, parent: ttk.Frame):
         self.owner, self.closed = owner, False
         self.summary = diagnostic_summary()
         self.results = queue.SimpleQueue()
         self.after_id = None
         self.reading_codex = False
-        self.window = tk.Toplevel(owner.window)
-        self.window.title("诊断信息 · 近舟 NearRoute")
-        self.window.geometry("760x720")
-        self.window.minsize(620, 590)
-        self.window.configure(background="#f3f6fb")
-        self.window.transient(owner.window)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        if not visible:
-            self.window.withdraw()
-        form = ttk.Frame(self.window, padding=24)
+        self.window = ttk.Frame(parent)
+        self.window.pack(fill="both", expand=True)
+        form = ttk.Frame(self.window, padding=(20, 16))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
         form.rowconfigure(4, weight=1)
         ttk.Label(form, text="诊断信息", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        description = ttk.Label(form, text="查看本安装的运行摘要，复制后可用于排查连接或更新问题。\n摘要不会自动发送。", style="Muted.TLabel", wraplength=650)
-        description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 12))
+        description = ttk.Label(form, text="查看本安装的运行摘要；仅手动复制，不会自动发送。", style="Muted.TLabel", wraplength=800)
+        description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 8))
         self.version_note = tk.StringVar(value=self.runtime_note(json.loads(self.summary)))
         runtime_label = ttk.Label(form, textvariable=self.version_note, style="Muted.TLabel", wraplength=680)
-        runtime_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        runtime_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         opt_in = ttk.Frame(form)
-        opt_in.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        opt_in.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         opt_in.columnconfigure(0, weight=1)
-        privacy_label = ttk.Label(opt_in, text="仅此次读取本机日志，输出脱敏时间线；不启用后台日志监测。\n使用配置的路径或本机 Codex 默认日志，仅显示近 2 小时的时间、错误类别、重试次数与传输方式。\n不包含原始日志、提示词、令牌或路径，读取后先在下方预览。", style="Muted.TLabel", wraplength=650)
+        privacy_label = ttk.Label(opt_in, text="仅此次读取配置路径或本机 Codex 默认日志，预览近 2 小时脱敏时间线。\n仅含时间、错误类别、重试次数与传输方式，不含原始日志、提示词、令牌或路径。", style="Muted.TLabel", wraplength=650)
         privacy_label.grid(row=0, column=0, sticky="ew")
         self.codex_button = ttk.Button(opt_in, text="读取 Codex 断流摘要", command=self.read_codex_summary)
-        self.codex_button.grid(row=1, column=0, sticky="w", pady=(8, 0))
+        self.codex_button.grid(row=0, column=1, sticky="ne", padx=(16, 0))
         self.codex_message = tk.StringVar(value="")
-        ttk.Label(opt_in, textvariable=self.codex_message, style="Muted.TLabel", wraplength=650).grid(row=2, column=0, sticky="ew", pady=(6, 0))
-        self.text = tk.Text(form, wrap="word", font=("Consolas", 10), background="#ffffff", foreground="#334155", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#e2e8f0", padx=16, pady=14, spacing3=3)
+        codex_feedback = ttk.Label(opt_in, textvariable=self.codex_message, style="Muted.TLabel", wraplength=800)
+        codex_feedback.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        self.text = tk.Text(form, wrap="word", height=8, font=("Consolas", 10), background="#ffffff", foreground="#334155", relief="flat", borderwidth=0, highlightthickness=1, highlightbackground="#e2e8f0", padx=16, pady=14, spacing3=3)
         self.text.grid(row=4, column=0, sticky="nsew")
         self.text.insert("1.0", self.summary)
         self.text.configure(state="disabled")
@@ -1077,15 +1100,16 @@ class DiagnosticDialog:
         scrollbar.grid(row=4, column=1, sticky="ns")
         self.text.configure(yscrollcommand=scrollbar.set)
         actions = ttk.Frame(form)
-        actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(18, 0))
+        actions.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(12, 0))
         self.copy_message = tk.StringVar(value="")
         ttk.Label(actions, textvariable=self.copy_message, style="Muted.TLabel").pack(side="left")
         ttk.Button(actions, text="复制摘要", style="Primary.TButton", command=self.copy_summary).pack(side="right")
-        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=(0, 10))
+        ttk.Button(actions, text="返回概览", command=self.close).pack(side="right", padx=(0, 10))
         def resize_description(event):
             if event.widget is self.window:
-                for label in (description, runtime_label, privacy_label):
-                    label.configure(wraplength=max(320, event.width - 64))
+                for label in (description, runtime_label, codex_feedback):
+                    label.configure(wraplength=max(320, event.width - 56))
+                privacy_label.configure(wraplength=max(320, event.width - 260))
 
         self.window.bind("<Configure>", resize_description, add="+")
 
@@ -1203,34 +1227,34 @@ class DiagnosticDialog:
     def close(self):
         if self.closed:
             return
+        self.owner.show_tab("overview")
+
+    def dispose(self):
+        if self.closed:
+            return
         self.closed = True
         if self.after_id is not None:
             self.window.after_cancel(self.after_id)
             self.after_id = None
-        self.owner.diagnostic_dialog = None
+        if getattr(self.owner, "diagnostic_dialog", None) is self:
+            self.owner.diagnostic_dialog = None
         self.window.destroy()
 
 
 class UpdateDialog:
     """Release notes and preferences; all network work belongs to the owner."""
 
-    def __init__(self, owner: Dashboard):
+    def __init__(self, owner: Dashboard, *, parent: ttk.Frame):
         self.owner = owner
         self.closed = False
-        self.diagnostic_dialog = None
-        self.window = tk.Toplevel(owner.root)
-        self.window.title("版本与更新 · 近舟 NearRoute")
-        self.window.geometry("720x620")
-        self.window.minsize(580, 540)
-        self.window.configure(background="#f3f6fb")
-        self.window.transient(owner.root)
-        self.window.protocol("WM_DELETE_WINDOW", self.close)
-        form = ttk.Frame(self.window, padding=24)
+        self.window = ttk.Frame(parent)
+        self.window.pack(fill="both", expand=True)
+        form = ttk.Frame(self.window, padding=(20, 16))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
         form.rowconfigure(2, weight=1)
         header = ttk.Frame(form)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 20))
+        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(0, weight=1)
         ttk.Label(header, text="版本与更新", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         self.check_button = ttk.Button(header, text="立即检查", command=lambda: owner.check_updates(manual=True))
@@ -1250,8 +1274,8 @@ class UpdateDialog:
         self.notes.configure(yscrollcommand=scrollbar.set)
         self.auto_check = tk.BooleanVar(value=owner.update_preferences["auto_check"])
         self.mode = tk.StringVar(value=owner.update_preferences["mode"])
-        preferences = ttk.Frame(form, style="Card.TFrame", padding=16)
-        preferences.grid(row=3, column=0, sticky="ew", pady=(18, 0))
+        preferences = ttk.Frame(form, style="Card.TFrame", padding=12)
+        preferences.grid(row=3, column=0, sticky="ew", pady=(12, 0))
         preferences.columnconfigure(0, weight=1)
         ttk.Label(preferences, text="自动更新", style="Surface.TLabel", font=("Microsoft YaHei UI", 11, "bold")).grid(row=0, column=0, sticky="w")
         ttk.Checkbutton(preferences, text="每 6 小时检查新版本", style="Surface.TCheckbutton", variable=self.auto_check).grid(row=0, column=1, sticky="e", padx=(12, 0))
@@ -1259,7 +1283,7 @@ class UpdateDialog:
         modes.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         for label, value in (("提醒后由我安装", "notify"), ("自动下载，提醒安装", "download"), ("空闲时自动安装并重启", "install")):
             button = ttk.Radiobutton(modes, text=label, value=value, variable=self.mode, style="Surface.TRadiobutton")
-            button.pack(anchor="w", pady=3)
+            button.pack(side="left", padx=(0, 16), pady=3)
             if value != "notify" and not owner.update_can_install:
                 button.state(["disabled"])
         update_help = ("支持在软件内更新，本地源码有改动时会保留并提示。" if owner.update_can_install
@@ -1267,12 +1291,15 @@ class UpdateDialog:
         help_label = ttk.Label(preferences, text=update_help, style="Surface.TLabel", foreground="#64748b", wraplength=620)
         help_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
         actions = ttk.Frame(form)
-        actions.grid(row=4, column=0, sticky="ew", pady=(20, 0))
+        actions.grid(row=4, column=0, sticky="ew", pady=(12, 0))
         ttk.Button(actions, text="诊断信息", command=self.open_diagnostics).pack(side="left")
         self.install_button = ttk.Button(actions, style="Primary.TButton", command=owner.request_update_install)
         self.install_button.pack(side="right")
         ttk.Button(actions, text="保存设置", command=self.save).pack(side="right", padx=(0, 8))
-        ttk.Button(actions, text="关闭", command=self.close).pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="放弃修改", command=self.discard_changes).pack(side="right", padx=(0, 8))
+        ttk.Button(actions, text="返回概览", command=self.close).pack(side="right", padx=(0, 8))
+        self.message = tk.StringVar(value="")
+        ttk.Label(form, textvariable=self.message, style="Muted.TLabel").grid(row=5, column=0, sticky="w", pady=(6, 0))
         def resize_description(event):
             if event.widget is self.window:
                 for label in (summary_label, help_label):
@@ -1282,10 +1309,11 @@ class UpdateDialog:
         self.refresh()
 
     def open_diagnostics(self):
-        if self.diagnostic_dialog is not None and not self.diagnostic_dialog.closed:
-            self.diagnostic_dialog.window.lift()
-            return
-        self.diagnostic_dialog = DiagnosticDialog(self)
+        self.owner.open_diagnostics()
+
+    def has_unsaved_changes(self) -> bool:
+        return (self.auto_check.get() != self.owner.update_preferences["auto_check"]
+                or self.mode.get() != self.owner.update_preferences["mode"])
 
     def refresh(self) -> None:
         owner = self.owner
@@ -1308,14 +1336,25 @@ class UpdateDialog:
             return
         self.owner.update_next_check = 0.0
         self.owner.notify("更新设置已保存。", 10)
-        self.close()
+        self.message.set("更新设置已保存。")
 
     def close(self) -> None:
+        if self.closed:
+            return
+        self.owner.show_tab("overview")
+
+    def discard_changes(self) -> None:
+        if self.closed:
+            return
+        self.dispose()
+        self.owner.show_tab("overview")
+
+    def dispose(self) -> None:
+        if self.closed:
+            return
         self.closed = True
-        diagnostic = getattr(self, "diagnostic_dialog", None)
-        if diagnostic is not None:
-            diagnostic.close()
-        self.owner.update_dialog = None
+        if getattr(self.owner, "update_dialog", None) is self:
+            self.owner.update_dialog = None
         self.window.destroy()
 
 
@@ -1355,6 +1394,8 @@ class Dashboard:
         self.update_prepared = None
         self.update_requested_install = False
         self.update_dialog = None
+        self.diagnostic_dialog = None
+        self.active_tab = "overview"
         self.update_next_check = 0.0
         self.update_can_install = updater.can_update(root=ROOT)
         self.update_preferences = updater.load_preferences(root=ROOT)
@@ -1374,22 +1415,19 @@ class Dashboard:
         root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
         apply_theme(root)
 
-        container = ttk.Frame(root, padding=(24, 16))
+        self.tabs = ttk.Notebook(root, padding=0)
+        self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
+        self.pages = {}
+        for key, label in (("overview", "线路概览"), ("client", "客户端连接"),
+                           ("settings", "测速设置"), ("updates", "版本与更新"), ("diagnostics", "诊断信息")):
+            page = ttk.Frame(self.tabs)
+            self.pages[key] = page
+            self.tabs.add(page, text=label)
+        self.tabs.bind("<<NotebookTabChanged>>", self.tab_changed)
+        container = ttk.Frame(self.pages["overview"], padding=(16, 8))
         container.pack(fill="both", expand=True)
         container.columnconfigure(0, weight=1)
         container.rowconfigure(3, weight=1)
-        header = ttk.Frame(container)
-        header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
-        header.columnconfigure(0, weight=1)
-        brand = ttk.Frame(header)
-        brand.grid(row=0, column=0, sticky="w")
-        ttk.Label(brand, text=WINDOW_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(brand, text="线路概览", style="Muted.TLabel").pack(side="left", padx=(14, 0), pady=(8, 0))
-        self.client_button = ttk.Button(header, text="客户端连接", command=self.open_client)
-        self.client_button.grid(row=0, column=1, padx=(0, 8))
-        self.settings_button = ttk.Button(header, text="测速设置", command=self.open_settings)
-        self.settings_button.grid(row=0, column=2)
-
         self.current = tk.StringVar(value="当前节点：等待代理客户端连接")
         self.health = tk.StringVar(value="控制接口：等待检测")
         self.timings = tk.StringVar(value="最近测速：—    下次测速：—    最近切换：—")
@@ -1402,7 +1440,7 @@ class Dashboard:
         hero.columnconfigure(0, weight=1)
         node = ttk.Frame(hero, style="Surface.TFrame")
         node.grid(row=0, column=0, sticky="nsew", padx=(0, 20))
-        ttk.Label(node, text="当前线路", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(node, text="近舟 NearRoute · 当前线路", style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w")
         node.columnconfigure(0, weight=1)
         node_label = ttk.Label(node, textvariable=self.node_title, style="Node.TLabel", width=1, wraplength=600)
         node_label.grid(row=1, column=0, sticky="ew", pady=(2, 4))
@@ -1534,12 +1572,44 @@ class Dashboard:
         self.notice_until = time.monotonic() + duration
 
     def open_updates(self) -> None:
-        if self.exiting:
+        self.show_tab("updates")
+
+    def open_diagnostics(self) -> None:
+        self.show_tab("diagnostics")
+
+    def show_tab(self, key) -> None:
+        if self.closed or self.exiting:
             return
-        if self.update_dialog is not None and not self.update_dialog.closed:
-            self.update_dialog.window.lift()
+        self.ensure_page(key)
+        self.active_tab = key
+        self.tabs.select(self.pages[key])
+
+    def tab_changed(self, _event=None) -> None:
+        if self.closed or self.exiting:
             return
-        self.update_dialog = UpdateDialog(self)
+        selected = self.tabs.select()
+        key = next((key for key, page in self.pages.items() if str(page) == selected), None)
+        if key is not None:
+            try:
+                self.ensure_page(key)
+                self.active_tab = key
+            except (OSError, ValueError, updater.UpdateError) as error:
+                self.show_tab("overview")
+                self.notify(f"页面暂时无法打开：{error}", 15)
+
+    def ensure_page(self, key) -> None:
+        panels = {"client": ("client_dialog", ClientDialog), "settings": ("settings_dialog", SettingsDialog),
+                  "updates": ("update_dialog", UpdateDialog), "diagnostics": ("diagnostic_dialog", DiagnosticDialog)}
+        if key in panels:
+            attribute, factory = panels[key]
+            panel = getattr(self, attribute)
+            if panel is None or panel.closed:
+                setattr(self, attribute, factory(self, parent=self.pages[key]))
+
+    def has_unsaved_page_changes(self) -> bool:
+        return any(panel is not None and not panel.closed and panel.has_unsaved_changes()
+                   for panel in (getattr(self, "client_dialog", None), getattr(self, "settings_dialog", None),
+                                 getattr(self, "update_dialog", None)))
 
     def update_worker(self, operation: str, work) -> None:
         """Workers publish plain values; only refresh is allowed to touch Tk."""
@@ -1577,6 +1647,11 @@ class Dashboard:
         if self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             self.notify("正在处理节点操作，请完成后再安装更新。", 15)
             return
+        if self.has_unsaved_page_changes():
+            self.update_text.set("有未保存的页面设置，请先保存或放弃修改，再安装更新。")
+            if self.update_dialog is not None:
+                self.update_dialog.refresh()
+            return
         if not messagebox.askyesno("安装近舟更新", "安装更新会停止后台优选并重启近舟。保留现有设置和当前代理节点，是否继续？", parent=self.root):
             return
         self.update_requested_install = True
@@ -1591,6 +1666,12 @@ class Dashboard:
         if self.closed or self.exiting or self.update_busy or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             return
         if self.update_prepared is None or not self.update_can_install:
+            return
+        if self.has_unsaved_page_changes():
+            self.update_requested_install = False
+            self.update_text.set("更新已下载，请先保存或放弃未保存的页面设置，再安装更新。")
+            if self.update_dialog is not None:
+                self.update_dialog.refresh()
             return
         self.exiting = True  # Also blocks daemon starts and all conflicting node actions.
         self.cancel_service_start()
@@ -1608,12 +1689,8 @@ class Dashboard:
     def automatic_install_ready(self, status: dict) -> bool:
         if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.update_busy or getattr(self, "client_busy", False):
             return False
-        if self.settings_dialog is not None and not self.settings_dialog.closed:
-            return False
-        if self.update_dialog is not None and not self.update_dialog.closed:
-            return False
-        client_dialog = getattr(self, "client_dialog", None)
-        if client_dialog is not None and not client_dialog.closed:
+        if ((getattr(self, "active_tab", "overview") != "overview" and not getattr(self, "hidden_to_tray", False))
+                or self.has_unsaved_page_changes()):
             return False
         if status_is_stale(status) or status.get("phase") not in ("monitoring", "paused", "waiting", "stopped"):
             return False
@@ -1726,11 +1803,8 @@ class Dashboard:
     def open_client(self) -> None:
         if self.exiting or self.restore_busy or self.manual_busy or self.client_busy:
             return
-        if self.client_dialog is not None and not self.client_dialog.closed:
-            self.client_dialog.window.lift()
-            return
         try:
-            self.client_dialog = ClientDialog(self)
+            self.show_tab("client")
         except (OSError, ValueError) as error:
             messagebox.showerror("无法打开客户端连接", str(error), parent=self.root)
 
@@ -1760,12 +1834,8 @@ class Dashboard:
     def open_settings(self) -> None:
         if self.restore_busy or self.exiting or getattr(self, "client_busy", False):
             return
-        if self.settings_dialog is not None and not self.settings_dialog.closed:
-            self.settings_dialog.window.lift()
-            self.settings_dialog.window.focus_force()
-            return
         try:
-            self.settings_dialog = SettingsDialog(self)
+            self.show_tab("settings")
         except (OSError, ValueError) as error:
             messagebox.showerror("无法打开设置", str(error), parent=self.root)
 
@@ -1943,7 +2013,6 @@ class Dashboard:
         self.enable_button.state(["disabled"])
         self.pause_button.state(["disabled"])
         self.scan_button.state(["disabled"])
-        self.settings_button.state(["disabled"])
         self.exit_button.state(["disabled"])
         self.notify("正在恢复原节点，自动切换已暂停…", 90)
 
@@ -2033,11 +2102,10 @@ class Dashboard:
         self.enable_button.state(["disabled"] if busy or (enabled and running) else ["!disabled"])
         self.pause_button.state(["!disabled"] if enabled and not busy else ["disabled"])
         self.scan_button.state(["disabled"] if busy else ["!disabled"])
-        self.settings_button.state(["disabled"] if busy else ["!disabled"])
         self.restore_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
         self.exit_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
         if self.exiting:
-            for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button, self.settings_button):
+            for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button):
                 button.state(["disabled"])
         if client_busy:
             badge, color = "正在保存客户端连接", "#1b66b0"
@@ -2155,16 +2223,6 @@ class Dashboard:
             return
         if self.tray is not None and self.tray.available:
             try:
-                if self.settings_dialog is not None and not self.settings_dialog.closed:
-                    self.settings_dialog.window.grab_release()
-                    self.settings_dialog.window.withdraw()
-                client_dialog = getattr(self, "client_dialog", None)
-                if client_dialog is not None and not client_dialog.closed:
-                    client_dialog.window.grab_release()
-                    client_dialog.window.withdraw()
-                update_dialog = getattr(self, "update_dialog", None)
-                if update_dialog is not None and not update_dialog.closed:
-                    update_dialog.window.withdraw()
                 self.root.withdraw()
                 self.hidden_to_tray = True
                 return
@@ -2180,20 +2238,6 @@ class Dashboard:
         self.root.lift()
         self.root.focus_force()
         self.hidden_to_tray = False
-        client_dialog = getattr(self, "client_dialog", None)
-        if client_dialog is not None and not client_dialog.closed:
-            client_dialog.window.deiconify()
-            client_dialog.window.lift()
-            client_dialog.window.grab_set()
-        if self.settings_dialog is not None and not self.settings_dialog.closed:
-            window = self.settings_dialog.window
-            window.deiconify()
-            window.lift()
-            window.grab_set()
-        update_dialog = getattr(self, "update_dialog", None)
-        if update_dialog is not None and not update_dialog.closed:
-            update_dialog.window.deiconify()
-            update_dialog.window.lift()
 
     def poll_tray(self) -> None:
         if self.closed:
@@ -2273,23 +2317,13 @@ class Dashboard:
         if self.closed:
             return
         self.closed = True
-        client_dialog = getattr(self, "client_dialog", None)
-        if client_dialog is not None and not client_dialog.closed:
-            try:
-                client_dialog.close()
-            except tk.TclError:
-                pass
-        update_dialog = getattr(self, "update_dialog", None)
-        if update_dialog is not None and not update_dialog.closed:
-            try:
-                update_dialog.close()
-            except tk.TclError:
-                pass
-        if self.settings_dialog is not None and not self.settings_dialog.closed:
-            try:
-                self.settings_dialog.close()
-            except tk.TclError:
-                pass
+        for name in ("client_dialog", "settings_dialog", "update_dialog", "diagnostic_dialog"):
+            panel = getattr(self, name, None)
+            if panel is not None and not panel.closed:
+                try:
+                    panel.dispose()
+                except tk.TclError:
+                    pass
         for callback in (self.after_id, self.tray_after_id, self.service_after_id):
             if callback is not None:
                 try:

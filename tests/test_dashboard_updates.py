@@ -32,6 +32,8 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.root = Path(self.directory.name)
         self.app = dashboard.Dashboard.__new__(dashboard.Dashboard)
         self.app.root = Mock()
+        self.app.active_tab = "overview"
+        self.app.show_tab = Mock(side_effect=lambda key: setattr(self.app, "active_tab", key))
         self.app.closed = self.app.exiting = self.app.restore_busy = self.app.manual_busy = self.app.client_busy = False
         self.app.client_dialog = None
         self.app.settings_dialog = self.app.update_dialog = None
@@ -228,11 +230,13 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.app.restore_busy = True
         self.app.poll_updates(self.fresh_status())
         self.app.restore_busy = False
-        self.app.settings_dialog = SimpleNamespace(closed=False)
+        self.app.settings_dialog = SimpleNamespace(closed=False, has_unsaved_changes=Mock(return_value=True))
         self.app.poll_updates(self.fresh_status())
         self.assertEqual(self.workers, [])
-        self.app.settings_dialog = None
+        self.assertEqual(self.app.active_tab, "overview")
+        self.app.settings_dialog.has_unsaved_changes.return_value = False
         self.app.poll_updates(self.fresh_status())
+        self.assertFalse(self.app.settings_dialog.closed)
         self.assertTrue(self.app.exiting)
         self.assertEqual(self.app.update_busy, "install")
         self.confirm.assert_not_called()  # This mode was explicitly enabled in preferences.
@@ -255,7 +259,7 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertTrue(self.app.exiting)
         self.confirm.assert_not_called()
 
-    def test_download_completion_waits_for_update_dialog_to_close_before_auto_install(self):
+    def test_download_completion_waits_for_active_updates_but_allows_clean_hidden_page(self):
         self.app.update_release = RELEASE
         self.app.update_preferences["mode"] = "install"
         self.app.poll_updates(self.fresh_status())
@@ -264,7 +268,9 @@ class UpdateBehaviorTests(unittest.TestCase):
         dialog = dashboard.UpdateDialog.__new__(dashboard.UpdateDialog)
         dialog.owner, dialog.window, dialog.closed = self.app, Mock(), False
         dialog.refresh = Mock()
+        dialog.has_unsaved_changes = Mock(return_value=False)
         self.app.update_dialog = dialog
+        self.app.active_tab = "updates"
 
         self.app.poll_updates(self.fresh_status())
         self.app.poll_updates(self.fresh_status())
@@ -275,9 +281,10 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.assertFalse(self.app.exiting)
         self.assertEqual(self.workers, [])
         self.install.assert_not_called()
-        dialog.close()
-        self.assertIsNone(self.app.update_dialog)
-        dialog.window.destroy.assert_called_once()
+        self.app.show_tab("overview")
+        self.assertIs(self.app.update_dialog, dialog)
+        self.assertFalse(dialog.closed)
+        dialog.window.destroy.assert_not_called()
         self.app.poll_updates(self.fresh_status())
         self.assertEqual(self.app.update_busy, "install")
         self.assertTrue(self.app.exiting)
@@ -289,7 +296,8 @@ class UpdateBehaviorTests(unittest.TestCase):
     def test_explicit_install_from_open_update_dialog_remains_available(self):
         self.app.update_release = RELEASE
         self.app.update_prepared = self.root / "prepared"
-        self.app.update_dialog = SimpleNamespace(closed=False, refresh=Mock())
+        self.app.update_dialog = SimpleNamespace(closed=False, refresh=Mock(), has_unsaved_changes=Mock(return_value=False))
+        self.app.active_tab = "updates"
 
         self.app.request_update_install()
 
@@ -533,23 +541,20 @@ class UpdateBehaviorTests(unittest.TestCase):
 
 
 class UpdateDialogLayoutTests(unittest.TestCase):
-    def test_source_update_controls_and_diagnostics_fit_the_minimum_window(self):
+    def test_source_update_controls_and_diagnostics_fit_inline_page(self):
         try:
             root = tk.Tk()
             root.withdraw()
             dashboard.apply_theme(root)
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
-        original_toplevel = tk.Toplevel
-
-        def invisible_window(*args, **kwargs):
-            window = original_toplevel(*args, **kwargs)
-            window.withdraw()
-            window.attributes("-alpha", 0)
-            return window
-
         dialog = None
         try:
+            root.attributes("-alpha", 0)
+            notebook = dashboard.ttk.Notebook(root)
+            notebook.pack(fill="both", expand=True)
+            parent = dashboard.ttk.Frame(notebook)
+            notebook.add(parent, text="版本与更新")
             with tempfile.TemporaryDirectory() as directory:
                 source = Path(directory)
                 (source / ".git").mkdir()
@@ -558,9 +563,13 @@ class UpdateDialogLayoutTests(unittest.TestCase):
                     update_can_install=updater.can_update(root=source), update_text=Mock(get=Mock(return_value="发现新版本")),
                     update_release=RELEASE, update_busy=None, update_prepared=None, exiting=False,
                     check_updates=Mock(), request_update_install=Mock(), update_dialog=None,
+                    show_tab=Mock(), open_diagnostics=Mock(), notify=Mock(),
                 )
-                with patch.object(dashboard.tk, "Toplevel", side_effect=invisible_window):
-                    dialog = dashboard.UpdateDialog(owner)
+                with patch.object(dashboard.tk, "Toplevel", side_effect=AssertionError("inline page must not create windows")):
+                    dialog = dashboard.UpdateDialog(owner, parent=parent)
+                owner.update_dialog = dialog
+                self.assertIs(dialog.window.master, parent)
+                self.assertEqual(dialog.window.winfo_class(), "TFrame")
                 self.assertTrue(dialog.auto_check.get())
                 self.assertEqual(dialog.mode.get(), "notify")
                 self.assertEqual(dialog.install_button.cget("text"), "下载并安装")
@@ -578,28 +587,50 @@ class UpdateDialogLayoutTests(unittest.TestCase):
                 for widget in widgets:
                     if widget.winfo_class() == "TRadiobutton":
                         self.assertFalse(widget.instate(["disabled"]))
-                # Allocate a transparent test window without showing its withdrawn owner.
-                dialog.window.transient("")
-                dialog.window.deiconify()
-                root.update()
-                default_size = tuple(map(int, dialog.window.geometry().split("+", 1)[0].split("x")))
-                for width, height in (default_size, dialog.window.minsize()):
-                    dialog.window.geometry(f"{width}x{height}")
-                    dialog.window.deiconify()
+                for width, height in ((1040, 620), (920, 540)):
+                    root.geometry(f"{width}x{height}")
+                    root.deiconify()
                     root.update()
-                    self.assertEqual((dialog.window.winfo_width(), dialog.window.winfo_height()), (width, height))
                     for button in buttons:
                         self.assertTrue(button.winfo_ismapped())
                         x = button.winfo_rootx() - dialog.window.winfo_rootx()
                         y = button.winfo_rooty() - dialog.window.winfo_rooty()
                         self.assertGreaterEqual(x, 0)
                         self.assertGreaterEqual(y, 0)
-                        self.assertLessEqual(x + button.winfo_width(), width)
-                        self.assertLessEqual(y + button.winfo_height(), height)
+                        self.assertLessEqual(x + button.winfo_width(), dialog.window.winfo_width())
+                        self.assertLessEqual(y + button.winfo_height(), dialog.window.winfo_height())
                     self.assertGreaterEqual(dialog.notes.winfo_height(), 64)
+                self.assertFalse(dialog.has_unsaved_changes())
+                dialog.auto_check.set(False)
+                dialog.mode.set("download")
+                self.assertTrue(dialog.has_unsaved_changes())
+                with patch.object(dashboard, "ROOT", source):
+                    dialog.save()
+                self.assertFalse(dialog.has_unsaved_changes())
+                self.assertFalse(dialog.closed)
+                self.assertIs(owner.update_dialog, dialog)
+                self.assertEqual(dialog.message.get(), "更新设置已保存。")
+                owner.show_tab.assert_not_called()
+                diagnostic.invoke()
+                owner.open_diagnostics.assert_called_once()
+                dialog.mode.set("install")
+                self.assertTrue(dialog.has_unsaved_changes())
+                dialog.close()
+                owner.show_tab.assert_called_once_with("overview")
+                self.assertIs(owner.update_dialog, dialog)
+                self.assertFalse(dialog.closed)
+                self.assertEqual(dialog.mode.get(), "install")
+                self.assertEqual(owner.update_preferences["mode"], "download")
+                owner.show_tab.reset_mock()
+                discard = next(button for button in buttons if button.cget("text") == "放弃修改")
+                discard.invoke()
+                self.assertTrue(dialog.closed)
+                self.assertIsNone(owner.update_dialog)
+                self.assertEqual(owner.update_preferences["mode"], "download")
+                owner.show_tab.assert_called_once_with("overview")
         finally:
             if dialog is not None:
-                dialog.close()
+                dialog.dispose()
             root.destroy()
 
 
@@ -633,7 +664,8 @@ class DisabledStartupTests(unittest.TestCase):
                     app.update_dialog.save()
                     saved = json.loads((location / "state" / "update-settings.json").read_text(encoding="utf-8"))
                     self.assertEqual(saved, {"auto_check": False, "mode": "notify"})
-                    self.assertIsNone(app.update_dialog)
+                    self.assertFalse(app.update_dialog.closed)
+                    self.assertEqual(app.update_dialog.message.get(), "更新设置已保存。")
                 finally:
                     app.close()
                 # A restart inside the check interval keeps the cached release visible,

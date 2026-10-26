@@ -24,7 +24,8 @@ class ClientDialogTests(unittest.TestCase):
         self.config = self.root / "config.json"
         self.config.write_text(json.dumps({"enabled": False}), encoding="utf-8")
         self.owner = SimpleNamespace(root=Mock(), exiting=False, restore_busy=False, manual_busy=False,
-                                     client_busy=False, client_dialog=None, client_saved=Mock(), cancel_service_start=Mock(), started_helpers=[])
+                                     client_busy=False, client_dialog=None, client_saved=Mock(), cancel_service_start=Mock(), started_helpers=[], show_tab=Mock())
+        self.parent = Mock(name="client_tab")
         self.interpreter = tk.Tcl()
         string_var = tk.StringVar
         boolean_var = tk.BooleanVar
@@ -32,7 +33,7 @@ class ClientDialogTests(unittest.TestCase):
         self.patches = ExitStack()
         self.addCleanup(self.patches.close)
         self.patches.enter_context(patch.object(dashboard, "CONFIG", self.config))
-        self.patches.enter_context(patch.object(dashboard.tk, "Toplevel"))
+        self.toplevel = self.patches.enter_context(patch.object(dashboard.tk, "Toplevel"))
         self.patches.enter_context(patch.object(dashboard.tk, "StringVar", side_effect=lambda **kwargs: string_var(master=self.interpreter, **kwargs)))
         self.patches.enter_context(patch.object(dashboard.tk, "BooleanVar", side_effect=lambda **kwargs: boolean_var(master=self.interpreter, **kwargs)))
         self.patches.enter_context(patch.object(dashboard, "ttk"))
@@ -43,7 +44,7 @@ class ClientDialogTests(unittest.TestCase):
         self.configure = self.patches.enter_context(patch.object(dashboard.core, "configure_client"))
         self.wait_for_startup = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
         self.start_daemon = self.patches.enter_context(patch.object(dashboard, "start_daemon", side_effect=AssertionError("real helper forbidden")))
-        self.dialog = dashboard.ClientDialog(self.owner, visible=False)
+        self.dialog = dashboard.ClientDialog(self.owner, parent=self.parent, visible=False)
         self.owner.client_dialog = self.dialog
         self.addCleanup(self.close_dialog)
 
@@ -54,7 +55,7 @@ class ClientDialogTests(unittest.TestCase):
     def close_dialog(self):
         self.dialog.applying = False
         if not self.dialog.closed:
-            self.dialog.close()
+            self.dialog.dispose()
 
     def finish(self):
         self.workers.pop(0)()
@@ -139,15 +140,19 @@ class ClientDialogTests(unittest.TestCase):
         self.wait_for_startup.assert_called_once_with(self.owner.started_helpers)
         self.owner.client_saved.assert_called_once_with(saved)
         self.assertFalse(self.owner.client_busy)
-        self.assertTrue(self.dialog.closed)
-        self.assertIsNone(self.owner.client_dialog)
+        self.assertFalse(self.dialog.closed)
+        self.assertIs(self.owner.client_dialog, self.dialog)
+        self.assertIn("已保存", self.dialog.message.get())
+        self.assertEqual(self.dialog.original_context, dashboard.core.state_context(saved))
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.owner.show_tab.assert_not_called()
         self.start_daemon.assert_not_called()
 
     def test_selected_group_name_is_saved_exactly_including_surrounding_spaces(self):
         for groups in (["PROXY "], ["PROXY", "PROXY "]):
             with self.subTest(groups=groups):
                 if self.dialog.closed:
-                    self.dialog = dashboard.ClientDialog(self.owner, visible=False)
+                    self.dialog = dashboard.ClientDialog(self.owner, parent=self.parent, visible=False)
                     self.owner.client_dialog = self.dialog
                 self.dialog.save_button = Mock()
                 self.configure.reset_mock()
@@ -158,6 +163,7 @@ class ClientDialogTests(unittest.TestCase):
                 self.dialog.save_button.state.assert_called_with(["!disabled"])
                 saved = dashboard.core.DEFAULTS | {"group": "PROXY ", "enabled": False}
                 self.configure.return_value = saved
+                original = self.dialog.original_context
 
                 self.dialog.save()
                 self.assertTrue(self.dialog.applying)
@@ -166,9 +172,9 @@ class ClientDialogTests(unittest.TestCase):
                 self.configure.assert_called_once_with(
                     {"controller": dashboard.core.DEFAULTS["controller"], "controller_secret_env": "", "group": "PROXY ",
                      "auto_detect_client": True, "auto_select_group": True},
-                    expected_context=self.dialog.original_context,
+                    expected_context=original,
                 )
-                self.assertTrue(self.dialog.closed)
+                self.assertFalse(self.dialog.closed)
                 self.assertFalse(self.owner.client_busy)
 
     def test_failed_inspection_or_save_releases_busy_and_allows_retry(self):
@@ -200,12 +206,12 @@ class ClientDialogTests(unittest.TestCase):
         self.assertFalse(self.dialog.applying)
         self.assertFalse(self.dialog.closed)
         self.owner.client_saved.assert_not_called()
-        self.dialog.close()
+        self.dialog.discard_changes()
         self.assertTrue(self.dialog.closed)
 
     def test_closed_dialog_ignores_late_inspection_without_touching_window(self):
         self.dialog.inspect_connection()
-        self.dialog.close()
+        self.dialog.dispose()
         self.dialog.window.reset_mock()
         self.finish()
         self.assertTrue(self.dialog.closed)
@@ -217,15 +223,31 @@ class ClientDialogTests(unittest.TestCase):
                                   "recommended_group": "PROXY", "group_reason": "优先保留有效代理组。",
                                   "nearby_regions": ["JP", "TW"]} | fields
 
-    def test_hidden_window_never_discovers_and_visible_window_starts_async_discovery(self):
+    def test_inline_panel_has_no_toplevel_and_activation_starts_async_discovery(self):
+        self.toplevel.assert_not_called()
+        self.dialog.window.pack.assert_any_call(fill="both", expand=True)
         self.discovery.assert_not_called()
         self.assertEqual(self.workers, [])
-        self.dialog.close()
-        self.dialog = dashboard.ClientDialog(self.owner)
+        self.dialog.discard_changes()
+        self.owner.show_tab.assert_called_once_with("overview")
+        self.dialog = dashboard.ClientDialog(self.owner, parent=self.parent)
         self.owner.client_dialog = self.dialog
         self.assertTrue(self.dialog.loading)
         self.discovery.assert_not_called()
         self.assertEqual(len(self.workers), 1)
+
+    def test_raw_draft_detection_and_dispose_do_not_validate_or_navigate(self):
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.controller.set("unfinished address")
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.dialog.controller.set(dashboard.core.DEFAULTS["controller"])
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.auto_detect.set(False)
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.dialog.dispose()
+        self.owner.show_tab.assert_not_called()
+        self.assertTrue(self.dialog.closed)
+        self.assertIsNone(self.dialog.after_id)
 
     def test_discovery_preserves_current_verified_client_and_existing_group(self):
         address = self.dialog.fields()["controller"]
@@ -331,7 +353,7 @@ class ClientDialogTests(unittest.TestCase):
 
 
 class ClientDialogLifecycleTests(unittest.TestCase):
-    def test_discovery_controls_and_connection_message_fit_minimum_window(self):
+    def test_discovery_controls_and_connection_message_fit_inline_panel(self):
         try:
             root = tk.Tk()
             root.withdraw()
@@ -344,19 +366,21 @@ class ClientDialogLifecycleTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="nearroute-client-layout-") as directory:
                 config = Path(directory) / "config.json"
                 config.write_text(json.dumps({"enabled": False}), encoding="utf-8")
-                owner = SimpleNamespace(root=root, client_dialog=None)
+                owner = SimpleNamespace(root=root, client_dialog=None, show_tab=Mock())
+                parent = dashboard.ttk.Frame(root)
+                parent.pack(fill="both", expand=True)
                 with patch.object(dashboard, "CONFIG", config):
-                    dialog = dashboard.ClientDialog(owner, visible=False)
+                    dialog = dashboard.ClientDialog(owner, parent=parent, visible=False)
                 owner.client_dialog = dialog
                 dialog.message.set("连接成功，HTTP 代理端口 7890，读取 8 个代理组。规则模式使用所选代理组。优先保留有效代理组。邻近地区：JP、TW、SG、HK、PH。")
-                dialog.window.attributes("-alpha", 0)
-                dialog.window.geometry("720x640+0+0")
+                root.geometry("920x580+0+0")
                 root.deiconify()
-                dialog.window.deiconify()
                 root.update()
+                self.assertIsInstance(dialog.window, dashboard.ttk.Frame)
+                self.assertIs(dialog.window.winfo_toplevel(), root)
                 for widget in (dialog.address_entry, dialog.discover_button, dialog.secret_entry,
                                dialog.auto_detect_button, dialog.groups, dialog.inspect_button,
-                               dialog.auto_group_button, dialog.save_button, dialog.cancel_button):
+                               dialog.auto_group_button, dialog.save_button, dialog.cancel_button, dialog.discard_button):
                     self.assertTrue(widget.winfo_ismapped(), str(widget))
                     x = widget.winfo_rootx() - dialog.window.winfo_rootx()
                     y = widget.winfo_rooty() - dialog.window.winfo_rooty()
@@ -366,10 +390,10 @@ class ClientDialogLifecycleTests(unittest.TestCase):
                     self.assertLessEqual(y + widget.winfo_height(), dialog.window.winfo_height(), str(widget))
         finally:
             if dialog is not None:
-                dialog.close()
+                dialog.dispose()
             root.destroy()
 
-    def test_close_releases_variable_traces_and_dialog_after_apply_finishes(self):
+    def test_back_retains_draft_and_discard_releases_traces_after_apply_finishes(self):
         try:
             root = tk.Tk()
             root.withdraw()
@@ -379,21 +403,31 @@ class ClientDialogLifecycleTests(unittest.TestCase):
             with tempfile.TemporaryDirectory(prefix="nearroute-client-lifecycle-") as directory:
                 config = Path(directory) / "config.json"
                 config.write_text(json.dumps({"enabled": False}), encoding="utf-8")
-                owner = SimpleNamespace(root=root, client_dialog=None)
+                owner = SimpleNamespace(root=root, client_dialog=None, show_tab=Mock())
+                parent = dashboard.ttk.Frame(root)
+                parent.pack(fill="both", expand=True)
                 with patch.object(dashboard, "CONFIG", config):
-                    # Real widgets avoid Mock command/protocol references masking leaks.
-                    dialog = dashboard.ClientDialog(owner, visible=False)
+                    # Real widgets verify trace and scheduled callback cleanup.
+                    dialog = dashboard.ClientDialog(owner, parent=parent, visible=False)
                 owner.client_dialog = dialog
                 variables = (dialog.controller, dialog.secret_env, dialog.group)
                 reference = weakref.ref(dialog)
                 self.assertTrue(all(len(variable.trace_info()) == 1 for variable in variables))
                 dialog.applying = True
                 dialog.close()
+                dialog.discard_changes()
                 self.assertFalse(dialog.closed)
                 self.assertTrue(dialog.window.winfo_exists())
                 self.assertTrue(all(len(variable.trace_info()) == 1 for variable in variables))
                 dialog.applying = False
+                dialog.controller.set("unfinished address")
                 dialog.close()
+                self.assertFalse(dialog.closed)
+                self.assertIs(owner.client_dialog, dialog)
+                self.assertEqual(dialog.controller.get(), "unfinished address")
+                self.assertTrue(dialog.has_unsaved_changes())
+                owner.show_tab.assert_called_once_with("overview")
+                dialog.discard_changes()
                 self.assertTrue(dialog.closed)
                 self.assertTrue(all(not variable.trace_info() for variable in variables))
                 self.assertIsNone(owner.client_dialog)

@@ -105,14 +105,17 @@ class SettingsWindowTests(unittest.TestCase):
         }), encoding="utf-8")
         self.location = patch.object(dashboard, "CONFIG", self.config)
         self.location.start()
-        self.owner = SimpleNamespace(root=self.root, settings_saved=Mock(), settings_dialog=None)
-        self.dialog = dashboard.SettingsDialog(self.owner, load_nodes=False, visible=False)
+        self.owner = SimpleNamespace(root=self.root, settings_saved=Mock(), settings_dialog=None, show_tab=Mock())
+        self.parent = dashboard.ttk.Frame(self.root)
+        self.parent.pack(fill="both", expand=True)
+        self.dialog = dashboard.SettingsDialog(self.owner, parent=self.parent, load_nodes=False, visible=False)
         self.owner.settings_dialog = self.dialog
         self.root.update_idletasks()
 
     def tearDown(self):
         if not self.dialog.closed:
-            self.dialog.close()
+            self.dialog.dispose()
+        self.parent.destroy()
         self.location.stop()
         self.directory.cleanup()
 
@@ -176,7 +179,39 @@ class SettingsWindowTests(unittest.TestCase):
         self.assertFalse(saved["enabled"])
         self.assertEqual(saved["probe_expected_statuses"], [200, 204])
         self.assertEqual(set(saved["scan_nodes"]), {"JP-online", "SG-offline"})
+        self.assertFalse(self.dialog.closed)
+        self.assertIs(self.owner.settings_dialog, self.dialog)
+        self.assertIn("已保存", self.dialog.save_message.get())
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.owner.show_tab.assert_not_called()
+
+    def test_inline_panel_back_retains_draft_and_explicit_discard_releases_panel(self):
+        self.assertIsInstance(self.dialog.window, dashboard.ttk.Frame)
+        self.assertIs(self.dialog.window.master, self.parent)
+        self.assertIs(self.dialog.window.winfo_toplevel(), self.root)
+        self.dialog.expected.set("unfinished,")
+        self.dialog.close()
+        self.owner.show_tab.assert_called_once_with("overview")
+        self.assertFalse(self.dialog.closed)
+        self.assertIs(self.owner.settings_dialog, self.dialog)
+        self.assertEqual(self.dialog.expected.get(), "unfinished,")
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.dialog.discard_changes()
         self.assertTrue(self.dialog.closed)
+        self.assertIsNone(self.owner.settings_dialog)
+        self.assertIsNone(self.dialog.after_id)
+        self.owner.show_tab.reset_mock()
+        self.dialog.dispose()
+        self.owner.show_tab.assert_not_called()
+
+    def test_raw_draft_detection_accepts_invalid_fields_and_tracks_node_selection(self):
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.expected.set("unfinished,")
+        self.assertTrue(self.dialog.has_unsaved_changes())
+        self.dialog.expected.set("405")
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.clear_nodes()
+        self.assertTrue(self.dialog.has_unsaved_changes())
 
     def test_invalid_save_displays_error_without_writing(self):
         before = self.config.read_bytes()
@@ -187,6 +222,23 @@ class SettingsWindowTests(unittest.TestCase):
         self.assertEqual(self.config.read_bytes(), before)
         self.owner.settings_saved.assert_not_called()
         self.assertFalse(self.dialog.closed)
+        self.assertTrue(self.dialog.has_unsaved_changes())
+
+    def test_busy_owner_preserves_draft_without_saving_or_requesting_scan(self):
+        self.dialog.url.set("https://example.org/draft")
+        before = self.config.read_bytes()
+        with patch.object(dashboard, "save_settings") as save:
+            for name in ("exiting", "restore_busy", "manual_busy", "client_busy"):
+                with self.subTest(operation=name):
+                    setattr(self.owner, name, True)
+                    self.dialog.save()
+                    self.assertIn("稍后保存", self.dialog.save_message.get())
+                    self.assertTrue(self.dialog.has_unsaved_changes())
+                    self.assertFalse(self.dialog.closed)
+                    setattr(self.owner, name, False)
+            save.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), before)
+        self.owner.settings_saved.assert_not_called()
 
     def test_scope_controls_follow_mode(self):
         self.dialog.apply_loaded_nodes(["JP-online"])

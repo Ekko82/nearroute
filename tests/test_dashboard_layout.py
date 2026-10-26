@@ -85,9 +85,10 @@ class DashboardLayoutTests(unittest.TestCase):
         self.assertLessEqual(y + widget.winfo_height(), self.root.winfo_height(), str(widget))
 
     def assert_layout(self, minimum_table_height):
-        for name in ("enable_button", "pause_button", "scan_button", "restore_button", "settings_button",
-                     "client_button", "update_button", "exit_button", "policy_button"):
+        for name in ("enable_button", "pause_button", "scan_button", "restore_button",
+                     "update_button", "exit_button", "policy_button"):
             self.assert_inside_window(getattr(self.app, name))
+        self.assert_inside_window(self.app.tabs)
         variables = {str(getattr(self.app, name)) for name in (
             "node_title", "node_meta", "connection_value", "node_count_value", "error_value",
             "scan_time_value", "switch_time_value", "next_scan_value", "update_time_value")}
