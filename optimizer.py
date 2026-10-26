@@ -553,6 +553,13 @@ class ControllerError(RuntimeError):
     pass
 
 
+class ConfigReadUnsupported(ControllerError):
+    unsupported_config_read = True
+
+    def __init__(self):
+        super().__init__(client_detection.CONFIG_READ_UNSUPPORTED_MESSAGE)
+
+
 class PathChanged(ControllerError):
     pass
 
@@ -597,6 +604,8 @@ class Controller:
                 return json.loads(content) if content else {}
         except urllib.error.HTTPError as exc:
             exc.close()
+            if exc.code == 405 and method == "GET" and path == "/configs":
+                raise ConfigReadUnsupported() from None
             raise ControllerError("控制接口 HTTP " + str(exc.code)) from None
         except (OSError, ValueError, http.client.HTTPException):
             raise ControllerError("无法连接代理客户端控制接口") from None
@@ -2061,8 +2070,11 @@ class Optimizer:
                     except (ControllerError, ValueError, OSError):
                         self.status["client_detection_message"] = "自动识别暂未成功，将稍后重试；也可在连接设置中手动检查"
                 detail = self.status.get("client_detection_message", "")
+                message = str(exc)
+                if detail:
+                    message = detail if detail.startswith(message) else message + "；" + detail
                 self.write_status(phase="waiting", controller_available=False,
-                                  message=str(exc) + ("；" + detail if detail else ""), last_error=str(exc))
+                                  message=message, last_error=str(exc))
                 self.next_scan = time.time() + 15
                 self.last_health = time.time()
             except Exception as exc:

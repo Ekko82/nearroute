@@ -301,6 +301,28 @@ class ClientDialogTests(unittest.TestCase):
         self.finish()
         self.assertEqual(self.dialog.verified_identity, (address, "OTHER_CLIENT_SECRET"))
 
+    def test_unsupported_config_read_is_explained_and_cannot_be_saved(self):
+        # The generic ttk fixture shares a Button mock; this control needs an
+        # independent identity so other buttons cannot overwrite its state call.
+        self.dialog.save_button = Mock()
+        address = self.dialog.controller.get()
+        candidate = self.candidate(address, verified=False, needs_auth=False) | {"unsupported": True}
+        self.discovery.return_value = {"candidates": [candidate], "selected_controller": None,
+                                       "message": str(dashboard.core.ConfigReadUnsupported())}
+        self.dialog.discover_connections()
+        self.finish()
+        self.dialog.controller.set(address)
+        self.dialog.select_discovered_client()
+        self.assertIsNone(self.dialog.verified_identity)
+        self.assertIn("GET /configs", self.dialog.message.get())
+        self.assertIn("HTTP 405", self.dialog.message.get())
+        self.assertNotIn("需要认证", self.dialog.message.get())
+        self.assertEqual(self.dialog.selector_groups, [])
+        self.dialog.save_button.state.assert_called_with(["disabled"])
+        self.dialog.save()
+        self.configure.assert_not_called()
+        self.assertEqual(self.workers, [])
+
     def test_discovery_discards_result_after_address_edit_and_error_allows_retry(self):
         address = self.dialog.fields()["controller"]
         self.discovery.return_value = {"candidates": [self.candidate(address)], "selected_controller": address, "message": "已发现。"}

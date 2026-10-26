@@ -933,8 +933,11 @@ class ClientDialog:
             self.apply_inspection(candidate, self.identity())
         else:
             self.verified_identity = None
-            self.message.set("此控制地址需要认证。请填写对应的密钥环境变量名，再点击“测试连接”。"
-                             if candidate.get("needs_auth") else "此控制地址尚未验证，请点击“测试连接”。")
+            if candidate.get("unsupported"):
+                self.message.set(str(core.ConfigReadUnsupported()))
+            else:
+                self.message.set("此控制地址需要认证。请填写对应的密钥环境变量名，再点击“测试连接”。"
+                                 if candidate.get("needs_auth") else "此控制地址尚未验证，请点击“测试连接”。")
         self.update_buttons()
 
     def apply_inspection(self, result, identity) -> None:

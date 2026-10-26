@@ -88,6 +88,39 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         self.assertFalse(optimizer.load_config()["enabled"])
         self.assertEqual(self.api.select_calls + recovered.select_calls, [])
 
+    def test_paused_explicit_scan_waits_once_for_unsupported_config_read(self):
+        optimizer.atomic_json(self.config, self.cfg | {"enabled": False})
+        before = self.config.read_bytes()
+        (self.state / "scan.request").touch()
+        error = optimizer.ConfigReadUnsupported()
+        self.discovery.return_value = {
+            "selected_controller": None, "message": str(error), "candidates": [
+                {"controller": self.cfg["controller"], "verified": False,
+                 "needs_auth": False, "unsupported": True}],
+        }
+        waiting = []
+        write = self.helper.write_status
+
+        def publish(**updates):
+            result = write(**updates)
+            if updates.get("phase") == "waiting":
+                waiting.append(dict(self.helper.status))
+            return result
+
+        with patch.object(self.api, "snapshot", side_effect=error), \
+             patch.object(self.helper, "write_status", side_effect=publish), \
+             patch.object(self.helper, "stopping", side_effect=lambda: bool(waiting)), \
+             patch.object(optimizer.time, "sleep", side_effect=AssertionError("helper did not stop after waiting")):
+            self.helper.run()
+
+        self.assertEqual(len(waiting), 1)
+        self.assertFalse(waiting[0]["controller_available"])
+        self.assertEqual(waiting[0]["message"], str(error))
+        self.assertEqual(waiting[0]["message"].count("HTTP 405"), 1)
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.api.select_calls, [])
+        self.discovery.assert_called_once()
+
     def test_pending_rollback_or_user_choice_blocks_discovery(self):
         for name in ("pending-selection.json", "select.request.json"):
             with self.subTest(name=name):

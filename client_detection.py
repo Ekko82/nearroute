@@ -12,6 +12,10 @@ import urllib.parse
 NEARBY_REGIONS = ("JP", "TW", "SG", "HK", "PH")
 COMMON_CONTROLLER_PORTS = (9090, 9097, 9790)
 MAX_CONTROLLER_ADDRESSES = 24
+CONFIG_READ_UNSUPPORTED_MESSAGE = (
+    "已检测到控制接口，但它不支持读取运行配置（GET /configs 返回 HTTP 405）。"
+    "近舟无法安全验证当前模式和代理端口，请选择支持完整控制接口的客户端。"
+)
 _BUILTINS = {"DIRECT", "REJECT", "REJECTDROP", "PASS", "COMPATIBLE"}
 
 
@@ -149,6 +153,8 @@ def discover_clients(cfg, inspect_func):
             information = inspect_func(fields, timeout=0.6, adaptive=True)
             return dict(information, controller=address, verified=True, needs_auth=False)
         except (OSError, ValueError, RuntimeError) as error:
+            if getattr(error, "unsupported_config_read", False) is True:
+                return {"controller": address, "verified": False, "needs_auth": False, "unsupported": True}
             needs_auth = (getattr(error, "code", None) in (401, 403)
                           or bool(re.search(r"\bHTTP(?:\s+Error)?\s+(?:401|403)\b", str(error)))
                           or (isinstance(error, ValueError) and address == configured
@@ -164,11 +170,15 @@ def discover_clients(cfg, inspect_func):
     selected = next((candidate["controller"] for candidate in verified if candidate["controller"] == configured), None)
     if selected:
         message = "当前控制地址验证成功，保留现有连接。"
-    elif len(verified) == 1 and not any(candidate["needs_auth"] for candidate in candidates):
+    elif len(verified) == 1 and len(candidates) == 1:
         selected = verified[0]["controller"]
         message = "已识别可用控制地址，请确认代理组后保存连接。"
     elif len(verified) > 1 or verified:
-        message = "发现多个可能的客户端，请选择控制地址；需要认证的接口须先设置密钥环境变量。"
+        message = "发现多个可能的客户端，请选择支持配置读取的控制地址；需要认证的接口须先设置密钥环境变量。"
+    elif any(candidate.get("unsupported") for candidate in candidates):
+        message = CONFIG_READ_UNSUPPORTED_MESSAGE
+        if any(candidate["needs_auth"] for candidate in candidates):
+            message += " 另有接口需要认证，请在客户端连接中选择并测试。"
     elif candidates:
         message = "发现需要认证的本机接口，请选择地址并设置密钥环境变量后测试连接。"
     else:
