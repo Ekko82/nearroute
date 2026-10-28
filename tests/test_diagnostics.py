@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 from datetime import datetime, timedelta
+import gc
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import tkinter as tk
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
+import weakref
 
 import dashboard
 import optimizer
@@ -238,6 +240,19 @@ class DiagnosticSummaryTests(unittest.TestCase):
 
 
 class DiagnosticDialogTests(unittest.TestCase):
+    def setUp(self):
+        self.interpreters = []
+        # Run last, after page disposal, root destruction, and patch restoration.
+        self.addCleanup(self.release_tcl_fixtures)
+
+    def release_tcl_fixtures(self):
+        # Synthetic exceptions and mock callbacks can retain destroyed pages and
+        # their StringVars. Finalize these graphs on the Tcl creator thread,
+        # before the next real diagnostic worker can trigger cyclic collection.
+        gc.collect()
+        for interpreter in self.interpreters:
+            self.assertIsNone(interpreter(), "diagnostic fixture retained its Tcl interpreter")
+
     def make_dialog(self, *, configured=True):
         fixture = DiagnosticSummaryTests()
         fixture.setUp()
@@ -251,6 +266,7 @@ class DiagnosticDialogTests(unittest.TestCase):
             root.withdraw()
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
+        self.interpreters.append(weakref.ref(root))
         self.addCleanup(root.destroy)
         root_patch = patch.object(dashboard, "ROOT", fixture.root)
         root_patch.start()
@@ -520,6 +536,7 @@ class DiagnosticDialogTests(unittest.TestCase):
             root.withdraw()
         except tk.TclError as error:
             self.skipTest(f"Tk display unavailable: {error}")
+        self.interpreters.append(weakref.ref(root))
         owner = SimpleNamespace(
             root=root, update_preferences={"auto_check": False, "mode": "notify"},
             update_can_install=False, update_text=Mock(get=Mock(return_value="fixture")),
