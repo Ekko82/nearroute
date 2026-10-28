@@ -37,6 +37,7 @@ CHINA_TIME = timezone(timedelta(hours=8))
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 WINDOW_TITLE = "近舟 NearRoute"
 STATUS_STALE_SECONDS = 120
+SERVICE_RECOVERY_SECONDS = 60
 
 
 def apply_theme(root):
@@ -1428,6 +1429,8 @@ class Dashboard:
         self.started_helpers = []
         self.settings_dialog: SettingsDialog | None = None
         self.started_at = time.monotonic()
+        self.service_recovery_enabled = start_service
+        self.next_service_recovery_at = self.started_at + STATUS_STALE_SECONDS
         self.after_id = None
         self.updates_enabled = enable_updates and start_service
         self.update_results: queue.SimpleQueue = queue.SimpleQueue()
@@ -1835,12 +1838,43 @@ class Dashboard:
             return False
         try:
             process = start_daemon()
+            self.next_service_recovery_at = time.monotonic() + SERVICE_RECOVERY_SECONDS
             self.started_helpers = [p for p in self.started_helpers if p.poll() is None]
             self.started_helpers.append(process)
             return True
         except (OSError, ValueError) as error:
             self.notify(f"服务启动失败：{error}", 30)
             return False
+
+    def recover_service(self, status: dict, config: dict) -> None:
+        """Recover a missing helper without replacing one whose snapshot is delayed."""
+        if (not getattr(self, "service_recovery_enabled", False) or config.get("enabled") is not True
+                or self.closed or self.exiting or self.restore_busy or self.manual_busy
+                or getattr(self, "client_busy", False) or self.update_busy):
+            return
+        if status.get("pid") and not status_is_stale(status) and status.get("phase") not in ("stopped", "stopping"):
+            return
+        now = time.monotonic()
+        if now < self.next_service_recovery_at:
+            return
+        self.next_service_recovery_at = now + SERVICE_RECOVERY_SECONDS
+        try:
+            if (STATE / "stop.request").exists() or updater.is_installing(root=ROOT):
+                return
+            if any(process.poll() is None for process in self.started_helpers):
+                return
+            # The same nonblocking lock is held throughout helper startup, probes,
+            # and rollback. A stale snapshot alone does not mean it has exited.
+            lock = core.InstanceLock()
+            try:
+                if not lock.acquire():
+                    return
+            finally:
+                lock.close()
+            if self.ensure_service():
+                self.notify("检测到后台已退出，正在恢复自动优选…", 30)
+        except (OSError, RuntimeError, ValueError) as error:
+            self.notify(f"后台恢复未完成：{error}；可点击“立即测速”重试。", 30)
 
     def open_client(self) -> None:
         if self.exiting or self.restore_busy or self.manual_busy or self.client_busy:
@@ -2109,6 +2143,7 @@ class Dashboard:
             status = {}
         try:
             config = read_json(CONFIG)
+            config.setdefault("enabled", True)
             enabled = bool(config.get("enabled", True))
             self.policy.set(policy_summary(config))
         except (OSError, ValueError):
@@ -2138,6 +2173,7 @@ class Dashboard:
             return
         self.refresh_runtime_notice(status)
         self.poll_manual_selection(status)
+        self.recover_service(status, config)
         stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))
         starting = phase == "starting"
