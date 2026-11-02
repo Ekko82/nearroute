@@ -14,6 +14,14 @@ from tests import test_runtime
 
 
 class SelectorCompatibilityTests(unittest.TestCase):
+    def setUp(self):
+        # Legacy registry tests must not read a real automatic credential store.
+        for owner, name in ((optimizer.windows_app, "read_controller_credential"),
+                            (optimizer.client_detection, "local_client_credentials")):
+            isolated = patch.object(owner, name, return_value="")
+            isolated.start()
+            self.addCleanup(isolated.stop)
+
     @contextmanager
     def controller(self):
         """A local synthetic API; delay URLs are recorded, never fetched."""

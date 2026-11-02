@@ -28,10 +28,11 @@ class DashboardTabsTests(unittest.TestCase):
 
     def test_pages_are_lazy_single_window_tabs_with_no_modal_grab(self):
         self.assertEqual([self.app.tabs.tab(tab, "text") for tab in self.app.tabs.tabs()],
-                         ["线路概览", "客户端连接", "测速设置", "版本与更新", "诊断信息"])
-        for attribute in ("client_dialog", "settings_dialog", "update_dialog", "diagnostic_dialog"):
+                         ["线路概览", "客户端连接", "Codex 连接", "测速设置", "版本与更新", "诊断信息"])
+        for attribute in ("client_dialog", "codex_transport_dialog", "settings_dialog", "update_dialog", "diagnostic_dialog"):
             self.assertIsNone(getattr(self.app, attribute))
         for key, attribute in (("client", "client_dialog"), ("settings", "settings_dialog"),
+                               ("codex", "codex_transport_dialog"),
                                ("updates", "update_dialog"), ("diagnostics", "diagnostic_dialog")):
             with self.subTest(page=key):
                 self.app.tabs.select(self.app.pages[key])
@@ -113,6 +114,7 @@ class DashboardTabsTests(unittest.TestCase):
     def test_every_page_keeps_fields_and_actions_inside_the_minimum_main_window(self):
         self.arrange(920, 650)
         for key, attribute in (("client", "client_dialog"), ("settings", "settings_dialog"),
+                               ("codex", "codex_transport_dialog"),
                                ("updates", "update_dialog"), ("diagnostics", "diagnostic_dialog")):
             with self.subTest(page=key):
                 self.app.show_tab(key)

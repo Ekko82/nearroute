@@ -37,7 +37,8 @@ class ReleasePackageTests(unittest.TestCase):
             self.assertEqual(manifest["size"], archive.stat().st_size)
             with zipfile.ZipFile(archive) as bundle:
                 self.assertEqual(set(bundle.namelist()), {
-                    "VERSION", "optimizer.py", "client_detection.py", "dashboard.py", "tray_icon.py", "windows_app.py", "updater.py",
+                "VERSION", "optimizer.py", "client_detection.py", "dashboard.py", "tray_icon.py", "windows_app.py", "updater.py",
+                "codex_transport.py", "codex_history.py", "toml_compat.py",
                     "install.ps1", "launch.ps1", "uninstall.ps1", "controller_auth.ps1", "config.example.json", "README.md", "LICENSE",
                     "assets/nearroute.ico", "assets/nearroute.svg",
                 })

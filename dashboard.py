@@ -22,6 +22,7 @@ import tkinter as tk
 from tkinter import messagebox, ttk
 
 import optimizer as core
+import codex_transport
 import updater
 import windows_app
 from tray_icon import ICON_PATH, TrayIcon, request_restore
@@ -1428,6 +1429,96 @@ class DiagnosticDialog:
         self.window.destroy()
 
 
+class CodexTransportDialog:
+    """Saved transport and pending intent; the owner runs all backend work."""
+
+    def __init__(self, owner: Dashboard, *, parent: ttk.Frame):
+        self.owner, self.closed = owner, False
+        self.window = ttk.Frame(parent, padding=(20, 16))
+        self.window.pack(fill="both", expand=True)
+        self.window.columnconfigure(0, weight=1)
+        ttk.Label(self.window, text="Codex 连接", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        description = ttk.Label(self.window, text="在近舟内切换 Codex 连接方式。运行中的任务会继续，设置在正常退出 Codex 后自动应用。",
+                                style="Muted.TLabel", wraplength=780)
+        description.grid(row=1, column=0, sticky="ew", pady=(4, 16))
+        card = ttk.Frame(self.window, style="Card.TFrame", padding=20)
+        card.grid(row=2, column=0, sticky="ew")
+        card.columnconfigure(0, weight=1)
+        self.mode = tk.StringVar()
+        self.running = tk.StringVar()
+        self.message = tk.StringVar()
+        ttk.Label(card, textvariable=self.mode, style="Section.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(card, textvariable=self.running, style="SurfaceMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        feedback = ttk.Label(card, textvariable=self.message, style="Surface.TLabel", wraplength=740)
+        feedback.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        actions = ttk.Frame(self.window)
+        actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
+        self.http_button = ttk.Button(actions, text="启用兼容连接（推荐）", style="Primary.TButton",
+                                      command=lambda: owner.request_codex_transport("http"))
+        self.http_button.pack(side="left", padx=(0, 8))
+        self.restore_button = ttk.Button(actions, text="恢复原设置", command=lambda: owner.request_codex_transport("original"))
+        self.restore_button.pack(side="left", padx=(0, 8))
+        self.cancel_button = ttk.Button(actions, text="取消待切换", command=owner.cancel_codex_transport)
+        self.cancel_button.pack(side="left")
+        note = ttk.Label(self.window, text="近舟会自动备份配置并处理可迁移的聊天。连接设置会在下次打开 Codex 后使用；实际传输方式可在“诊断信息”读取日志确认。",
+                         style="Muted.TLabel", wraplength=780)
+        note.grid(row=4, column=0, sticky="ew", pady=(16, 0))
+        navigation = ttk.Frame(self.window)
+        navigation.grid(row=5, column=0, sticky="ew", pady=(16, 0))
+        self.refresh_button = ttk.Button(navigation, text="刷新状态", command=owner.refresh_codex_transport)
+        self.refresh_button.pack(side="left")
+        ttk.Button(navigation, text="返回概览", command=self.close).pack(side="right")
+
+        def resized(event):
+            if event.widget is self.window:
+                description.configure(wraplength=max(300, event.width - 40))
+                note.configure(wraplength=max(300, event.width - 40))
+                feedback.configure(wraplength=max(260, event.width - 84))
+
+        self.window.bind("<Configure>", resized, add="+")
+        self.refresh()
+
+    def refresh(self):
+        if self.closed:
+            return
+        owner, state = self.owner, self.owner.codex_transport_state
+        mode = {"http": "HTTP/SSE", "original": "原始连接方式", "custom": "现有自定义连接"}.get(state.get("mode"), "待读取")
+        if state.get("compatible_http") and not state.get("owned"):
+            mode = "HTTP/SSE（现有配置）"
+        self.mode.set("已保存配置：" + mode)
+        self.running.set("上次检查：Codex 正在运行。" if state.get("running") else
+                         "上次检查：Codex 已退出。" if state.get("running") is False else "")
+        operation = owner.codex_transport_busy
+        text = {"inspect": "正在读取 Codex 连接状态…", "request": "正在安排连接切换…",
+                "apply": "正在应用连接设置和处理现有聊天，请稍候…", "cancel": "正在取消待切换…"}.get(operation)
+        if not text:
+            text = str(state.get("explanation") or "等待连接状态。")
+            if state.get("pending") and state.get("ok") is not False:
+                target = "HTTP/SSE" if state["pending"] == "http" else "原始连接方式"
+                text = f"已安排，正常退出 Codex 后自动应用；不打断当前任务。\n切换目标：{target}。\n" + text
+        self.message.set(text)
+        busy = bool(operation) or owner.exiting
+        enabled = owner.codex_transport_enabled and not busy
+        retry_http = state.get("pending") == "http" and state.get("status") == "error"
+        offer_http = (state.get("mode") != "http" and not state.get("compatible_http")) or retry_http
+        self.http_button.state(["!disabled"] if enabled and state.get("can_request") and offer_http else ["disabled"])
+        self.restore_button.state(["!disabled"] if enabled and state.get("can_restore") else ["disabled"])
+        self.cancel_button.state(["!disabled"] if enabled and state.get("pending") else ["disabled"])
+        self.refresh_button.state(["!disabled"] if enabled else ["disabled"])
+
+    def close(self):
+        if not self.closed:
+            self.owner.show_tab("overview")
+
+    def dispose(self):
+        if self.closed:
+            return
+        self.closed = True
+        if getattr(self.owner, "codex_transport_dialog", None) is self:
+            self.owner.codex_transport_dialog = None
+        self.window.destroy()
+
+
 class UpdateDialog:
     """Release notes and preferences; all network work belongs to the owner."""
 
@@ -1510,7 +1601,8 @@ class UpdateDialog:
         self.notes.delete("1.0", tk.END)
         self.notes.insert("1.0", release.notes if release else "检查后将在这里显示新版本的更新说明。")
         self.notes.configure(state="disabled")
-        busy = bool(owner.update_busy) or owner.exiting
+        busy = (bool(owner.update_busy) or owner.exiting
+                or getattr(owner, "codex_transport_busy", None) in ("request", "apply", "cancel"))
         self.check_button.state(["disabled"] if busy else ["!disabled"])
         self.install_button.configure(text=("无法安全更新" if not owner.update_can_install else "安装并重启" if owner.update_prepared else "下载并安装"))
         self.install_button.state(["disabled"] if busy or release is None else ["!disabled"])
@@ -1584,6 +1676,7 @@ class Dashboard:
         self.update_requested_install = False
         self.update_dialog = None
         self.diagnostic_dialog = None
+        self.initialize_codex_transport(enabled=start_service)
         self.active_tab = "overview"
         self.update_next_check = 0.0
         self.update_can_install = updater.can_update(root=ROOT)
@@ -1608,7 +1701,8 @@ class Dashboard:
         self.tabs.pack(fill="both", expand=True, padx=8, pady=8)
         self.pages = {}
         for key, label in (("overview", "线路概览"), ("client", "客户端连接"),
-                           ("settings", "测速设置"), ("updates", "版本与更新"), ("diagnostics", "诊断信息")):
+                           ("codex", "Codex 连接"), ("settings", "测速设置"),
+                           ("updates", "版本与更新"), ("diagnostics", "诊断信息")):
             page = ttk.Frame(self.tabs)
             self.pages[key] = page
             self.tabs.add(page, text=label)
@@ -1740,6 +1834,7 @@ class Dashboard:
                 # Finish connection setup before a newly started helper begins
                 # discovery. Its own silent recovery handles later restarts.
                 self.service_after_id = root.after(100, self.begin_auto_connection)
+                self.start_codex_transport_monitor()
             if enable_tray and os.name == "nt":
                 self.tray = TrayIcon(WINDOW_TITLE, str(ROOT), self.tray_actions.put)
                 if not self.tray.start():
@@ -1790,12 +1885,115 @@ class Dashboard:
 
     def ensure_page(self, key) -> None:
         panels = {"client": ("client_dialog", ClientDialog), "settings": ("settings_dialog", SettingsDialog),
+                  "codex": ("codex_transport_dialog", CodexTransportDialog),
                   "updates": ("update_dialog", UpdateDialog), "diagnostics": ("diagnostic_dialog", DiagnosticDialog)}
         if key in panels:
             attribute, factory = panels[key]
             panel = getattr(self, attribute)
             if panel is None or panel.closed:
                 setattr(self, attribute, factory(self, parent=self.pages[key]))
+            if key == "codex":
+                self.refresh_codex_transport()
+
+    def initialize_codex_transport(self, *, enabled: bool) -> None:
+        self.codex_transport_enabled = enabled
+        self.codex_transport_dialog = None
+        self.codex_transport_busy = None
+        self.codex_transport_results = queue.SimpleQueue()
+        self.codex_transport_after_id = None
+        self.codex_transport_poll_id = None
+        self.codex_transport_state = {"mode": "unknown", "running": None, "pending": None,
+                                      "can_request": False, "can_restore": False,
+                                      "explanation": "正在读取连接状态…" if enabled else "离线模式，不读取或修改本机 Codex 设置。"}
+
+    def start_codex_transport_monitor(self) -> None:
+        """Discover persisted intent at startup, independently of opening the tab."""
+        if (self.codex_transport_enabled and not self.closed and not self.exiting
+                and self.codex_transport_after_id is None):
+            self.codex_transport_after_id = self.root.after(500, self.refresh_codex_transport)
+
+    def refresh_codex_transport(self) -> None:
+        if self.codex_transport_after_id is not None:
+            self.root.after_cancel(self.codex_transport_after_id)
+        self.codex_transport_after_id = None
+        self.codex_transport_worker("inspect", lambda: codex_transport.inspect(root=ROOT))
+
+    def request_codex_transport(self, mode: str) -> None:
+        state = self.codex_transport_state
+        if not state.get("can_request") or (mode == "original" and not state.get("can_restore")):
+            return
+        self.codex_transport_worker("request", lambda: codex_transport.request_mode(mode, root=ROOT))
+
+    def cancel_codex_transport(self) -> None:
+        if self.codex_transport_state.get("pending"):
+            self.codex_transport_worker("cancel", lambda: codex_transport.cancel_pending(root=ROOT))
+
+    def apply_pending_codex_transport(self) -> None:
+        self.codex_transport_after_id = None
+        if not self.codex_transport_state.get("pending"):
+            return
+        if self.codex_transport_state.get("running"):
+            self.refresh_codex_transport()
+            return
+        if self.restore_busy or self.manual_busy or self.client_busy or self.update_busy:
+            self.schedule_codex_transport_check()
+            return
+        self.codex_transport_worker("apply", lambda: codex_transport.process_pending(root=ROOT))
+
+    def codex_transport_applying(self) -> bool:
+        return getattr(self, "codex_transport_busy", None) in ("request", "apply", "cancel")
+
+    def schedule_codex_transport_check(self, delay: int = 4000) -> None:
+        if (self.codex_transport_enabled and not self.closed and not self.exiting
+                and self.codex_transport_after_id is None):
+            self.codex_transport_after_id = self.root.after(delay, self.apply_pending_codex_transport)
+
+    def codex_transport_worker(self, operation: str, work) -> None:
+        if (self.closed or self.exiting or not self.codex_transport_enabled or self.codex_transport_busy):
+            return
+        if operation != "inspect" and (self.restore_busy or self.manual_busy or self.client_busy or self.update_busy):
+            self.notify("正在处理其他操作，请完成后再切换 Codex 连接。", 15)
+            return
+        if self.codex_transport_after_id is not None:
+            self.root.after_cancel(self.codex_transport_after_id)
+            self.codex_transport_after_id = None
+        self.codex_transport_busy = operation
+        if self.codex_transport_dialog is not None:
+            self.codex_transport_dialog.refresh()
+        results = self.codex_transport_results
+
+        def worker():
+            if self.closed:
+                return
+            try:
+                result = work()
+            except Exception as error:
+                result = {**self.codex_transport_state, "status": "error", "ok": False,
+                          "explanation": f"Codex 连接操作未完成：{error}"}
+            results.put(result)
+
+        try:
+            threading.Thread(target=worker, name="nearroute-codex-" + operation, daemon=True).start()
+        except RuntimeError as error:
+            results.put({**self.codex_transport_state, "status": "error", "ok": False,
+                         "explanation": f"Codex 连接操作暂未启动：{error}"})
+        self.codex_transport_poll_id = self.root.after(100, self.poll_codex_transport)
+
+    def poll_codex_transport(self) -> None:
+        self.codex_transport_poll_id = None
+        if self.closed:
+            return
+        try:
+            state = self.codex_transport_results.get_nowait()
+        except queue.Empty:
+            self.codex_transport_poll_id = self.root.after(100, self.poll_codex_transport)
+            return
+        self.codex_transport_busy = None
+        self.codex_transport_state = state
+        if self.codex_transport_dialog is not None:
+            self.codex_transport_dialog.refresh()
+        if state.get("pending") and state.get("status") not in ("error", "unsupported"):
+            self.schedule_codex_transport_check(4000 if state.get("running") else 0)
 
     def has_unsaved_page_changes(self) -> bool:
         return any(panel is not None and not panel.closed and panel.has_unsaved_changes()
@@ -1830,6 +2028,9 @@ class Dashboard:
     def request_update_install(self) -> None:
         if self.closed or self.exiting or self.update_busy or self.update_release is None:
             return
+        if self.codex_transport_applying():
+            self.notify("正在处理 Codex 连接，请完成后再安装更新。", 15)
+            return
         if not self.update_can_install:
             self.update_text.set("当前目录不能安全地在软件内更新，请使用官方安装目录。")
             if self.update_dialog is not None:
@@ -1856,6 +2057,8 @@ class Dashboard:
     def begin_update_install(self) -> None:
         if self.closed or self.exiting or self.update_busy or self.restore_busy or self.manual_busy or getattr(self, "client_busy", False):
             return
+        if self.codex_transport_applying():
+            return
         if self.update_prepared is None or not self.update_can_install:
             return
         if self.has_unsaved_page_changes():
@@ -1879,6 +2082,8 @@ class Dashboard:
 
     def automatic_install_ready(self, status: dict) -> bool:
         if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.update_busy or getattr(self, "client_busy", False):
+            return False
+        if self.codex_transport_applying():
             return False
         if ((getattr(self, "active_tab", "overview") != "overview" and not getattr(self, "hidden_to_tray", False))
                 or self.has_unsaved_page_changes()):
@@ -2375,7 +2580,8 @@ class Dashboard:
         self.pause_button.state(["!disabled"] if enabled and not busy else ["disabled"])
         self.scan_button.state(["disabled"] if busy else ["!disabled"])
         self.restore_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
-        self.exit_button.state(["disabled"] if busy or self.exiting or self.manual_busy else ["!disabled"])
+        self.exit_button.state(["disabled"] if busy or self.exiting or self.manual_busy
+                               or self.codex_transport_applying() else ["!disabled"])
         if self.exiting:
             for button in (self.enable_button, self.pause_button, self.scan_button, self.restore_button):
                 button.state(["disabled"])
@@ -2544,6 +2750,10 @@ class Dashboard:
     def request_exit(self) -> None:
         if self.closed or self.exiting:
             return
+        if self.codex_transport_applying():
+            self.show_window()
+            self.notify("正在处理 Codex 连接，请等待完成后再退出。", 15)
+            return
         if getattr(self, "client_busy", False):
             self.show_window()
             self.notify("正在保存客户端连接，请完成后再退出。", 15)
@@ -2594,14 +2804,15 @@ class Dashboard:
         if self.closed:
             return
         self.closed = True
-        for name in ("client_dialog", "settings_dialog", "update_dialog", "diagnostic_dialog"):
+        for name in ("client_dialog", "settings_dialog", "update_dialog", "diagnostic_dialog", "codex_transport_dialog"):
             panel = getattr(self, name, None)
             if panel is not None and not panel.closed:
                 try:
                     panel.dispose()
                 except tk.TclError:
                     pass
-        for callback in (self.after_id, self.tray_after_id, self.service_after_id):
+        for callback in (self.after_id, self.tray_after_id, self.service_after_id,
+                         getattr(self, "codex_transport_after_id", None), getattr(self, "codex_transport_poll_id", None)):
             if callback is not None:
                 try:
                     self.root.after_cancel(callback)
