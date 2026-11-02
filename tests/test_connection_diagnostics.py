@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 import optimizer
+from tests import test_log_signals
 
 
 NOW = 2000000000
@@ -174,6 +175,21 @@ class ConnectionDiagnosticsTests(unittest.TestCase):
         result = self.summarize()
         self.assertEqual([row["kind"] for row in result["errors"]], [kind for _, kind in errors])
         self.assertEqual(result["error_count"], 4)
+
+    def test_compaction_stream_errors_use_the_same_transport_classification(self):
+        errors = ((test_log_signals.WS_CLOSE, "websocket"), (test_log_signals.RESET_ZH, "reset"),
+                  (test_log_signals.RESET_EN, "reset"), (test_log_signals.TLS_EOF, "tls"),
+                  (test_log_signals.COMPACT_DECODE, "decode"))
+        for offset, (error, _) in enumerate(errors):
+            self.insert(test_log_signals.compact_retry(error), stamp=NOW-offset)
+        self.insert(test_log_signals.compact_retry('authentication failed 401: "' + test_log_signals.WS_CLOSE + '"'))
+        self.insert(test_log_signals.compact_retry(test_log_signals.TLS_EOF), target="user_transcript")
+        result = self.summarize()
+        self.assertEqual(result["error_count"], len(errors))
+        self.assertEqual([row["kind"] for row in result["errors"]], [kind for _, kind in errors])
+        self.assertTrue(all(row["retry"] == 1 and row["max_retries"] == 2 for row in result["errors"]))
+        for error, _ in errors:
+            self.assertNotIn(error, json.dumps(result))
 
     def test_exact_two_hour_bounds_future_and_malformed_timestamps(self):
         self.insert(stamp=NOW-7200)

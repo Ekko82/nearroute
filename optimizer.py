@@ -995,8 +995,12 @@ class LogSignals:
 
     @staticmethod
     def _retry_stream_kind(body):
-        field = re.search(r'\bsampling_error\s*=\s*', body)
-        if not field or "stream disconnected - retrying sampling request (" not in body[:field.start()]:
+        field = re.search(r'\b(sampling_error|compact_error)\s*=\s*', body)
+        if not field:
+            return None
+        template = ("stream disconnected - retrying sampling request (" if field.group(1) == "sampling_error"
+                    else "remote compaction v2 stream failed; retrying request after delay")
+        if template not in body[:field.start()]:
             return None
         error = re.split(r'\s+[A-Za-z_][A-Za-z_0-9]*\s*=', body[field.end():], maxsplit=1)[0]
         error = error.strip().strip('\"\'')

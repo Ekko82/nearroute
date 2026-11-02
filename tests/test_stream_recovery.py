@@ -12,7 +12,9 @@ class StreamRecoveryTests(unittest.TestCase):
     def test_retry_rows_defer_measurement_and_switch_until_recovery_expires(self):
         rows = [test_log_signals.sampling_retry(error) for error in
                 (test_log_signals.WS_CLOSE, test_log_signals.RESET_ZH, test_log_signals.TLS_EOF)]
-        rows.append(test_log_signals.compact_retry())
+        rows.extend(test_log_signals.compact_retry(error) for error in
+                    (test_log_signals.WS_CLOSE, test_log_signals.RESET_ZH, test_log_signals.RESET_EN,
+                     test_log_signals.TLS_EOF, test_log_signals.COMPACT_DECODE))
         for row in rows:
             with self.subTest(row=row):
                 logs = test_log_signals.LogSignalsTests()

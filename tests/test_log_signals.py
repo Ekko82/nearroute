@@ -33,9 +33,9 @@ def sampling_retry(error):
 
 
 def compact_retry(error=COMPACT_DECODE):
-    # Source-derived RemoteCompactionV2 log shape, not a captured SQLite row.
+    # Observed RemoteCompactionV2 log shape with a synthetic turn identifier.
     return ("remote compaction v2 stream failed; retrying request after delay "
-            f"turn_id={TURN_A} retries=1 max_retries=1 compact_error={error}")
+            f"turn_id={TURN_A} retries=1 max_retries=2 compact_error={error}")
 
 
 class LogSignalsTests(unittest.TestCase):
@@ -121,6 +121,48 @@ class LogSignalsTests(unittest.TestCase):
         self.clock.return_value = 1005
         self.assertEqual(self.signals.poll(), 1)
         self.assertIsNone(self.signals.last_new_error_at)
+
+    def test_compact_websocket_close_windows_reset_and_tls_eof_are_new_transport_signals(self):
+        self.prime()
+        for offset, error in enumerate((WS_CLOSE, RESET_ZH, RESET_EN, TLS_EOF)):
+            text = compact_retry(error)
+            if offset == 0:
+                text = text.replace("compact_error", "\x1b[3mcompact_error\x1b[0m")
+            self.insert(text, stamp=1000 + offset)
+        self.clock.return_value = 1003
+
+        self.assertEqual(self.signals.poll(), 4)
+        self.assertEqual(self.signals.last_new_error_at, 1003)
+        self.clock.return_value = 1007
+        self.assertEqual(self.signals.poll(), 4)
+        self.assertIsNone(self.signals.last_new_error_at, "a quiet poll must not extend recovery")
+        for error in (WS_CLOSE, RESET_ZH, RESET_EN, TLS_EOF):
+            self.assertNotIn(error, repr(vars(self.signals)))
+
+    def test_compact_transport_signals_require_the_actual_error_field_and_source(self):
+        cases = [
+            ("other logger", compact_retry(WS_CLOSE), "user_transcript"),
+            ("similar logger", compact_retry(WS_CLOSE), "unrelated_responses_retry"),
+            ("missing retry template", "compact_error=" + WS_CLOSE, RETRY),
+            ("missing error field", compact_retry(WS_CLOSE).replace("compact_error=", "note="), RETRY),
+            ("wrong template", sampling_retry(WS_CLOSE).replace("sampling_error=", "compact_error="), RETRY),
+            ("wrong field", compact_retry(WS_CLOSE).replace("compact_error=", "sampling_error="), RETRY),
+            ("authentication body", compact_retry('authentication failed 401: "' + WS_CLOSE + '"'), RETRY),
+            ("rate limit body", compact_retry('stream disconnected before completion: HTTP 429: "' + WS_CLOSE + '"'), RETRY),
+            ("second error field", compact_retry("authentication failed compact_error=" + TLS_EOF), RETRY),
+            ("mixed error fields", compact_retry("authentication failed sampling_error=" + TLS_EOF), RETRY),
+            ("unknown error", compact_retry("stream disconnected before completion: unknown failure"), RETRY),
+            ("different reset", compact_retry(RESET_EN.replace("10054", "10053")), RETRY),
+            ("TLS in another field", compact_retry("stream disconnected before completion: unrelated failure")
+             + ' other_error="' + TLS_EOF + '"', RETRY),
+        ]
+        for label, text, target in cases:
+            with self.subTest(case=label):
+                signals = optimizer.LogSignals(str(self.path))
+                self.assertEqual(signals.poll(), 0)
+                self.insert(text, target=target)
+                self.assertEqual(signals.poll(), 0)
+                self.assertIsNone(signals.last_new_error_at)
 
     def test_sampling_transport_signals_require_the_actual_error_field_and_source(self):
         cases = [
