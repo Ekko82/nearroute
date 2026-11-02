@@ -34,6 +34,7 @@ REQUIRED_FILES = {"VERSION", "optimizer.py", "client_detection.py", "dashboard.p
                   "codex_transport.py", "codex_history.py", "toml_compat.py",
                   "windows_app.py", "controller_auth.ps1", "launch.ps1", "install.ps1", "uninstall.ps1",
                   "config.example.json", "README.md", "LICENSE", "assets/nearroute.ico"}
+BASELINE_REQUIRED_FILES = REQUIRED_FILES - {"codex_transport.py", "codex_history.py", "toml_compat.py"}
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -194,6 +195,29 @@ def _validate_release(release):
         raise UpdateError("更新包的版本、来源或校验信息不正确")
 
 
+def _release_from_metadata(metadata):
+    if not isinstance(metadata, dict):
+        raise UpdateError("GitHub 返回的版本信息格式不正确")
+    tag = metadata.get("tag_name", "")
+    if metadata.get("draft") or metadata.get("prerelease") or not isinstance(tag, str) or not tag.startswith("v"):
+        raise UpdateError("发布标签不是稳定版本标签")
+    version = tag[1:]
+    version_tuple(version)
+    asset_name = f"NearRoute-{version}-windows.zip"
+    asset = _asset(metadata, asset_name, tag)
+    manifest_asset = _asset(metadata, "nearroute-update.json", tag)
+    manifest = json.loads(_read_url(manifest_asset["browser_download_url"], 16 * 1024))
+    if (not isinstance(manifest, dict) or manifest.get("schema") != 1
+            or manifest.get("version") != version or manifest.get("asset") != asset_name
+            or manifest.get("size") != asset.get("size")):
+        raise UpdateError("更新清单与发布的安装包不匹配")
+    release = Release(version, tag, metadata.get("html_url", ""),
+                      str(metadata.get("body") or "暂无更新说明。")[:12000],
+                      asset["browser_download_url"], manifest.get("sha256", ""), manifest.get("size"))
+    _validate_release(release)
+    return release
+
+
 def check_for_update(root=ROOT) -> Release | None:
     state = Path(root) / "state" / "update-check.json"
     try:
@@ -217,18 +241,7 @@ def check_for_update(root=ROOT) -> Release | None:
         if version_tuple(version) <= local:
             _write_document(state, {"last_checked": time.time(), "latest_version": version})
             return None
-        asset_name = f"NearRoute-{version}-windows.zip"
-        asset = _asset(metadata, asset_name, tag)
-        manifest_asset = _asset(metadata, "nearroute-update.json", tag)
-        manifest = json.loads(_read_url(manifest_asset["browser_download_url"], 16 * 1024))
-        if (not isinstance(manifest, dict) or manifest.get("schema") != 1
-                or manifest.get("version") != version or manifest.get("asset") != asset_name
-                or manifest.get("size") != asset.get("size")):
-            raise UpdateError("更新清单与发布的安装包不匹配")
-        release = Release(version, tag, metadata.get("html_url", ""),
-                          str(metadata.get("body") or "暂无更新说明。")[:12000],
-                          asset["browser_download_url"], manifest.get("sha256", ""), manifest.get("size"))
-        _validate_release(release)
+        release = _release_from_metadata(metadata)
         _write_document(state, {"last_checked": time.time(), "latest_version": version, "release": asdict(release)})
         return release
     except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
@@ -247,6 +260,10 @@ def can_install(root=ROOT) -> bool:
 def can_update(root=ROOT) -> bool:
     root = Path(root).resolve()
     return (root / ".git").exists() or can_install(root)
+
+
+def requires_package_migration(root=ROOT) -> bool:
+    return (Path(root) / ".git").exists() and shutil.which("git") is None
 
 
 def _git(root, *arguments, message="无法检查源码更新，请确认 Git 可用后重试", timeout=30):
@@ -349,7 +366,7 @@ def _safe_member(name):
             and re.fullmatch(r"[A-Za-z0-9_-]+\.(?:ico|svg|png)", path.parts[1]))
 
 
-def validate_package(archive, release):
+def validate_package(archive, release, *, required_files=REQUIRED_FILES):
     _validate_release(release)
     archive = Path(archive)
     if archive.stat().st_size != release.size or hashlib.sha256(archive.read_bytes()).hexdigest() != release.sha256:
@@ -359,7 +376,7 @@ def validate_package(archive, release):
             members = package.infolist()
             names = [item.filename for item in members]
             if (len(members) > 256 or len({name.casefold() for name in names}) != len(names)
-                    or not REQUIRED_FILES.issubset(names)
+                    or not required_files.issubset(names)
                     or sum(item.file_size for item in members) > MAX_UNPACKED_BYTES):
                 raise UpdateError("更新包的文件清单或大小不正确")
             for item in members:
@@ -377,25 +394,19 @@ def validate_package(archive, release):
         raise UpdateError("更新包损坏或程序文件无效，请重新下载") from error
 
 
-def prepare_update(release: Release, root=ROOT) -> Path:
+def _prepare_package(release, root, *, required_files=REQUIRED_FILES):
     _validate_release(release)
-    root = Path(root).absolute()
-    if not can_update(root):
-        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
-    before = _git_source_state(root) if not can_install(root) else None
     updates = _safe_target(root, "state/updates")
     updates.mkdir(parents=True, exist_ok=True)
     prepared = _safe_target(root, "state/updates/" + release.tag)
     if prepared.exists():
         try:
-            names = validate_package(prepared / "package.zip", release)
+            validate_package(prepared / "package.zip", release, required_files=required_files)
             _write_document(prepared / "release.json", asdict(release))
         except (OSError, UpdateError):
             # Only this version's private download cache is discarded.
             shutil.rmtree(prepared)
         else:
-            if before is not None:
-                _prepare_git_update(root, prepared, release, before, names)
             return prepared
     with tempfile.TemporaryDirectory(prefix=".download-", dir=updates) as temporary:
         archive = Path(temporary) / "package.zip"
@@ -411,11 +422,115 @@ def prepare_update(release: Release, root=ROOT) -> Path:
                     stream.write(block)
         except (OSError, http.client.HTTPException) as error:
             raise UpdateError("下载失败，请确认能够连接 GitHub 后重试") from error
-        names = validate_package(archive, release)
+        validate_package(archive, release, required_files=required_files)
         _write_document(Path(temporary) / "release.json", asdict(release))
         os.replace(temporary, prepared)
+    return prepared
+
+
+def _installed_release(root):
+    version = current_version(root)
+    cached = _safe_target(root, "state/updates/v" + version)
+    try:
+        release = Release(**_read_document(cached / "release.json", {}))
+        _validate_release(release)
+        if release.version == version:
+            validate_package(cached / "package.zip", release, required_files=BASELINE_REQUIRED_FILES)
+            return release
+    except (OSError, UpdateError, TypeError):
+        pass
+    try:
+        metadata = json.loads(_read_url(
+            f"https://api.github.com/repos/{REPOSITORY}/releases/tags/v{version}", 512 * 1024))
+        release = _release_from_metadata(metadata)
+        if release.version != version:
+            raise UpdateError("当前版本的正式安装包版本不匹配，已保留现有源码")
+        return release
+    except (OSError, http.client.HTTPException, ValueError, KeyError, TypeError) as error:
+        raise UpdateError("无法验证当前版本的正式安装包，请确认能够连接 GitHub 后重试") from error
+
+
+def _source_package_root(root):
+    git = _safe_target(root, ".git")
+    if not git.is_dir() or (git / "commondir").exists() or (git / "worktrees").exists():
+        raise UpdateError("共享或工作树源码目录不能自动转换安装方式，请保留 Git 元数据并使用正式 ZIP 安装目录")
+    if any((parent / ".git").exists() for parent in root.parents):
+        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
+    return git
+
+
+def _same_release_file(name, current, original):
+    if current == original:
+        return True
+    if name in {"VERSION", "LICENSE", "README.md", "config.example.json"} or Path(name).suffix in {".py", ".ps1", ".svg"}:
+        try:
+            # Git's Windows checkout changes line endings; an optional UTF-8 BOM
+            # does not change these text files. All other bytes must match.
+            return current.decode("utf-8-sig").replace("\r\n", "\n") == original.decode("utf-8-sig").replace("\r\n", "\n")
+        except UnicodeError:
+            pass
+    return False
+
+
+def _verify_source_package_files(root, baseline, baseline_archive, target_names):
+    _source_package_root(root)
+    baseline_names = validate_package(baseline_archive, baseline, required_files=BASELINE_REQUIRED_FILES)
+    if current_version(root) != baseline.version:
+        raise UpdateError("准备更新后安装版本发生变化，请重新检查更新")
+    with zipfile.ZipFile(baseline_archive) as package:
+        for name in baseline_names:
+            target = _safe_target(root, name)
+            if not target.is_file() or not _same_release_file(name, target.read_bytes(), package.read(name)):
+                raise UpdateError(f"当前源码文件 {name} 与正式版本不同，已保留本地改动；请处理后重试")
+    for name in set(target_names) - set(baseline_names):
+        if _safe_target(root, name).exists():
+            raise UpdateError(f"新版本文件 {name} 与本地文件冲突，已保留本地文件；请处理后重试")
+
+
+def _prepare_source_package_update(root, release):
+    _source_package_root(root)
+    baseline = _installed_release(root)
+    if version_tuple(release.version) <= version_tuple(baseline.version):
+        raise UpdateError("更新版本必须高于当前安装版本")
+    baseline_prepared = _prepare_package(baseline, root, required_files=BASELINE_REQUIRED_FILES)
+    prepared = _prepare_package(release, root)
+    names = validate_package(prepared / "package.zip", release)
+    _verify_source_package_files(root, baseline, baseline_prepared / "package.zip", names)
+    _write_document(prepared / "source-package.json", {
+        "baseline": asdict(baseline), "version": release.version, "sha256": release.sha256,
+    })
+    (prepared / "git-update.json").unlink(missing_ok=True)
+    return prepared
+
+
+def _validate_prepared_source_package_update(root, archive, release, names):
+    record = _read_document(Path(archive).parent / "source-package.json", {})
+    try:
+        baseline = Release(**record.get("baseline", {}))
+        _validate_release(baseline)
+    except (TypeError, UpdateError) as error:
+        raise UpdateError("源码转换准备信息已失效，请重新下载并校验更新") from error
+    if (record.get("version") != release.version or record.get("sha256") != release.sha256
+            or version_tuple(baseline.version) >= version_tuple(release.version)):
+        raise UpdateError("源码转换准备信息已失效，请重新下载并校验更新")
+    baseline_archive = _safe_target(root, "state/updates/" + baseline.tag + "/package.zip")
+    _verify_source_package_files(root, baseline, baseline_archive, names)
+    return baseline
+
+
+def prepare_update(release: Release, root=ROOT) -> Path:
+    _validate_release(release)
+    root = Path(root).absolute()
+    if not can_update(root):
+        raise UpdateError("当前目录属于其他源码项目，无法安全更新近舟")
+    if requires_package_migration(root):
+        return _prepare_source_package_update(root, release)
+    before = _git_source_state(root) if not can_install(root) else None
+    prepared = _prepare_package(release, root)
     if before is not None:
+        names = validate_package(prepared / "package.zip", release)
         _prepare_git_update(root, prepared, release, before, names)
+        (prepared / "source-package.json").unlink(missing_ok=True)
     return prepared
 
 
@@ -489,6 +604,34 @@ def apply_package(archive: Path, release: Release, root=ROOT):
         raise UpdateError("更新未完成，已还原旧版程序") from error
 
 
+def apply_source_package_update(archive, release, root=ROOT):
+    root = Path(root).absolute()
+    names = validate_package(archive, release)
+    baseline = _validate_prepared_source_package_update(root, archive, release, names)
+    git = _source_package_root(root)
+    updates = _safe_target(root, "state/updates")
+    metadata = Path(tempfile.mkdtemp(prefix="source-metadata-v" + baseline.version + "-", dir=updates))
+    saved_git = metadata / ".git"
+    try:
+        os.replace(git, saved_git)
+    except OSError:
+        metadata.rmdir()
+        raise
+    try:
+        apply_package(archive, release, root)
+    except Exception:
+        try:
+            if git.exists() or _is_link(git):
+                raise OSError("Git metadata path is occupied")
+            os.replace(saved_git, git)
+            metadata.rmdir()
+        except OSError as restore_error:
+            raise UpdateError("更新未完成；Git 元数据保留在 " + str(metadata.relative_to(root)) +
+                              "/.git，请恢复后重试") from restore_error
+        raise
+    return metadata
+
+
 class InstallLock:
     def __init__(self, root=ROOT):
         self.path = Path(root) / "state" / "update.lock"
@@ -539,7 +682,10 @@ def start_installer(prepared: Path, *, parent_pid: int, python_exe: str, root=RO
         raise UpdateError("缓存版本信息已失效，请重新下载更新") from error
     names = validate_package(Path(prepared) / "package.zip", release)
     if not can_install(root):
-        _validate_prepared_git_update(root, Path(prepared) / "package.zip", release, names)
+        if (Path(prepared) / "source-package.json").exists():
+            _validate_prepared_source_package_update(Path(root).absolute(), Path(prepared) / "package.zip", release, names)
+        else:
+            _validate_prepared_git_update(root, Path(prepared) / "package.zip", release, names)
     worker = Path(tempfile.mkdtemp(prefix="nearroute-updater-"))
     try:
         shutil.copy2(Path(__file__), worker / "updater.py")
@@ -615,6 +761,8 @@ def _run_installer(prepared, root, parent_pid, python_exe):
             raise UpdateError("后台已重新启动，已取消更新")
         if can_install(root):
             apply_package(Path(prepared) / "package.zip", release, root)
+        elif (Path(prepared) / "source-package.json").exists():
+            apply_source_package_update(Path(prepared) / "package.zip", release, root)
         else:
             apply_git_update(Path(prepared) / "package.zip", release, root)
         _write_document(root / "state" / "update-result.json",

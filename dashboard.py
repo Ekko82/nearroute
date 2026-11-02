@@ -1564,7 +1564,7 @@ class UpdateDialog:
             button.pack(side="left", padx=(0, 16), pady=3)
             if value != "notify" and not owner.update_can_install:
                 button.state(["disabled"])
-        update_help = ("支持在软件内更新，本地源码有改动时会保留并提示。" if owner.update_can_install
+        update_help = ("支持在软件内更新。缺少 Git 时自动校验并转换安装方式，无需另装工具；本地改动会保留并提示。" if owner.update_can_install
                        else "当前目录不能安全地在软件内更新，请使用官方安装目录。")
         help_label = ttk.Label(preferences, text=update_help, style="Surface.TLabel", foreground="#64748b", wraplength=620)
         help_label.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -2044,7 +2044,10 @@ class Dashboard:
             if self.update_dialog is not None:
                 self.update_dialog.refresh()
             return
-        if not messagebox.askyesno("安装近舟更新", "安装更新会停止后台优选并重启近舟。保留现有设置和当前代理节点，是否继续？", parent=self.root):
+        prompt = "安装更新会停止后台优选并重启近舟，保留现有设置和当前代理节点。"
+        if updater.requires_package_migration(root=ROOT):
+            prompt += "\n软件将自动校验并转为发行包更新，原源码信息会备份，无需安装 Git。"
+        if not messagebox.askyesno("安装近舟更新", prompt + "\n是否继续？", parent=self.root):
             return
         self.update_requested_install = True
         if self.update_prepared is not None:

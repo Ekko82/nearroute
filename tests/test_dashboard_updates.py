@@ -384,6 +384,15 @@ class UpdateBehaviorTests(unittest.TestCase):
         self.app.close.assert_called_once()
         self.browser.assert_not_called()
 
+    def test_missing_git_migration_is_explained_in_the_same_install_confirmation(self):
+        self.app.update_release = RELEASE
+        with patch.object(updater, "requires_package_migration", return_value=True):
+            self.app.request_update_install()
+        self.confirm.assert_called_once()
+        self.assertIn("原源码信息会备份", self.confirm.call_args.args[1])
+        self.assertIn("无需安装 Git", self.confirm.call_args.args[1])
+        self.assertEqual(self.app.update_busy, "prepare")
+
     def test_unsupported_directory_reports_reason_without_opening_browser(self):
         self.app.update_release = RELEASE
         self.app.update_can_install = False
