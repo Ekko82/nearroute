@@ -28,7 +28,9 @@ class HistoryMigrationTests(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="nearroute-history-")
         self.addCleanup(temporary.cleanup)
-        self.home = Path(temporary.name)
+        # Windows CI may expose TEMP through an 8.3 alias (RUNNER~1).
+        # The adapter resolves home before passing it to the engine.
+        self.home = Path(temporary.name).resolve()
         self.engine = self.home / "CoDeX.exe"
         self.engine.touch()
         self.config = self.home / "config.toml"
