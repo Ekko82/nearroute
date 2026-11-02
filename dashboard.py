@@ -801,6 +801,8 @@ class ClientDialog:
         cfg = core.DEFAULTS | (read_json(CONFIG) if CONFIG.exists() else {})
         self.original_context = core.state_context(cfg)
         self.closed = self.loading = self.applying = self.importing = False
+        self.auto_connecting = self.needs_permission = False
+        self.advanced_open = False
         self.verified_identity = None
         self.selector_groups = []
         self.discovered_clients = {}
@@ -816,21 +818,56 @@ class ClientDialog:
         self.auto_group = tk.BooleanVar(value=cfg.get("auto_select_group", True))
         self.compatible = tk.BooleanVar(value=cfg.get("controller_api_mode", "standard") == "selector")
         self._saved_fields = self._draft_values()
-        self.message = tk.StringVar(value="自动发现本机客户端，或填写控制地址后测试连接；检查过程不会切换节点。")
+        self.message = tk.StringVar(value="打开后会自动连接本机代理客户端。")
+        self.choice_controller = tk.StringVar()
         form = ttk.Frame(self.window, padding=(16, 12))
         form.pack(fill="both", expand=True)
         form.columnconfigure(0, weight=1)
-        form.rowconfigure(2, weight=1)
+        form.rowconfigure(4, weight=1)
         header = ttk.Frame(form)
         header.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         ttk.Label(header, text="连接代理客户端", style="Title.TLabel").pack(anchor="w")
-        help_text = ("支持 Clash Verge Rev、Clash Party（原 Mihomo Party）等本机 Mihomo/Clash 客户端。"
-                     "猫猫云 5.6 可使用下方代理组兼容模式。")
+        help_text = "自动识别本机客户端、认证和代理组；连接后沿用当前节点与优选开关。"
         help_label = ttk.Label(header, text=help_text, wraplength=690, style="Muted.TLabel")
         help_label.pack(anchor="w", fill="x", pady=(6, 0))
 
-        connection = ttk.Frame(form, style="Card.TFrame", padding=10)
-        connection.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.summary = ttk.Frame(form, style="Card.TFrame", padding=16)
+        self.summary.grid(row=1, column=0, sticky="ew", pady=(0, 10))
+        self.summary.columnconfigure(0, weight=1)
+        status_label = ttk.Label(self.summary, textvariable=self.message, wraplength=650,
+                                width=1, style="Surface.TLabel")
+        status_label.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        self.reconnect_button = ttk.Button(self.summary, text="重新连接", style="Primary.TButton",
+                                           command=self.auto_connect)
+        self.reconnect_button.grid(row=1, column=0, sticky="w")
+        self.permission_button = ttk.Button(self.summary, text="允许 Windows 确认并连接", command=self.auto_connect)
+        self.permission_button.grid(row=1, column=1, padx=(10, 0))
+        self.permission_button.grid_remove()
+        self.choices = ttk.Frame(form, style="Card.TFrame", padding=12)
+        self.choices.grid(row=2, column=0, sticky="ew", pady=(0, 10))
+        self.choices.columnconfigure(1, weight=1)
+        self.client_choice_label = ttk.Label(self.choices, text="选择客户端", style="Surface.TLabel")
+        self.client_choice_label.grid(row=0, column=0, padx=(0, 12))
+        self.client_choice = ttk.Combobox(self.choices, textvariable=self.choice_controller, state="readonly")
+        self.client_choice.grid(row=0, column=1, sticky="ew")
+        self.client_choice.bind("<<ComboboxSelected>>", self.connect_selected_client)
+        self.group_choice_label = ttk.Label(self.choices, text="选择代理组", style="Surface.TLabel")
+        self.group_choice_label.grid(row=1, column=0, padx=(0, 12), pady=(8, 0))
+        self.group_choice = ttk.Combobox(self.choices, textvariable=self.group, state="readonly")
+        self.group_choice.grid(row=1, column=1, sticky="ew", pady=(8, 0))
+        self.group_choice.bind("<<ComboboxSelected>>", lambda _event: self.auto_connect(selected=True))
+        self.choices.grid_remove()
+        navigation = ttk.Frame(form)
+        navigation.grid(row=3, column=0, sticky="ew", pady=(0, 8))
+        self.advanced_button = ttk.Button(navigation, text="高级设置 ▸", command=self.toggle_advanced)
+        self.advanced_button.pack(side="left")
+        ttk.Button(navigation, text="返回概览", command=self.close).pack(side="right")
+        self.advanced = ttk.Frame(form)
+        self.advanced.grid(row=4, column=0, sticky="nsew")
+        self.advanced.columnconfigure(0, weight=1)
+        self.advanced.rowconfigure(1, weight=1)
+        connection = ttk.Frame(self.advanced, style="Card.TFrame", padding=10)
+        connection.grid(row=0, column=0, sticky="ew", pady=(0, 10))
         connection.columnconfigure(1, weight=1)
         ttk.Label(connection, text="控制地址", style="Surface.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 14))
         self.address_entry = ttk.Combobox(connection, textvariable=self.controller)
@@ -845,7 +882,7 @@ class ClientDialog:
         self.secret_entry.grid(row=2, column=1, sticky="ew")
         self.auth_button = ttk.Button(connection, text="导入猫猫云认证", command=self.import_auth)
         self.auth_button.grid(row=2, column=2, padx=(10, 0))
-        secret_help = ttk.Label(connection, text="填写变量名，无需认证时留空。猫猫云导入需管理员确认，客户端重启后需重新导入。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
+        secret_help = ttk.Label(connection, text="手动连接可指定密钥变量；自动连接会处理猫猫云认证，必要时显示 Windows 管理员确认。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
         secret_help.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(6, 0))
         self.auto_detect_button = ttk.Checkbutton(connection, text="当前地址失效时自动发现本机客户端", variable=self.auto_detect, style="Surface.TCheckbutton")
         self.auto_detect_button.grid(row=4, column=0, columnspan=3, sticky="w", pady=(10, 0))
@@ -854,8 +891,8 @@ class ClientDialog:
         compatible_help = ttk.Label(connection, text="仅按所选代理组优选；Codex 实际路径、HTTP 状态与流式连接未验证。", wraplength=650, style="Surface.TLabel", foreground="#64748b")
         compatible_help.grid(row=6, column=0, columnspan=3, sticky="ew", pady=(4, 0))
 
-        selection = ttk.Frame(form, style="Card.TFrame", padding=10)
-        selection.grid(row=2, column=0, sticky="nsew")
+        selection = ttk.Frame(self.advanced, style="Card.TFrame", padding=10)
+        selection.grid(row=1, column=0, sticky="nsew")
         selection.columnconfigure(0, weight=1)
         ttk.Label(selection, text="选择代理组", style="Section.TLabel", background="#ffffff").grid(row=0, column=0, columnspan=2, sticky="w")
         self.groups = ttk.Combobox(selection, textvariable=self.group, state="readonly")
@@ -866,8 +903,8 @@ class ClientDialog:
         self.auto_group_button.grid(row=2, column=0, columnspan=2, sticky="w", pady=(0, 12))
         message_label = ttk.Label(selection, textvariable=self.message, wraplength=650, style="Surface.TLabel", foreground="#64748b")
         message_label.grid(row=3, column=0, columnspan=2, sticky="ew")
-        actions = ttk.Frame(form)
-        actions.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        actions = ttk.Frame(self.advanced)
+        actions.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(actions, text="更换连接会停止后台并暂停自动优选。", style="Muted.TLabel").pack(side="left")
         self.save_button = ttk.Button(actions, text="保存连接", style="Primary.TButton", command=self.save)
         self.save_button.pack(side="right")
@@ -877,8 +914,9 @@ class ClientDialog:
         self.discard_button.pack(side="right")
         form.bind("<Configure>", lambda event: (
             help_label.configure(wraplength=max(400, event.width - 48)),
-            [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, compatible_help, message_label)],
+            [label.configure(wraplength=max(400, event.width - 82)) for label in (address_help, secret_help, compatible_help, message_label, status_label)],
         ))
+        self.advanced.grid_remove()
         self._variable_traces = [
             (self.controller, self.controller.trace_add("write", self.invalidate_connection)),
             (self.secret_env, self.secret_env.trace_add("write", self.invalidate_connection)),
@@ -888,7 +926,67 @@ class ClientDialog:
         self.update_buttons()
         self.after_id = self.window.after(150, self.poll_results)
         if visible:
-            self.discover_connections()
+            self.auto_connect()
+
+    def toggle_advanced(self) -> None:
+        self.advanced_open = not self.advanced_open
+        self.advanced_button.configure(text="高级设置 ▾" if self.advanced_open else "高级设置 ▸")
+        if self.advanced_open:
+            self.summary.grid_remove()
+            self.choices.grid_remove()
+            self.advanced.grid()
+        else:
+            self.advanced.grid_remove()
+            self.summary.grid()
+            self.update_choices()
+
+    def update_choices(self) -> None:
+        clients = list(self.discovered_clients)
+        multiple_clients = len(clients) > 1 and not self.verified_identity
+        groups = self.selector_groups if self.group.get() not in self.selector_groups else []
+        multiple_groups = len(groups) > 1
+        self.client_choice.configure(values=clients)
+        self.group_choice.configure(values=groups)
+        for widget in (self.client_choice_label, self.client_choice):
+            widget.grid() if multiple_clients else widget.grid_remove()
+        for widget in (self.group_choice_label, self.group_choice):
+            widget.grid() if multiple_groups else widget.grid_remove()
+        if (multiple_clients or multiple_groups) and not self.advanced_open:
+            self.choices.grid()
+        else:
+            self.choices.grid_remove()
+
+    def connect_selected_client(self, _event=None) -> None:
+        address = self.choice_controller.get()
+        if address not in self.discovered_clients or self.applying or self.loading:
+            return
+        self.controller.set(address)
+        self.select_discovered_client()
+        self.auto_connect(selected=True)
+
+    def auto_connect(self, *, selected: bool = False, allow_elevation: bool = True) -> None:
+        if (self.closed or self.loading or self.applying or self.owner.exiting
+                or self.owner.restore_busy or self.owner.manual_busy or self.owner.client_busy):
+            return
+        # Existing manual drafts are intentional. The automatic worker may only
+        # use them after an explicit retry; startup never replaces a draft.
+        fields = self.fields() if selected or self.has_unsaved_changes() else None
+        snapshot = self._draft_values()
+        expected_context = self.original_context
+        self.applying = self.auto_connecting = self.owner.client_busy = True
+        self.verified_identity = None
+        self.selector_groups = []
+        self.owner.cancel_service_start()
+        self.message.set("正在连接本机代理客户端；需要读取受保护认证时会显示 Windows 确认…")
+        self.update_buttons()
+        helpers = list(self.owner.started_helpers)
+
+        def connect():
+            if not wait_for_helper_startup(helpers):
+                raise RuntimeError("后台仍在启动，请稍后重新连接。")
+            return core.auto_connect_client(fields, expected_context=expected_context, allow_elevation=allow_elevation)
+
+        self.start_worker("auto", snapshot, connect)
 
     def fields(self) -> dict:
         return {"controller": self.controller.get().strip().rstrip("/"),
@@ -917,6 +1015,11 @@ class ClientDialog:
 
     def update_buttons(self) -> None:
         busy = self.loading or self.applying
+        self.reconnect_button.state(["disabled"] if busy else ["!disabled"])
+        self.permission_button.state(["disabled"] if busy else ["!disabled"])
+        self.permission_button.grid() if self.needs_permission else self.permission_button.grid_remove()
+        self.client_choice.configure(state="disabled" if busy else "readonly")
+        self.group_choice.configure(state="disabled" if busy else "readonly")
         self.inspect_button.state(["disabled"] if busy else ["!disabled"])
         self.discover_button.state(["disabled"] if busy else ["!disabled"])
         self.auth_button.state(["disabled"] if busy or os.name != "nt" else ["!disabled"])
@@ -1038,7 +1141,48 @@ class ClientDialog:
         try:
             while True:
                 operation, identity, success, result = self.results.get_nowait()
-                if operation == "auth":
+                if operation == "auto":
+                    self.applying = self.auto_connecting = self.owner.client_busy = False
+                    if identity != self._draft_values():
+                        self.message.set("连接参数已改变，已保留当前草稿。请重新连接。")
+                    elif success:
+                        self.needs_permission = bool(result.get("needs_permission"))
+                        self.discovery_identity = self.identity()
+                        self.discovered_clients = {item["controller"]: item for item in result.get("candidates", [])}
+                        self.address_entry.configure(values=list(self.discovered_clients))
+                        if result.get("connected"):
+                            saved = result["config"]
+                            self.controller.set(saved["controller"])
+                            self.secret_env.set(saved.get("controller_secret_env", ""))
+                            self.compatible.set(saved.get("controller_api_mode") == "selector")
+                            self.group.set(saved["group"])
+                            self.auto_detect.set(saved.get("auto_detect_client", True))
+                            self.auto_group.set(saved.get("auto_select_group", True))
+                            self.original_context = core.state_context(saved)
+                            candidate = self.discovered_clients.get(saved["controller"])
+                            if candidate is not None and candidate.get("verified"):
+                                self.apply_inspection(candidate, self.identity())
+                            self._saved_fields = self._draft_values()
+                            self.owner.client_saved(saved)
+                        else:
+                            selected = self.discovered_clients.get(result.get("selected_controller"))
+                            if selected is not None:
+                                self.controller.set(selected["controller"])
+                                if selected.get("verified"):
+                                    self.select_discovered_client()
+                                    # The automatic core left an ambiguous group
+                                    # unresolved; do not inherit an old group.
+                                    self.group.set("")
+                            self.selector_groups = result.get("groups", self.selector_groups)
+                            self._saved_fields = self._draft_values()
+                        self.message.set(result.get("message") or ("客户端已连接。" if result.get("connected") else "尚未连接，请确认代理客户端已启动。"))
+                        self.update_choices()
+                    else:
+                        self.message.set("暂未连接：" + result)
+                    if (getattr(self.owner, "service_recovery_enabled", False)
+                            and not self.owner.closed and not self.owner.exiting):
+                        self.owner.ensure_service()
+                elif operation == "auth":
                     self.applying = self.importing = self.owner.client_busy = False
                     if identity != self.identity():
                         self.message.set("连接参数已改变；本次认证未应用到当前草稿，请重新导入。")
@@ -1593,7 +1737,9 @@ class Dashboard:
         self.policy_label.bind("<Configure>", lambda event: self.policy_label.configure(wraplength=max(200, event.width)))
         try:
             if start_service:
-                self.service_after_id = root.after(100, self.ensure_service)
+                # Finish connection setup before a newly started helper begins
+                # discovery. Its own silent recovery handles later restarts.
+                self.service_after_id = root.after(100, self.begin_auto_connection)
             if enable_tray and os.name == "nt":
                 self.tray = TrayIcon(WINDOW_TITLE, str(ROOT), self.tray_actions.put)
                 if not self.tray.start():
@@ -1845,6 +1991,48 @@ class Dashboard:
         except (OSError, ValueError) as error:
             self.notify(f"服务启动失败：{error}", 30)
             return False
+
+    def begin_auto_connection(self) -> None:
+        self.service_after_id = None
+        if self.closed or self.exiting or self.restore_busy or self.manual_busy or self.client_busy:
+            return
+        panel = self.client_dialog
+        if panel is None or panel.closed:
+            try:
+                panel = self.client_dialog = ClientDialog(self, parent=self.pages["client"], visible=False)
+            except (OSError, ValueError) as error:
+                self.notify(f"自动连接未完成：{error}", 30)
+                self.ensure_service()
+                return
+        if not panel.has_unsaved_changes():
+            panel.auto_connect()
+        else:
+            self.ensure_service()
+
+    def refresh_client_connection(self, status: dict, config: dict) -> None:
+        panel = self.client_dialog
+        if panel is None or panel.closed or panel.loading or panel.applying or panel.has_unsaved_changes():
+            return
+        saved = core.DEFAULTS | config
+        if core.state_context(saved) != panel.original_context:
+            # Silent helper recovery can rotate the credential or select a new
+            # unique client. Only a clean panel follows that saved connection.
+            panel.controller.set(saved["controller"])
+            panel.secret_env.set(saved["controller_secret_env"])
+            panel.group.set(saved["group"])
+            panel.compatible.set(saved.get("controller_api_mode") == "selector")
+            panel.original_context = core.state_context(saved)
+            panel._saved_fields = panel._draft_values()
+            panel.discovered_clients = {}
+            panel.update_choices()
+        if status.get("client_connection_needs_permission"):
+            panel.needs_permission = True
+            panel.message.set(status.get("client_detection_message") or "连接认证需要 Windows 确认，请点击重新连接。")
+            panel.update_buttons()
+        elif status.get("controller_available"):
+            panel.needs_permission = False
+            panel.message.set("客户端已连接，当前节点和优选开关保持。")
+            panel.update_buttons()
 
     def recover_service(self, status: dict, config: dict) -> None:
         """Recover a missing helper without replacing one whose snapshot is delayed."""
@@ -2174,6 +2362,7 @@ class Dashboard:
         self.refresh_runtime_notice(status)
         self.poll_manual_selection(status)
         self.recover_service(status, config)
+        self.refresh_client_connection(status, config)
         stale = bool(status) and status_is_stale(status)
         phase = str(status.get("phase", "starting"))
         starting = phase == "starting"
@@ -2192,7 +2381,9 @@ class Dashboard:
                 button.state(["disabled"])
         if client_busy:
             importing = getattr(getattr(self, "client_dialog", None), "importing", False)
-            badge, color = "正在导入客户端认证" if importing else "正在保存客户端连接", "#1b66b0"
+            connecting = getattr(getattr(self, "client_dialog", None), "auto_connecting", False)
+            badge, color = ("正在连接代理客户端" if connecting else "正在导入客户端认证" if importing
+                            else "正在保存客户端连接"), "#1b66b0"
         elif self.manual_busy:
             badge, color = "正在手动切换", "#1b66b0"
         elif stale:

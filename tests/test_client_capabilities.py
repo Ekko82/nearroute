@@ -89,7 +89,7 @@ class ClientCapabilityTests(unittest.TestCase):
                         response = io.BytesIO(json.dumps(version).encode())
                         responses.append(response)
                         return response
-                    self.assertIn(path, ("/version", "/configs"))
+                    self.assertIn(path, ("/version", "/configs", "/proxies"))
                     response = io.BytesIO(b"private response body")
                     responses.append(response)
                     raise urllib.error.HTTPError(request.full_url, 405, "fixture", {}, response)
@@ -102,7 +102,8 @@ class ClientCapabilityTests(unittest.TestCase):
                 self.assertEqual(len(result["candidates"]), int(retained))
                 if retained:
                     self.assertTrue(result["candidates"][0]["unsupported"])
-                self.assertEqual(calls, [("GET", "/version"), ("GET", "/configs")] if retained
+                self.assertEqual(calls, [("GET", "/version"), ("GET", "/configs"),
+                                         ("GET", "/version"), ("GET", "/proxies")] if retained
                                  else [("GET", "/version")])
                 self.assertTrue(all(response.closed for response in responses))
                 self.assertIsNone(result["selected_controller"])

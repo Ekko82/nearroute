@@ -33,6 +33,7 @@ GPS_READWRITE = 2
 GA_ROOT = 2
 RPC_E_CHANGED_MODE = -2147417850
 LAUNCH_PREFIX = ("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File")
+_credential_permission_required = set()
 
 
 def _read_user_environment(name):
@@ -44,15 +45,7 @@ def _read_user_environment(name):
     return value
 
 
-def import_maomao_auth(controller):
-    """Import the selected local client's credential after a user clicks Import.
-
-    The elevated helper validates the client and stores only a user environment
-    variable. Its name is returned; the credential never enters process arguments,
-    stdout, diagnostic messages, or the application configuration.
-    """
-    if not IS_WINDOWS:
-        raise RuntimeError("猫猫云认证导入仅支持 Windows")
+def _controller_endpoint(controller, *, canonical_localhost=False):
     try:
         url = urllib.parse.urlsplit(controller)
         if (url.scheme != "http" or url.hostname not in ("127.0.0.1", "::1", "localhost")
@@ -61,9 +54,13 @@ def import_maomao_auth(controller):
                 or "\\" in controller or any(ord(char) <= 32 or ord(char) >= 127 for char in controller)
                 or url.netloc.endswith(":") or not 1 <= (80 if url.port is None else url.port) <= 65535):
             raise ValueError
-        host, port = url.hostname, url.port or 80
+        host = "127.0.0.1" if canonical_localhost and url.hostname == "localhost" else url.hostname
+        return host, url.port or 80
     except (AttributeError, TypeError, ValueError):
         raise ValueError("认证导入仅支持本机 HTTP 控制地址，不能含账号密码、路径或查询参数") from None
+
+
+def _run_controller_auth(host, port, *, private_credential, elevate):
     script = ROOT / "controller_auth.ps1"
     if not script.is_file():
         raise RuntimeError("缺少认证导入组件，请更新或重新安装近舟")
@@ -79,8 +76,8 @@ try {
     $expires = [DateTime]::UtcNow.AddSeconds(60).Ticks
     $arguments = @('-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File',
         %s, '-ControllerHost', %s, '-ControllerPort', '%d', '-ExpectedSid', $sid,
-        '-RequestExpiresUtcTicks', $expires)
-    $process = Start-Process -FilePath %s -ArgumentList $arguments -Verb RunAs -WindowStyle Hidden -PassThru
+        '-RequestExpiresUtcTicks', $expires%s)
+    $process = Start-Process -FilePath %s -ArgumentList $arguments %s-WindowStyle Hidden -PassThru
     try {
         if (-not $process.WaitForExit(60000)) { exit 124 }
         exit $process.ExitCode
@@ -91,14 +88,110 @@ try {
     }
     exit 15
 }
-""" % (quote('"' + str(script) + '"'), quote(host), port, quote(powershell))
+""" % (quote('"' + str(script) + '"'), quote(host), port,
+       ", '-PrivateCredential'" if private_credential else "", quote(powershell),
+       "-Verb RunAs " if elevate else "")
+    return subprocess.run(
+        [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
+         base64.b64encode(program.encode("utf-16-le")).decode("ascii")],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        timeout=150 if elevate else 75, check=False,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [("size", wintypes.DWORD), ("data", ctypes.c_void_p)]
+
+
+def _decrypt_controller_credential(encrypted, entropy):
+    """Use the signed-in user's DPAPI key; CRYPTPROTECT_UI_FORBIDDEN forbids UI."""
+    crypt = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    crypt.CryptUnprotectData.argtypes = [ctypes.POINTER(_DataBlob), ctypes.c_void_p,
+        ctypes.POINTER(_DataBlob), ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+        ctypes.POINTER(_DataBlob)]
+    crypt.CryptUnprotectData.restype = wintypes.BOOL
+    kernel.LocalFree.argtypes, kernel.LocalFree.restype = [ctypes.c_void_p], ctypes.c_void_p
+    source = ctypes.create_string_buffer(encrypted)
+    purpose = ctypes.create_string_buffer(entropy)
+    source_blob = _DataBlob(len(encrypted), ctypes.cast(source, ctypes.c_void_p))
+    purpose_blob = _DataBlob(len(entropy), ctypes.cast(purpose, ctypes.c_void_p))
+    output = _DataBlob()
+    if not crypt.CryptUnprotectData(ctypes.byref(source_blob), None,
+            ctypes.byref(purpose_blob), None, None, 1, ctypes.byref(output)):
+        raise OSError("Controller credential cannot be decrypted")
     try:
-        result = subprocess.run(
-            [powershell, "-NoProfile", "-NonInteractive", "-EncodedCommand",
-             base64.b64encode(program.encode("utf-16-le")).decode("ascii")],
-            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            timeout=150, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
+        return ctypes.string_at(output.data, output.size).decode("ascii")
+    finally:
+        kernel.LocalFree(output.data)
+
+
+def read_controller_credential(controller):
+    """Read NearRoute's user-encrypted credential without launching a helper or UI.
+
+    Missing, unreadable and unsupported controller credentials return an empty
+    string. Only refresh_controller_credential inspects the selected local client.
+    """
+    if not IS_WINDOWS:
+        return ""
+    try:
+        host, port = _controller_endpoint(controller, canonical_localhost=True)
+        filename = f"{host.replace(':', '_')}-{port}.dpapi"
+        path = ROOT / "state" / "controller-credentials" / filename
+        with path.open("rb") as stream:
+            encrypted = stream.read(8193)
+        if not encrypted or len(encrypted) > 8192:
+            return ""
+        entropy = f"NearRoute/controller/v1/{host}:{port}".encode("ascii")
+        credential = _decrypt_controller_credential(encrypted, entropy)
+        return credential if re.fullmatch(r"[0-9a-fA-F]{48}", credential) else ""
+    except (OSError, ValueError, TypeError, UnicodeError):
+        return ""
+
+
+def refresh_controller_credential(controller, *, elevate=False):
+    """Validate and save the selected current user's MAOMAO credential privately.
+
+    The default uses standard-user process access and never prompts for elevation.
+    An explicit elevate=True may show UAC. Failures return False, leave any prior
+    credential in place and expose no process arguments or credential diagnostics.
+    This function never writes user or process environment variables.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        host, port = _controller_endpoint(controller, canonical_localhost=True)
+        _credential_permission_required.discard((host, port))
+        result = _run_controller_auth(host, port, private_credential=True, elevate=elevate)
+        if not elevate and result.returncode == 16:
+            _credential_permission_required.add((host, port))
+        return result.returncode == 0 and bool(read_controller_credential(controller))
+    except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        return False
+
+
+def controller_credential_needs_permission(controller):
+    """True after a silent attempt identified a protected, current-user MAOMAO candidate.
+
+    This permits an elevation request only. The elevated helper still verifies
+    full paths, both process owners and controller authentication before storage.
+    """
+    if not IS_WINDOWS:
+        return False
+    try:
+        return _controller_endpoint(controller, canonical_localhost=True) in _credential_permission_required
+    except ValueError:
+        return False
+
+
+def import_maomao_auth(controller):
+    """Legacy explicit import for advanced environment-variable configuration."""
+    if not IS_WINDOWS:
+        raise RuntimeError("猫猫云认证导入仅支持 Windows")
+    host, port = _controller_endpoint(controller)
+    try:
+        result = _run_controller_auth(host, port, private_credential=False, elevate=True)
     except subprocess.TimeoutExpired:
         raise RuntimeError("管理员确认或认证导入超时，请确认猫猫云仍在运行后重试") from None
     except OSError:

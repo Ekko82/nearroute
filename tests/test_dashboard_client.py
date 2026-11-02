@@ -45,6 +45,7 @@ class ClientDialogTests(unittest.TestCase):
         self.inspect = self.patches.enter_context(patch.object(dashboard.core, "inspect_controller", return_value=self.inspection))
         self.discovery = self.patches.enter_context(patch.object(dashboard.core, "discover_clients"))
         self.configure = self.patches.enter_context(patch.object(dashboard.core, "configure_client"))
+        self.auto_connection = self.patches.enter_context(patch.object(dashboard.core, "auto_connect_client", create=True))
         self.import_auth = self.patches.enter_context(patch.object(dashboard.windows_app, "import_maomao_auth", create=True))
         self.wait_for_startup = self.patches.enter_context(patch.object(dashboard, "wait_for_helper_startup", return_value=True))
         self.start_daemon = self.patches.enter_context(patch.object(dashboard, "start_daemon", side_effect=AssertionError("real helper forbidden")))
@@ -64,7 +65,7 @@ class ClientDialogTests(unittest.TestCase):
     def release_tcl_fixture(self):
         interpreter = weakref.ref(self.interpreter)
         self.workers.clear()
-        for mock in (self.inspect, self.discovery, self.configure, self.import_auth):
+        for mock in (self.inspect, self.discovery, self.configure, self.auto_connection, self.import_auth):
             # Raised synthetic errors retain worker frames through tracebacks.
             mock.reset_mock(return_value=True, side_effect=True)
         self.dialog = self.interpreter = None
@@ -239,7 +240,7 @@ class ClientDialogTests(unittest.TestCase):
                                   "recommended_group": "PROXY", "group_reason": "优先保留有效代理组。",
                                   "nearby_regions": ["JP", "TW"]} | fields
 
-    def test_inline_panel_has_no_toplevel_and_activation_starts_async_discovery(self):
+    def test_inline_panel_has_no_toplevel_and_activation_starts_async_connection(self):
         self.toplevel.assert_not_called()
         self.dialog.window.pack.assert_any_call(fill="both", expand=True)
         self.discovery.assert_not_called()
@@ -248,9 +249,121 @@ class ClientDialogTests(unittest.TestCase):
         self.owner.show_tab.assert_called_once_with("overview")
         self.dialog = dashboard.ClientDialog(self.owner, parent=self.parent)
         self.owner.client_dialog = self.dialog
-        self.assertTrue(self.dialog.loading)
+        self.assertTrue(self.dialog.auto_connecting)
+        self.assertTrue(self.owner.client_busy)
+        self.auto_connection.assert_not_called()
         self.discovery.assert_not_called()
         self.assertEqual(len(self.workers), 1)
+
+    def test_automatic_connection_finishes_without_manual_test_import_or_save(self):
+        self.owner.service_recovery_enabled = True
+        self.owner.closed = False
+        self.owner.ensure_service = Mock()
+        address = "http://127.0.0.1:9790"
+        saved = dashboard.core.DEFAULTS | {"controller": address, "controller_secret_env": "AUTOMATIC_SECRET",
+                                            "group": "PROXY", "enabled": False, "controller_api_mode": "selector"}
+        self.auto_connection.return_value = {"connected": True, "config": saved,
+                                             "candidates": [self.candidate(address, controller_api_mode="selector")],
+                                             "selected_controller": address, "message": "客户端已自动连接。"}
+        original = self.dialog.original_context
+        before = self.dialog._draft_values()
+        self.dialog.auto_connect()
+        self.dialog.auto_connect()  # No competing automatic worker.
+        self.assertEqual(len(self.workers), 1)
+        self.assertTrue(self.owner.client_busy)
+        self.owner.cancel_service_start.assert_called_once()
+        self.auto_connection.assert_not_called()
+        self.workers.pop(0)()
+        self.assertEqual(self.dialog._draft_values(), before)  # Worker never touches Tk.
+        self.owner.ensure_service.assert_not_called()
+        self.dialog.poll_results()
+        self.auto_connection.assert_called_once_with(None, expected_context=original, allow_elevation=True)
+        self.owner.client_saved.assert_called_once_with(saved)
+        self.owner.ensure_service.assert_called_once()
+        self.assertFalse(self.dialog.auto_connecting)
+        self.assertFalse(self.owner.client_busy)
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.assertEqual(self.dialog.original_context, dashboard.core.state_context(saved))
+        self.assertEqual(self.dialog.secret_env.get(), "AUTOMATIC_SECRET")
+        self.assertTrue(self.dialog.compatible.get())
+        self.inspect.assert_not_called()
+        self.configure.assert_not_called()
+        self.import_auth.assert_not_called()
+
+    def test_automatic_result_preserves_later_draft(self):
+        saved = dashboard.core.DEFAULTS | {"group": "PROXY"}
+        self.auto_connection.return_value = {"connected": True, "config": saved, "candidates": []}
+        self.dialog.auto_connect()
+        self.dialog.controller.set("http://127.0.0.1:9090")
+        self.dialog.secret_env.set("NEW_DRAFT_SECRET")
+        self.finish()
+        self.assertEqual(self.dialog.controller.get(), "http://127.0.0.1:9090")
+        self.assertEqual(self.dialog.secret_env.get(), "NEW_DRAFT_SECRET")
+        self.assertIn("保留当前草稿", self.dialog.message.get())
+        self.assertFalse(self.owner.client_busy)
+        self.owner.client_saved.assert_not_called()
+
+    def test_multiple_automatic_clients_wait_for_one_choice_then_connect(self):
+        address = "http://127.0.0.1:9090"
+        self.auto_connection.return_value = {"connected": False, "selected_controller": None,
+                                             "candidates": [self.candidate(address), self.candidate("http://127.0.0.1:9097")],
+                                             "message": "请选择客户端。"}
+        self.dialog.auto_connect()
+        self.finish()
+        self.assertEqual(len(self.dialog.discovered_clients), 2)
+        self.assertFalse(self.owner.client_busy)
+        self.owner.client_saved.assert_not_called()
+        self.assertEqual(self.workers, [])
+        self.dialog.choice_controller.set(address)
+        self.dialog.connect_selected_client()
+        self.assertEqual(len(self.workers), 1)
+        self.finish()
+        self.assertEqual(self.auto_connection.call_args.args[0]["controller"], address)
+        self.assertEqual(self.auto_connection.call_count, 2)
+
+    def test_ambiguous_group_connects_on_selection_without_save(self):
+        address = self.dialog.controller.get()
+        self.auto_connection.return_value = {"connected": False, "selected_controller": address,
+                                             "candidates": [self.candidate(address)], "groups": ["PROXY", "PROXY "],
+                                             "message": "请选择代理组。"}
+        self.dialog.auto_connect()
+        self.finish()
+        self.assertEqual(self.dialog.group.get(), "")
+        self.assertEqual(self.dialog.selector_groups, ["PROXY", "PROXY "])
+        self.assertFalse(self.dialog.has_unsaved_changes())
+        self.dialog.group.set("PROXY ")
+        self.dialog.auto_connect(selected=True)
+        self.finish()
+        self.assertEqual(self.auto_connection.call_args.args[0]["group"], "PROXY ")
+        self.configure.assert_not_called()
+
+    def test_permission_request_waits_for_retry_and_does_not_repeat_confirmation(self):
+        self.auto_connection.return_value = {"connected": False, "candidates": [], "needs_permission": True,
+                                             "message": "Windows 确认已取消，可重新连接。"}
+        self.dialog.auto_connect()
+        self.finish()
+        self.assertTrue(self.dialog.needs_permission)
+        self.assertEqual(self.workers, [])
+        self.dialog.poll_results()
+        self.auto_connection.assert_called_once()
+        self.dialog.auto_connect()
+        self.finish()
+        self.assertEqual(self.auto_connection.call_count, 2)
+        self.owner.client_saved.assert_not_called()
+
+    def test_startup_helper_barrier_failure_allows_retry_without_touching_auth(self):
+        self.wait_for_startup.return_value = False
+        self.dialog.auto_connect()
+        self.finish()
+        self.auto_connection.assert_not_called()
+        self.assertFalse(self.owner.client_busy)
+        self.assertIn("后台仍在启动", self.dialog.message.get())
+        self.import_auth.assert_not_called()
+        self.wait_for_startup.return_value = True
+        self.auto_connection.return_value = {"connected": False, "candidates": [], "message": "等待客户端。"}
+        self.dialog.auto_connect()
+        self.finish()
+        self.auto_connection.assert_called_once()
 
     def test_raw_draft_detection_and_dispose_do_not_validate_or_navigate(self):
         self.assertFalse(self.dialog.has_unsaved_changes())
@@ -516,11 +629,23 @@ class ClientDialogLifecycleTests(unittest.TestCase):
                     dialog = dashboard.ClientDialog(owner, parent=parent, visible=False)
                 owner.client_dialog = dialog
                 dialog.message.set("连接成功，HTTP 代理端口 7890，读取 8 个代理组。规则模式使用所选代理组。优先保留有效代理组。邻近地区：JP、TW、SG、HK、PH。")
-                root.geometry("920x580+0+0")
+                root.geometry("920x650+0+0")
                 root.deiconify()
                 root.update()
                 self.assertIsInstance(dialog.window, dashboard.ttk.Frame)
                 self.assertIs(dialog.window.winfo_toplevel(), root)
+                self.assertFalse(dialog.address_entry.winfo_ismapped())
+                self.assertTrue(dialog.reconnect_button.winfo_ismapped())
+                self.assertFalse(dialog.choices.winfo_ismapped())
+                dialog.needs_permission = True
+                dialog.update_buttons()
+                root.update()
+                for widget in (dialog.reconnect_button, dialog.permission_button):
+                    self.assertTrue(widget.winfo_ismapped())
+                    self.assertLessEqual(widget.winfo_rootx() + widget.winfo_width(),
+                                         dialog.window.winfo_rootx() + dialog.window.winfo_width())
+                dialog.toggle_advanced()
+                root.update()
                 for widget in (dialog.address_entry, dialog.discover_button, dialog.secret_entry,
                                dialog.auto_detect_button, dialog.groups, dialog.inspect_button,
                                dialog.auto_group_button, dialog.save_button, dialog.cancel_button, dialog.discard_button):
@@ -768,6 +893,57 @@ class ClientContextTests(unittest.TestCase):
         daemon.assert_not_called()
         request.assert_not_called()
         self.app.ensure_service.assert_not_called()
+
+    def test_startup_connects_before_starting_helper_and_does_not_repeat_while_busy(self):
+        panel = self.app.client_dialog = Mock(closed=False)
+        panel.has_unsaved_changes.return_value = False
+        self.app.service_after_id = "connection-start"
+        self.app.begin_auto_connection()
+        self.assertIsNone(self.app.service_after_id)
+        panel.auto_connect.assert_called_once_with()
+        self.app.ensure_service.assert_not_called()
+        self.app.client_busy = True
+        self.app.begin_auto_connection()
+        panel.auto_connect.assert_called_once()
+
+    def test_startup_creates_connection_panel_before_client_tab_is_opened(self):
+        self.app.pages = {"client": Mock()}
+        panel = Mock(closed=False)
+        panel.has_unsaved_changes.return_value = False
+        with patch.object(dashboard, "ClientDialog", return_value=panel) as create:
+            self.app.begin_auto_connection()
+        create.assert_called_once_with(self.app, parent=self.app.pages["client"], visible=False)
+        self.assertIs(self.app.client_dialog, panel)
+        panel.auto_connect.assert_called_once_with()
+        self.app.ensure_service.assert_not_called()
+
+    def test_startup_preserves_draft_and_allows_helper_to_use_saved_connection(self):
+        panel = self.app.client_dialog = Mock(closed=False)
+        panel.has_unsaved_changes.return_value = True
+        self.app.service_after_id = "connection-start"
+        self.app.begin_auto_connection()
+        panel.auto_connect.assert_not_called()
+        self.app.ensure_service.assert_called_once()
+
+    def test_helper_permission_notice_and_new_saved_connection_only_update_clean_panel(self):
+        panel = self.app.client_dialog = Mock(closed=False, loading=False, applying=False)
+        panel.has_unsaved_changes.return_value = False
+        panel.original_context = self.context
+        saved = dashboard.core.DEFAULTS | {"controller_secret_env": "ROTATED_SECRET"}
+        status = {"client_connection_needs_permission": True, "client_detection_message": "需要 Windows 确认。"}
+        self.app.refresh_client_connection(status, saved)
+        self.assertTrue(panel.needs_permission)
+        panel.message.set.assert_called_with("需要 Windows 确认。")
+        panel.secret_env.set.assert_called_once_with("ROTATED_SECRET")
+        self.assertEqual(panel.original_context, dashboard.core.state_context(saved))
+        panel.auto_connect.assert_not_called()
+
+        panel.reset_mock()
+        panel.has_unsaved_changes.return_value = True
+        self.app.refresh_client_connection(status, dashboard.core.DEFAULTS)
+        panel.secret_env.set.assert_not_called()
+        panel.message.set.assert_not_called()
+        panel.auto_connect.assert_not_called()
 
 
 if __name__ == "__main__":

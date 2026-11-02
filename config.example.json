@@ -1,5 +1,5 @@
 {
-  "enabled": false,
+  "enabled": true,
   "controller": "http://127.0.0.1:9790",
   "controller_secret_env": "",
   "controller_api_mode": "standard",
@@ -28,6 +28,5 @@
   "node_quarantine_seconds": 1800,
   "history_seconds": 1800,
   "history_samples": 12,
-  "verification_idle_seconds": 5,
-  "codex_log_db": ""
+  "verification_idle_seconds": 5
 }

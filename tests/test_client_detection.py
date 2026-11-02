@@ -53,6 +53,11 @@ class GroupRecommendationTests(unittest.TestCase):
 
 
 class ControllerAddressTests(unittest.TestCase):
+    def setUp(self):
+        configurations = patch.object(detection, "_local_client_configurations", return_value=[])
+        configurations.start()
+        self.addCleanup(configurations.stop)
+
     def test_current_address_and_identified_custom_ports_are_in_bounded_loopback_list(self):
         listeners = [{"pid": 100, "port": port, "host": "127.0.0.1"} for port in (32123, *range(40000, 40050))]
         with patch.object(detection, "controller_listeners", return_value=listeners):
@@ -109,6 +114,20 @@ class ControllerAddressTests(unittest.TestCase):
         self.assertEqual(addresses[0], "http://127.0.0.1:12345")
         self.assertIn("http://127.0.0.1:9090", addresses)
 
+    def test_generated_runtime_adds_custom_controller_without_port_scanning(self):
+        configurations = [("http://127.0.0.1:32123", "synthetic-private")]
+        with patch.object(detection, "_local_client_configurations", return_value=configurations), \
+                patch.object(detection, "controller_listeners", return_value=[]):
+            addresses = detection.controller_addresses("http://127.0.0.1:9790")
+        self.assertIn("http://127.0.0.1:32123", addresses)
+        self.assertNotIn("synthetic-private", str(addresses))
+
+    def test_runtime_localhost_alias_does_not_duplicate_a_common_port(self):
+        with patch.object(detection, "_local_client_configurations", return_value=[("http://localhost:9090", "fixture")]), \
+                patch.object(detection, "controller_listeners", return_value=[]):
+            addresses = detection.controller_addresses("http://127.0.0.1:9790")
+        self.assertEqual([address for address in addresses if address.endswith(":9090")], ["http://localhost:9090"])
+
 
 class ClientDiscoveryTests(unittest.TestCase):
     def setUp(self):
@@ -120,6 +139,9 @@ class ClientDiscoveryTests(unittest.TestCase):
         environment = patch.dict(os.environ, {"SYNTHETIC_SECRET": "synthetic-test-value"})
         environment.start()
         self.addCleanup(environment.stop)
+        configurations = patch.object(detection, "_local_client_configurations", return_value=[])
+        configurations.start()
+        self.addCleanup(configurations.stop)
 
     @staticmethod
     def information():
@@ -137,6 +159,8 @@ class ClientDiscoveryTests(unittest.TestCase):
         self.assertEqual(seen[self.cfg["controller"]], "SYNTHETIC_SECRET")
         self.assertEqual([seen[address] for address in self.addresses[1:]], ["", ""])
         self.assertEqual(self.cfg["controller_secret_env"], "SYNTHETIC_SECRET")
+        self.assertEqual(result["candidates"][0]["controller_secret_env"], "SYNTHETIC_SECRET")
+        self.assertEqual(result["candidates"][1]["controller_secret_env"], "")
 
     def test_single_verified_alternative_is_selected(self):
         def inspector(fields, **_kwargs):
@@ -194,6 +218,45 @@ class ClientDiscoveryTests(unittest.TestCase):
         result = detection.discover_clients(self.cfg, inspector)
         self.assertIsNone(result["selected_controller"])
         self.assertEqual(len(result["candidates"]), 2)
+
+    def test_explicit_candidate_provider_does_not_probe_other_clients(self):
+        seen = []
+        def inspector(fields, **_kwargs):
+            seen.append(fields["controller"])
+            return self.information()
+        result = detection.discover_clients(self.cfg, inspector, addresses=lambda configured: [configured])
+        self.assertEqual(seen, [self.cfg["controller"]])
+        self.assertEqual(result["selected_controller"], self.cfg["controller"])
+
+    def test_configs_405_automatically_verifies_selector_mode(self):
+        class Unsupported(RuntimeError):
+            unsupported_config_read = True
+        seen = []
+        def inspector(fields, **_kwargs):
+            seen.append(fields.copy())
+            if fields.get("controller_api_mode", "standard") == "standard":
+                raise Unsupported("GET /configs HTTP 405")
+            return self.information() | {"mode": "unknown", "proxy_port": None}
+        result = detection.discover_clients(self.cfg, inspector, addresses=lambda configured: [configured])
+        self.assertEqual(len(seen), 2)
+        self.assertEqual(seen[-1]["controller_secret_env"], "SYNTHETIC_SECRET")
+        self.assertEqual(result["selected_controller"], self.cfg["controller"])
+        candidate = result["candidates"][0]
+        self.assertTrue(candidate["verified"])
+        self.assertEqual(candidate["controller_api_mode"], "selector")
+        self.assertEqual(candidate["verification_scope"], "selector")
+
+    def test_selector_retry_needs_auth_stays_available_for_credential_refresh(self):
+        class Unsupported(RuntimeError):
+            unsupported_config_read = True
+        def inspector(fields, **_kwargs):
+            if fields.get("controller_api_mode", "standard") == "standard":
+                raise Unsupported("GET /configs HTTP 405")
+            raise RuntimeError("控制接口 HTTP 401")
+        result = detection.discover_clients(self.cfg, inspector, addresses=lambda configured: [configured])
+        self.assertIsNone(result["selected_controller"])
+        self.assertTrue(result["candidates"][0]["needs_auth"])
+        self.assertNotIn("环境变量", result["message"])
 
     def test_discovery_concurrency_is_bounded(self):
         self.patch_addresses.stop()

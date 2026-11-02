@@ -373,28 +373,37 @@ def _check_expected_context(cfg, expected_context):
         raise ValueError("代理客户端设置已改变，请刷新后重试")
 
 
+class ControllerAuthenticationRequired(ValueError):
+    authentication_required = True
+
+
 def _check_client_environment(cfg):
     name = cfg["controller_secret_env"]
     if name and not _controller_secret(cfg):
         if re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_[0-9]+", name):
-            raise ValueError("未找到有效的猫猫云认证，请在客户端连接中点击“导入猫猫云认证”")
-        raise ValueError("当前进程未找到非空的密钥环境变量 " + name + "，请设置后重新启动近舟")
+            raise ControllerAuthenticationRequired("猫猫云认证需要刷新，近舟将自动重新连接")
+        raise ControllerAuthenticationRequired("当前进程未找到非空的密钥环境变量 " + name + "，请设置后重新启动近舟")
 
 
 def _controller_secret(cfg):
     name = cfg.get("controller_secret_env", "")
     managed = re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_([0-9]+)", name)
-    if windows_app.IS_WINDOWS and managed:
+    # Explicit credentials for other controllers retain their existing meaning.
+    if name and not managed:
+        return os.environ.get(name, "")
+    credential = windows_app.read_controller_credential(cfg["controller"])
+    if credential:
+        return credential
+    if windows_app.IS_WINDOWS and managed and int(managed[1]) == (urllib.parse.urlsplit(cfg["controller"]).port or 80):
         # Import refreshes HKCU while an existing helper retains its old process
         # environment. Managed credentials are read afresh, including revocation.
-        if int(managed[1]) != (urllib.parse.urlsplit(cfg["controller"]).port or 80):
-            return ""
         try:
             credential = windows_app._read_user_environment(name)
-            return credential if re.fullmatch(r"[0-9a-fA-F]{48}", credential) else ""
+            if re.fullmatch(r"[0-9a-fA-F]{48}", credential):
+                return credential
         except (OSError, ValueError, TypeError, ImportError):
-            return ""
-    return os.environ.get(name, "")
+            pass
+    return client_detection.local_client_credentials(cfg["controller"])
 
 
 def owned_records(data):
@@ -613,13 +622,21 @@ class _NoControllerRedirect(urllib.request.HTTPRedirectHandler):
 class Controller:
     def __init__(self, cfg):
         self.base = cfg["controller"].rstrip("/")
+        endpoint = urllib.parse.urlsplit(self.base)
+        if endpoint.hostname == "localhost":
+            # Automatic credentials are bound to a literal address family.
+            # IPv6-only controllers are discovered using [::1] explicitly.
+            netloc = "127.0.0.1" + (f":{endpoint.port}" if endpoint.port is not None else "")
+            self.base = urllib.parse.urlunsplit(endpoint._replace(netloc=netloc))
         self.secret = _controller_secret(cfg)
+        name = cfg.get("controller_secret_env", "")
+        self.automatic_auth = not name or bool(re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_[0-9]+", name))
         self.timeout_ms = int(cfg["probe_timeout_ms"])
         self.probe_url = cfg["probe_url"]
         self.api_mode = cfg.get("controller_api_mode", "standard")
         self.expected_statuses = cfg.get("probe_expected_statuses", [405])
 
-    def request(self, path, method="GET", body=None, timeout=5):
+    def request(self, path, method="GET", body=None, timeout=5, *, _retry_auth=True):
         headers = {"Content-Type": "application/json"}
         if self.secret:
             headers["Authorization"] = "Bearer " + self.secret
@@ -633,6 +650,14 @@ class Controller:
                 return json.loads(content) if content else {}
         except urllib.error.HTTPError as exc:
             exc.close()
+            if exc.code == 401 and method == "GET" and self.automatic_auth and _retry_auth:
+                # A different supported client may now own this same endpoint.
+                # Try its exact-endpoint runtime credential once, after rejection
+                # of an old private credential, without altering user credentials.
+                credential = client_detection.local_client_credentials(self.base)
+                if credential and credential != self.secret:
+                    self.secret = credential
+                    return self.request(path, method=method, body=body, timeout=timeout, _retry_auth=False)
             if exc.code == 405 and method == "GET" and path == "/configs":
                 raise ConfigReadUnsupported() from None
             raise ControllerError("控制接口 HTTP " + str(exc.code)) from None
@@ -762,9 +787,95 @@ def inspect_controller(fields, *, timeout=5, adaptive=False):
             **({"controller_api_mode": "selector", "verification_scope": "selector"} if selector_only else {})}
 
 
-def discover_clients(fields):
-    """Discover compatible local endpoints using GET requests only."""
-    return client_detection.discover_clients(validate_config(fields), inspect_controller)
+def discover_clients(fields, *, refresh_auth=False, allow_elevation=False, only_configured=False):
+    """Discover local clients; optional authentication never changes proxy routes."""
+    cfg = validate_config(fields)
+    addresses = {"addresses": lambda _configured: [cfg["controller"]]} if only_configured else {}
+    result = client_detection.discover_clients(cfg, inspect_controller, **addresses)
+    if not refresh_auth or not windows_app.IS_WINDOWS:
+        return result
+    if result.get("selected_controller"):
+        result["needs_permission"] = False
+        return result
+    refreshed = False
+    permission_endpoints = set()
+    for candidate in result["candidates"]:
+        if not candidate.get("needs_auth"):
+            continue
+        endpoint = candidate["controller"]
+        if endpoint == cfg["controller"] and cfg["controller_secret_env"] and not re.fullmatch(
+                r"NEARROUTE_MAOMAO_SECRET_[0-9]+", cfg["controller_secret_env"]):
+            continue  # Never replace an explicitly supplied custom credential.
+        imported = windows_app.refresh_controller_credential(endpoint)
+        permission = windows_app.controller_credential_needs_permission(endpoint)
+        refreshed |= imported
+        if permission and not imported:
+            permission_endpoints.add(endpoint)
+    if refreshed:
+        result = client_detection.discover_clients(cfg, inspect_controller, **addresses)
+    # Ask Windows once, only after the client is unambiguous. A choice between
+    # clients must never turn into one administrator prompt per running client.
+    if allow_elevation and len(result["candidates"]) == 1:
+        candidate = result["candidates"][0]
+        endpoint = candidate["controller"]
+        if candidate.get("needs_auth") and endpoint in permission_endpoints:
+            if windows_app.refresh_controller_credential(endpoint, elevate=True):
+                permission_endpoints.discard(endpoint)
+                result = client_detection.discover_clients(cfg, inspect_controller, **addresses)
+    result["needs_permission"] = len(result["candidates"]) == 1 and bool(permission_endpoints)
+    return result
+
+
+def auto_connect_client(fields=None, expected_context=None, *, allow_elevation=False):
+    """Connect a proven local client without exposing authentication setup to users."""
+    current = load_config()
+    _check_expected_context(current, expected_context)
+    allowed = {"controller", "controller_secret_env", "controller_api_mode", "group",
+               "auto_detect_client", "auto_select_group"}
+    if fields is not None and (not isinstance(fields, dict) or set(fields) - allowed):
+        raise ValueError("自动连接仅接受客户端连接设置")
+    draft = dict(fields or {})
+    if draft.get("group") == "":
+        # Choosing a client can precede knowing its groups. Use the saved name
+        # only as an inspection hint; ambiguous results still require a choice.
+        draft["group"] = current["group"]
+    cfg = validate_config(current | draft)
+    expected = state_context(current)
+    # An explicit choice is inspected alone, never switched to another client.
+    result = discover_clients(cfg, refresh_auth=True, allow_elevation=allow_elevation,
+                              only_configured=fields is not None or not cfg["auto_detect_client"])
+    result["connected"] = False
+    endpoint = result.get("selected_controller")
+    info = next((item for item in result["candidates"]
+                 if item["controller"] == endpoint and item.get("verified")), None)
+    if info is None:
+        if result.get("needs_permission"):
+            result["message"] = "猫猫云需要 Windows 授权才能读取连接信息，请允许管理员确认后重试连接。"
+        return result
+    if info["mode"] == "direct":
+        result["message"] = "代理客户端当前为直连模式，请在客户端启用代理。"
+        return result
+    groups = info["groups"]
+    group = "GLOBAL" if info["mode"] == "global" else cfg["group"]
+    if group not in groups:
+        group = info.get("recommended_group") if cfg["auto_select_group"] else None
+    if not group:
+        result.update(groups=groups, message="已连接客户端，请选择要优选的代理组。")
+        return result
+    connection = {key: cfg[key] for key in allowed}
+    connection.update(controller=endpoint, group=group,
+                      controller_api_mode=info.get("controller_api_mode", "standard"))
+    if endpoint != cfg["controller"]:
+        connection["controller_secret_env"] = ""
+    # A private automatic credential replaces the old managed environment variable
+    # without making the user copy or maintain any authentication value.
+    if re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_[0-9]+", connection["controller_secret_env"]):
+        if windows_app.read_controller_credential(endpoint) or client_detection.local_client_credentials(endpoint):
+            connection["controller_secret_env"] = ""
+    saved = configure_client(connection, expected_context=expected, automatic=True)
+    result.update(connected=True, config=saved, groups=groups, needs_permission=False,
+                  message="已自动连接代理客户端，正在读取线路。")
+    return result
 
 
 class _ProbeCancelled(Exception):
@@ -1237,6 +1348,9 @@ class Optimizer:
         return (STATE / "stop.request").exists()
 
     def write_status(self, **updates):
+        if updates.get("controller_available") is True:
+            updates["client_connection_needs_permission"] = False
+            updates["client_detection_message"] = ""
         if "nodes" in updates:
             # Only newly computed rows can establish their probe provenance.
             if self.status.get("nodes_probe_identity") != self.history_probe:
@@ -1285,22 +1399,17 @@ class Optimizer:
         """Recover an unavailable client/group while this helper owns the writer lock."""
         cfg = dict(self.cfg)
         if (self.dry_run or self.tentative or self.stopping()
-                or not (cfg["auto_detect_client"] or cfg["auto_select_group"])
                 or time.monotonic() - self.last_client_detection < 30
                 or (STATE / "pending-selection.json").exists()
                 or (STATE / "select.request.json").exists()):
             return False
         self.last_client_detection = time.monotonic()
-        if cfg["auto_detect_client"]:
-            result = discover_clients(cfg)
-        else:
-            info = inspect_controller(cfg, timeout=0.6, adaptive=True)
-            result = {"candidates": [{"controller": cfg["controller"], "verified": True, **info}],
-                      "selected_controller": cfg["controller"], "message": ""}
+        result = discover_clients(cfg, refresh_auth=True, only_configured=not cfg["auto_detect_client"])
         endpoint = result.get("selected_controller")
         info = next((item for item in result["candidates"]
                      if item["controller"] == endpoint and item.get("verified")), None)
         self.status["client_detection_message"] = result.get("message", "")
+        self.status["client_connection_needs_permission"] = bool(result.get("needs_permission"))
         if info is None or info.get("mode") == "direct":
             return False
         group = cfg["group"]
@@ -1312,8 +1421,15 @@ class Optimizer:
         fields = {"controller": endpoint, "group": group,
                   "controller_secret_env": cfg["controller_secret_env"] if endpoint == cfg["controller"] else "",
                   "controller_api_mode": info.get("controller_api_mode", "standard")}
+        if re.fullmatch(r"NEARROUTE_MAOMAO_SECRET_[0-9]+", fields["controller_secret_env"]):
+            if windows_app.read_controller_credential(endpoint):
+                fields["controller_secret_env"] = ""
         if state_context(cfg | fields) == state_context(cfg):
             self.status["client_detection_message"] = ""
+            # Authentication may have changed while the endpoint stayed the
+            # same. Replace the API object that cached the expired credential.
+            self.api = Controller(cfg)
+            self.status["client_connection_needs_permission"] = False
             return False
         # Never move an unfinished rollback or a queued user choice to another client.
         with _manual_request_lock(), config_update_lock():
@@ -2187,7 +2303,7 @@ def stop_daemon():
     return False
 
 
-def configure_client(fields, expected_context=None):
+def configure_client(fields, expected_context=None, *, automatic=False):
     """Save connection fields after ending transactions on the old controller.
 
     Discovery is a separate read-only action. This function validates local
@@ -2223,13 +2339,15 @@ def configure_client(fields, expected_context=None):
             scan_request = STATE / "scan.request"
             had_pending_scan = False
             if changed:
-                candidate["enabled"] = False
+                if not automatic:
+                    candidate["enabled"] = False
                 atomic_json(STATE / "status.json", {
                     "controller_context": list(state_context(candidate)),
-                    "enabled": False, "phase": "stopped", "pid": None,
+                    "enabled": candidate["enabled"], "phase": "stopped", "pid": None,
                     "controller_available": False, "mode": None, "group": None,
                     "selected": None, "nodes": [], "health": None, "last_error": None,
-                    "message": "代理客户端设置已保存，自动优选保持暂停", "updated_at": iso(),
+                    "message": "已自动连接代理客户端" if automatic else "代理客户端设置已保存，自动优选保持暂停",
+                    "updated_at": iso(),
                 })
                 had_pending_scan = scan_request.exists()
                 scan_request.unlink(missing_ok=True)

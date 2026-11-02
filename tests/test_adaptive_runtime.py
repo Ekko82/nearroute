@@ -132,7 +132,7 @@ class AdaptiveRuntimeTests(unittest.TestCase):
                 path.unlink()
 
     def test_choice_arriving_during_discovery_blocks_commit(self):
-        def discovered(_cfg):
+        def discovered(_cfg, **_kwargs):
             optimizer.atomic_json(self.state / "select.request.json", {"request_id": "queued"})
             return self.result()
         self.discovery.side_effect = discovered
@@ -140,7 +140,7 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         self.assertEqual(optimizer.load_config(), self.cfg)
 
     def test_concurrent_settings_are_preserved(self):
-        def discovered(_cfg):
+        def discovered(_cfg, **_kwargs):
             optimizer.atomic_json(self.config, self.cfg | {"prefer_japan": False})
             return self.result()
         self.discovery.side_effect = discovered
@@ -176,11 +176,27 @@ class AdaptiveRuntimeTests(unittest.TestCase):
     def test_disabled_discovery_checks_only_configured_endpoint(self):
         optimizer.atomic_json(self.config, self.cfg | {"auto_detect_client": False})
         self.helper.reload_config()
-        info = self.result(self.cfg["controller"], "New Main")["candidates"][0]
-        with patch.object(optimizer, "inspect_controller", return_value=info) as inspect:
-            self.assertTrue(self.helper.adapt_client())
-        inspect.assert_called_once_with(self.cfg | {"auto_detect_client": False}, timeout=0.6, adaptive=True)
-        self.discovery.assert_not_called()
+        self.discovery.return_value = self.result(self.cfg["controller"], "New Main")
+        self.assertTrue(self.helper.adapt_client())
+        self.discovery.assert_called_once_with(self.cfg | {"auto_detect_client": False},
+                                               refresh_auth=True, only_configured=True)
+
+    def test_authentication_refresh_replaces_cached_api_without_changing_context(self):
+        self.discovery.return_value = self.result(self.cfg["controller"], "Main")
+        previous = self.helper.api
+        refreshed = FakeController()
+        with patch.object(optimizer, "Controller", return_value=refreshed):
+            self.assertFalse(self.helper.adapt_client())
+        self.assertIsNot(self.helper.api, previous)
+        self.assertIs(self.helper.api, refreshed)
+        self.assertEqual(optimizer.load_config(), self.cfg)
+
+    def test_successful_reconnection_clears_old_permission_notice(self):
+        self.helper.write_status(client_connection_needs_permission=True,
+                                 client_detection_message="Windows permission required")
+        self.helper.write_status(controller_available=True)
+        self.assertFalse(self.helper.status["client_connection_needs_permission"])
+        self.assertEqual(self.helper.status["client_detection_message"], "")
 
     def test_dry_run_and_inflight_transaction_never_apply(self):
         for field in ("dry_run", "tentative"):

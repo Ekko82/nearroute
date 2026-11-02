@@ -134,8 +134,10 @@ $ErrorActionPreference = 'Stop'
 $errors = $null; $tokens = $null
 $ast = [Management.Automation.Language.Parser]::ParseFile(SCRIPT, [ref]$tokens, [ref]$errors)
 if ($errors.Count) { throw 'parse_failure' }
-$definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Read-MaomaoCoreArgument' }, $true)
-Invoke-Expression $definition.Extent.Text
+foreach ($name in @('Test-MaomaoCoreIdentity', 'Read-MaomaoCoreArgument')) {
+    $definition = $ast.Find({ param($node) $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq $name }, $true)
+    Invoke-Expression $definition.Extent.Text
+}
 $application = 'C:\Fixture\MAOMAOYUNAPP\client.exe'
 $directory = 'C:\Fixture\Roaming\MAOMAOYUNAPP'
 $installed = 'C:\Fixture\MAOMAOYUNAPP\resources\extra\mihomo-windows-386.exe'
