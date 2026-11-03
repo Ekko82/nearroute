@@ -424,10 +424,20 @@ class Client:
                 message = self.messages.get(timeout=max(0.01, deadline - time.monotonic()))
             except queue.Empty:
                 raise Refused("A metadata RPC timed out; raw responses are withheld.") from None
-            if message.get("id") == request_id:
+            if "method" in message:
+                # Each direction has its own request IDs; a server request may
+                # reuse the ID of the metadata response we are waiting for.
+                if "id" in message:
+                    self.send({"id": message["id"], "error": {
+                        "code": -32601,
+                        "message": "NearRoute metadata client does not support server requests.",
+                    }})
+            elif message.get("id") == request_id:
                 if "error" in message:
                     raise Refused("A metadata RPC was rejected; raw error details are withheld.")
-                return message.get("result")
+                if "result" not in message:
+                    raise Refused("A metadata RPC returned an invalid response; raw details are withheld.")
+                return message["result"]
             if message.get("eof") or message.get("invalid_output"):
                 raise Refused("The metadata helper stopped or returned invalid output.")
             if time.monotonic() >= deadline:
