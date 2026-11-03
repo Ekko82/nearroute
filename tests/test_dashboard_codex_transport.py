@@ -40,6 +40,7 @@ class CodexTransportUITests(unittest.TestCase):
         self.stack.enter_context(patch.object(dashboard, "ttk"))
         dashboard.ttk.Button.side_effect = lambda *_args, **_kwargs: Mock()
         self.stack.enter_context(patch.object(dashboard.tk, "StringVar", side_effect=Value))
+        self.stack.enter_context(patch.object(dashboard.tk, "BooleanVar", side_effect=Value))
         self.stack.enter_context(patch.object(dashboard.tk, "Menu"))
         self.stack.enter_context(patch.object(dashboard, "apply_theme"))
         self.inspect = self.stack.enter_context(patch.object(dashboard.codex_transport, "inspect", return_value=transport_state()))
@@ -61,6 +62,7 @@ class CodexTransportUITests(unittest.TestCase):
         self.app.codex_transport_state = transport_state()
         self.app.notify = Mock()
         self.app.show_window = Mock()
+        self.app.tray = None
 
     def after(self, delay, callback):
         timer = object()
@@ -147,7 +149,7 @@ class CodexTransportUITests(unittest.TestCase):
         self.inspect.assert_not_called()
         self.finish()
         self.assertEqual(panel.running.get(), "上次检查：Codex 正在运行。")
-        self.assertEqual(panel.mode.get(), "已保存配置：HTTP/SSE")
+        self.assertIn("已保存配置：HTTP/SSE", panel.mode.get())
         self.assertEqual(self.timers, {})
         self.app.show_tab("overview")
         self.inspect.return_value = transport_state(mode="http", owned=True, running=False, can_restore=True)
@@ -164,13 +166,14 @@ class CodexTransportUITests(unittest.TestCase):
 
     def test_running_codex_request_queues_then_applies_after_normal_exit(self):
         panel = self.panel()
-        self.request.return_value = transport_state(pending="http", status="pending")
+        self.request.return_value = transport_state(pending="http", status="pending", reopen_requested=True)
         self.app.request_codex_transport("http")
         self.assertEqual(self.app.codex_transport_busy, "request")
         self.request.assert_not_called()
         self.finish()
-        self.request.assert_called_once_with("http", root=self.location)
-        self.assertIn("已安排，正常退出 Codex 后自动应用；不打断当前任务。", panel.message.get())
+        self.request.assert_called_once_with("http", reopen=True, root=self.location)
+        self.assertIn("当前尚未完成切换", panel.message.get())
+        self.assertIn("自动备份、应用并重新打开", panel.message.get())
         self.assertIn("切换目标：HTTP/SSE", panel.message.get())
         self.assertIn("已保存配置：原始连接方式", panel.mode.get())
         self.assertIsNone(self.app.codex_transport_busy)
@@ -204,6 +207,41 @@ class CodexTransportUITests(unittest.TestCase):
         self.fire(self.app.poll_codex_transport)
         self.assertEqual(panel.refresh.call_count, 2)
         self.assertIsNone(self.app.codex_transport_busy)
+
+    def test_configuration_and_waiting_are_not_displayed_as_verified_transport(self):
+        panel = self.panel()
+        self.assertIn("尚未启用", panel.mode.get())
+        self.app.codex_transport_state = transport_state(mode="http", compatible_http=True)
+        panel.refresh()
+        self.assertIn("配置已启用", panel.mode.get())
+        self.assertIn("实际模型请求的传输方式尚未在此验证", panel.message.get())
+        self.app.codex_transport_state = transport_state(pending="http", status="pending", reopen_requested=True)
+        panel.refresh()
+        self.assertIn("等待 Codex 退出", panel.mode.get())
+        self.assertIn("当前尚未完成切换", panel.message.get())
+        panel.reopen_check.state.assert_called_with(["disabled"])
+
+    def test_automatic_open_is_chosen_on_click_and_can_be_disabled(self):
+        panel = self.panel()
+        self.assertTrue(panel.reopen.get())
+        self.request.assert_not_called()
+        panel.reopen.set(False)
+        self.request.return_value = transport_state(pending="http", status="pending", reopen_requested=False)
+        self.app.request_codex_transport("http")
+        self.finish()
+        self.request.assert_called_once_with("http", reopen=False, root=self.location)
+        self.assertIn("完成提示出现后重新打开", panel.message.get())
+
+    def test_apply_completion_notifies_while_window_remains_in_tray(self):
+        self.app.tray = Mock()
+        self.app.codex_transport_state = transport_state(pending="http", status="pending", running=False)
+        explanation = "配置已保存，已请求打开 Codex；实际传输待验证。"
+        self.apply.return_value = transport_state(mode="http", status="applied", running=False, can_restore=True,
+                                                  explanation=explanation, reopened=True)
+        self.app.apply_pending_codex_transport()
+        self.finish()
+        self.app.notify.assert_called_once_with(explanation, 45)
+        self.app.tray.show_notification.assert_called_once_with("Codex 连接配置完成", explanation)
 
     def test_cancelling_pending_releases_watcher_without_applying(self):
         self.app.codex_transport_state = transport_state(pending="http", status="pending")
@@ -248,13 +286,14 @@ class CodexTransportUITests(unittest.TestCase):
                                                         pending="http", status="error", ok=False, can_restore=True,
                                                         explanation="部分聊天尚未迁移，可重试。")
         panel = self.panel()
-        self.assertEqual(panel.mode.get(), "已保存配置：HTTP/SSE")
+        self.assertIn("已保存配置：HTTP/SSE", panel.mode.get())
+        self.assertFalse(panel.reopen.get(), "旧的待执行请求没有授权自动打开，重试时应保留这一选择")
         panel.http_button.state.assert_called_with(["!disabled"])
         self.request.return_value = transport_state(mode="http", compatible_http=True, owned=True,
                                                     pending="http", status="pending", can_restore=True)
         self.app.request_codex_transport("http")
         self.finish()
-        self.request.assert_called_once_with("http", root=self.location)
+        self.request.assert_called_once_with("http", reopen=False, root=self.location)
         self.assertEqual(self.app.codex_transport_state["status"], "pending")
 
     def test_engine_unavailable_disables_switches_and_explains_support(self):

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import errno
 import hashlib
 import json
+import ntpath
 import os
 from pathlib import Path
 import re
@@ -40,6 +41,21 @@ supports_standalone_web_search = true
 '''
 _LOCK = threading.RLock()
 _FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+_DESKTOP_FAMILY = "OpenAI.Codex_2p2nqsd0c76g0"
+_DESKTOP_APP_ID = _DESKTOP_FAMILY + "!App"
+_DESKTOP_REGISTRATION = """
+$desktop = $null
+$packages = @(Get-AppxPackage -Name 'OpenAI.Codex' | Where-Object { $_.PackageFamilyName -eq 'OpenAI.Codex_2p2nqsd0c76g0' })
+if ($packages.Count -eq 1) {
+    $package = $packages[0]
+    $manifest = Get-AppxPackageManifest -Package $package.PackageFullName
+    $applications = @($manifest.Package.Applications.Application | Where-Object { $_.Id -eq 'App' })
+    if ($applications.Count -eq 1) {
+        $desktop = @{family=$package.PackageFamilyName; application_id=$applications[0].Id;
+                     install_location=$package.InstallLocation; executable=$applications[0].Executable}
+    }
+}
+"""
 
 
 class Refused(Exception):
@@ -88,29 +104,101 @@ def _release_home_lock(stream):
         stream.close()
 
 
-def process_inventory():
-    if os.name != "nt":
-        raise Refused("此功能需要 Windows，并须先确认 Codex 已正常退出。")
-    script = ("Get-CimInstance Win32_Process -Filter \"Name = 'codex.exe'\" | "
-              "Select-Object ProcessId,Name,ExecutablePath | ConvertTo-Json -Compress")
+def _powershell_json(script, failure):
+    script = "$ErrorActionPreference = 'Stop'; [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + script
     try:
         result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
                                 stdin=subprocess.DEVNULL, capture_output=True, timeout=15,
                                 creationflags=_FLAGS)
     except (OSError, subprocess.TimeoutExpired):
-        raise Refused("无法确认 Codex 进程状态，尚未修改配置。") from None
+        raise Refused(failure) from None
     if result.returncode:
-        raise Refused("无法确认 Codex 进程状态，尚未修改配置。")
+        raise Refused(failure)
     try:
-        rows = json.loads(result.stdout.decode("utf-8-sig")) if result.stdout.strip() else []
+        return json.loads(result.stdout.decode("utf-8-sig")) if result.stdout.strip() else None
     except (ValueError, UnicodeError):
-        raise Refused("无法确认 Codex 进程状态，尚未修改配置。") from None
-    if rows is None:
-        return []
-    rows = rows if isinstance(rows, list) else [rows]
+        raise Refused(failure) from None
+
+
+def _registered_desktop(value):
+    if not isinstance(value, dict):
+        return None
+    location, executable = value.get("install_location"), value.get("executable")
+    if (value.get("family") != _DESKTOP_FAMILY or value.get("application_id") != "App"
+            or not isinstance(location, str) or not ntpath.isabs(location)
+            or not isinstance(executable, str)
+            or ntpath.normcase(executable.replace("/", "\\")) != r"app\chatgpt.exe"):
+        return None
+    return {"app_id": _DESKTOP_APP_ID, "executable": ntpath.join(location, executable)}
+
+
+def process_inventory():
+    if os.name != "nt":
+        raise Refused("此功能需要 Windows，并须先确认 Codex 已正常退出。")
+    failure = "无法确认 Codex 进程状态，尚未修改配置。"
+    script = _DESKTOP_REGISTRATION + """
+$processes = @(Get-CimInstance Win32_Process -Filter "Name = 'codex.exe' OR Name = 'ChatGPT.exe'" |
+              Select-Object ProcessId,Name,ExecutablePath)
+@{desktop=$desktop; processes=$processes} | ConvertTo-Json -Depth 4 -Compress
+"""
+    document = _powershell_json(script, failure)
+    if not isinstance(document, dict) or not isinstance(document.get("processes"), list):
+        raise Refused(failure)
+    rows = document["processes"]
     if any(not isinstance(row, dict) or type(row.get("ProcessId")) is not int for row in rows):
-        raise Refused("无法确认 Codex 进程状态，尚未修改配置。")
-    return rows
+        raise Refused(failure)
+    if any(str(row.get("Name", "")).casefold() == "chatgpt.exe" and not row.get("ExecutablePath") for row in rows):
+        raise Refused("有无法确认身份的 ChatGPT 桌面进程，尚未修改配置；请正常退出相关应用后重试。")
+    desktop = _registered_desktop(document.get("desktop"))
+    return [row for row in rows if str(row.get("Name", "")).casefold() == "codex.exe"
+            or (desktop and isinstance(row.get("ExecutablePath"), str)
+                and ntpath.normcase(ntpath.normpath(row["ExecutablePath"]))
+                == ntpath.normcase(ntpath.normpath(desktop["executable"])))]
+
+
+def _require_user_launch():
+    if os.name != "nt":
+        raise Refused("自动打开需要 Windows 上已安装的 Codex 桌面应用；可取消勾选后继续。")
+    import ctypes
+    if ctypes.windll.shell32.IsUserAnAdmin():
+        raise Refused("请以普通用户运行近舟后自动打开 Codex，或取消勾选并在切换后手动打开。")
+
+
+def discover_desktop():
+    """Resolve the official registered desktop AppID, without copying process arguments."""
+    _require_user_launch()
+    document = _powershell_json(_DESKTOP_REGISTRATION + "$desktop | ConvertTo-Json -Compress",
+                                "无法读取 Codex 桌面应用注册信息；可取消自动打开后继续。")
+    desktop = _registered_desktop(document)
+    if desktop is None:
+        raise Refused("未找到已注册的 Codex 桌面应用；可取消自动打开后继续，切换完成后手动打开。")
+    return desktop["app_id"]
+
+
+def open_desktop(app_id):
+    """Ask the Windows shell to open the captured official app, never its CLI engine."""
+    if app_id != _DESKTOP_APP_ID:
+        raise Refused("保存的 Codex 打开方式无效，请手动打开 Codex。")
+    if discover_desktop() != app_id:
+        raise Refused("Codex 桌面应用注册信息已变化，请手动打开 Codex。")
+    explorer = ntpath.join(os.environ.get("SystemRoot", r"C:\Windows"), "explorer.exe")
+    try:
+        subprocess.Popen([explorer, "shell:AppsFolder\\" + app_id], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, creationflags=_FLAGS)
+    except OSError:
+        raise Refused("未能自动打开 Codex，请手动打开。") from None
+
+
+def _applied_explanation(result):
+    text = ("HTTP/SSE 配置已启用；实际传输方式待后续请求日志确认。" if result["mode"] == "http"
+            else "已恢复原传输配置。")
+    if result.get("reopened"):
+        return text + "已请求自动打开 Codex。"
+    if result.get("reopen_error"):
+        return text + "自动打开未完成，请手动打开 Codex。"
+    if result.get("reopen_skipped"):
+        return text + "Codex 已在运行，无需重复打开。"
+    return text + "请重新打开 Codex 使用。"
 
 
 def discover_engine(rows=()):
@@ -443,10 +531,13 @@ class TransportManager:
             result = {"ok": True, "mode": "unknown", "status": "ready", "running": None,
                       "engine_available": False, "pending": None, "explanation": "",
                       "affected_count": 0, "skipped_count": 0, "supported": False,
-                      "can_request": False, "can_restore": False, "owned": False, "compatible_http": False}
+                      "can_request": False, "can_restore": False, "owned": False, "compatible_http": False,
+                      "reopen_requested": False, "reopened": False, "reopen_error": "", "reopen_skipped": False,
+                      "last_result": None}
             try:
                 pending = self._load("pending")
                 result["pending"] = pending.get("mode") if pending else None
+                result["reopen_requested"] = bool(pending and pending.get("reopen") is True)
                 running, engine, data, config, owned = self._context()
                 result.update(running=running, engine_available=bool(engine and engine.is_file()), owned=bool(owned))
                 selected = config.get("model_provider", "openai")
@@ -464,11 +555,23 @@ class TransportManager:
                     if pending.get("error"):
                         result.update(ok=False, status="error", explanation=pending["error"])
                     else:
-                        result.update(status="pending", explanation="已保存切换请求；请正常退出 Codex，NearRoute 将自动应用。" if running else "已保存切换请求，正在等待后台应用。")
+                        text = "切换尚未生效；请在任务结束后正常退出 Codex，近舟将自动应用。" if running else "切换尚未生效，正在等待后台应用。"
+                        if result["reopen_requested"]:
+                            text += "完成后会自动打开 Codex。"
+                        result.update(status="pending", explanation=text)
                 elif compatible:
-                    result["explanation"] = "当前已使用 HTTP/SSE。" if selected == PROVIDER_ID else "已检测到现有 HTTP/SSE 配置，尚未改动。"
+                    result["explanation"] = ("HTTP/SSE 配置已启用；实际传输方式待后续请求日志确认。" if selected == PROVIDER_ID
+                                             else "已检测到现有 HTTP/SSE 配置，尚未改动；实际传输方式待后续请求日志确认。")
                 else:
                     result["explanation"] = "当前使用 Codex 原有传输设置。"
+                if not pending:
+                    last = self._load("last-result")
+                    if (last and last.get("home") == str(self.home) and last.get("mode") == result["mode"]
+                            and last.get("provider") == selected):
+                        result.update(last_result=last, reopen_requested=last.get("reopen_requested") is True,
+                                      reopened=last.get("reopened") is True, reopen_error=str(last.get("reopen_error") or ""),
+                                      reopen_skipped=last.get("reopen_skipped") is True,
+                                      explanation=_applied_explanation(last))
                 if not result["engine_available"]:
                     result["explanation"] = "未找到 Codex 桌面引擎，请安装或启动 Codex 后刷新。"
             except (Refused, OSError) as exc:
@@ -477,16 +580,27 @@ class TransportManager:
                               explanation=str(exc) if isinstance(exc, Refused) else "无法读取传输设置，请检查文件访问权限。")
             return result
 
-    def request_mode(self, mode):
+    def request_mode(self, mode, *, reopen=False):
         with _LOCK:
             if mode not in ("http", "original"):
                 raise ValueError("mode must be 'http' or 'original'")
+            if type(reopen) is not bool:
+                raise ValueError("reopen must be a boolean")
             status = self.inspect()
             allowed = status["can_request"] if mode == "http" else status["can_restore"]
             if not allowed:
                 return dict(status, ok=False, explanation=status["explanation"] or "没有可恢复的 NearRoute 管理配置。")
-            self._save("pending", {"mode": mode, "home": str(self.home), "requested_at": _now()})
-            self._journal("requested", mode=mode)
+            pending = {"mode": mode, "home": str(self.home), "requested_at": _now(), "reopen": reopen}
+            if reopen:
+                try:
+                    app_id = discover_desktop()
+                    if app_id != _DESKTOP_APP_ID:
+                        raise Refused("Codex 桌面应用注册信息无效；可取消自动打开后继续。")
+                except Refused as exc:
+                    return dict(status, ok=False, request_error=str(exc), explanation=str(exc))
+                pending["reopen_app_id"] = app_id
+            self._save("pending", pending)
+            self._journal("requested", mode=mode, reopen=reopen)
             return self.inspect()
 
     def cancel_pending(self):
@@ -531,6 +645,9 @@ class TransportManager:
             try:
                 if pending.get("home") != str(self.home):
                     raise Refused("待执行请求属于另一个 Codex 主目录。")
+                if (type(pending.get("reopen", False)) is not bool
+                        or (pending.get("reopen") and pending.get("reopen_app_id") != _DESKTOP_APP_ID)):
+                    raise Refused("保存的 Codex 自动打开请求无效，请取消待切换后重新选择。")
                 if self.process_check():
                     return self.inspect()
                 home_lock = _acquire_home_lock(self.home)
@@ -590,7 +707,28 @@ class TransportManager:
                     raise Refused("部分对话切换尚未完成，备份已保留。可重试或恢复原设置。")
                 (self.state / "pending.json").unlink(missing_ok=True)
                 self._journal("completed", mode=pending["mode"], target_count=len(targets))
-                return dict(self.inspect(), status="applied", explanation="已应用 HTTP/SSE；可重新打开 Codex。" if pending["mode"] == "http" else "已恢复原传输设置；可重新打开 Codex。")
+                completed = {"mode": pending["mode"], "home": str(self.home), "completed_at": _now(),
+                             "provider": expected.get("model_provider", "openai"),
+                             "reopen_requested": pending.get("reopen") is True, "reopened": False,
+                             "reopen_error": "", "reopen_skipped": False}
+                # Consume the switch intent before opening the app. A launch failure
+                # cannot retry a completed migration or repeatedly start Codex.
+                self._save("last-result", completed)
+                if completed["reopen_requested"]:
+                    try:
+                        if self.process_check():
+                            completed["reopen_skipped"] = True
+                        else:
+                            open_desktop(pending["reopen_app_id"])
+                            completed["reopened"] = True
+                    except Exception as exc:
+                        completed["reopen_error"] = (str(exc) if isinstance(exc, Refused)
+                                                     else "自动打开未完成，请手动打开 Codex。")
+                    self._save("last-result", completed)
+                return dict(self.inspect(), ok=True, status="applied", last_result=completed,
+                            reopen_requested=completed["reopen_requested"], reopened=completed["reopened"],
+                            reopen_error=completed["reopen_error"], reopen_skipped=completed["reopen_skipped"],
+                            explanation=_applied_explanation(completed))
             except Exception as exc:
                 reason = str(exc) if isinstance(exc, Refused) else "切换未完成，备份和切换记录已保留，请检查后重试。"
                 pending["error"] = reason
@@ -614,8 +752,8 @@ def inspect(**kwargs):
     return TransportManager(**kwargs).inspect()
 
 
-def request_mode(mode, **kwargs):
-    return TransportManager(**kwargs).request_mode(mode)
+def request_mode(mode, *, reopen=False, **kwargs):
+    return TransportManager(**kwargs).request_mode(mode, reopen=reopen)
 
 
 def process_pending(**kwargs):

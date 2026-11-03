@@ -1438,7 +1438,7 @@ class CodexTransportDialog:
         self.window.pack(fill="both", expand=True)
         self.window.columnconfigure(0, weight=1)
         ttk.Label(self.window, text="Codex 连接", style="Title.TLabel").grid(row=0, column=0, sticky="w")
-        description = ttk.Label(self.window, text="在近舟内切换 Codex 连接方式。运行中的任务会继续，设置在正常退出 Codex 后自动应用。",
+        description = ttk.Label(self.window, text="首次切换时，让 Codex 正常退出一次；近舟会完成配置并自动重新打开。日常节点优选无需重启 Codex。",
                                 style="Muted.TLabel", wraplength=780)
         description.grid(row=1, column=0, sticky="ew", pady=(4, 16))
         card = ttk.Frame(self.window, style="Card.TFrame", padding=20)
@@ -1451,16 +1451,20 @@ class CodexTransportDialog:
         ttk.Label(card, textvariable=self.running, style="SurfaceMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
         feedback = ttk.Label(card, textvariable=self.message, style="Surface.TLabel", wraplength=740)
         feedback.grid(row=2, column=0, sticky="ew", pady=(12, 0))
+        self.reopen = tk.BooleanVar(value=True)
+        self.reopen_check = ttk.Checkbutton(card, text="完成配置后自动打开 Codex（推荐）", variable=self.reopen,
+                                            style="Surface.TCheckbutton")
+        self.reopen_check.grid(row=3, column=0, sticky="w", pady=(12, 0))
         actions = ttk.Frame(self.window)
         actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
-        self.http_button = ttk.Button(actions, text="启用兼容连接（推荐）", style="Primary.TButton",
+        self.http_button = ttk.Button(actions, text="一键启用兼容连接", style="Primary.TButton",
                                       command=lambda: owner.request_codex_transport("http"))
         self.http_button.pack(side="left", padx=(0, 8))
         self.restore_button = ttk.Button(actions, text="恢复原设置", command=lambda: owner.request_codex_transport("original"))
         self.restore_button.pack(side="left", padx=(0, 8))
         self.cancel_button = ttk.Button(actions, text="取消待切换", command=owner.cancel_codex_transport)
         self.cancel_button.pack(side="left")
-        note = ttk.Label(self.window, text="近舟会自动备份配置并处理可迁移的聊天。连接设置会在下次打开 Codex 后使用；实际传输方式可在“诊断信息”读取日志确认。",
+        note = ttk.Label(self.window, text="只在你点击启用后执行。近舟可以一直留在托盘，自动备份并保留原聊天；配置已保存与实际请求已验证会分开说明。",
                          style="Muted.TLabel", wraplength=780)
         note.grid(row=4, column=0, sticky="ew", pady=(16, 0))
         navigation = ttk.Frame(self.window)
@@ -1485,7 +1489,15 @@ class CodexTransportDialog:
         mode = {"http": "HTTP/SSE", "original": "原始连接方式", "custom": "现有自定义连接"}.get(state.get("mode"), "待读取")
         if state.get("compatible_http") and not state.get("owned"):
             mode = "HTTP/SSE（现有配置）"
-        self.mode.set("已保存配置：" + mode)
+        configured = state.get("compatible_http") or state.get("mode") == "http"
+        title = "兼容连接：配置已启用" if configured else "兼容连接：尚未启用"
+        if state.get("mode") == "unknown":
+            title = "兼容连接：正在检查"
+        if state.get("pending"):
+            title = "连接切换：等待 Codex 退出" if state.get("running") else "连接切换：等待应用"
+        if state.get("status") in ("error", "unsupported"):
+            title = "连接切换：需要处理"
+        self.mode.set(title + "\n已保存配置：" + mode)
         self.running.set("上次检查：Codex 正在运行。" if state.get("running") else
                          "上次检查：Codex 已退出。" if state.get("running") is False else "")
         operation = owner.codex_transport_busy
@@ -1495,10 +1507,16 @@ class CodexTransportDialog:
             text = str(state.get("explanation") or "等待连接状态。")
             if state.get("pending") and state.get("ok") is not False:
                 target = "HTTP/SSE" if state["pending"] == "http" else "原始连接方式"
-                text = f"已安排，正常退出 Codex 后自动应用；不打断当前任务。\n切换目标：{target}。\n" + text
+                followup = "近舟会自动备份、应用并重新打开 Codex。" if state.get("reopen_requested") else "完成提示出现后重新打开 Codex。"
+                text = f"已安排，当前尚未完成切换。\n下一步：正常退出 Codex 一次，近舟保持运行。\n{followup}\n切换目标：{target}。"
+            elif configured and state.get("status") != "applied":
+                text += "\n这是配置状态，实际模型请求的传输方式尚未在此验证。"
         self.message.set(text)
         busy = bool(operation) or owner.exiting
         enabled = owner.codex_transport_enabled and not busy
+        if state.get("pending"):
+            self.reopen.set(bool(state.get("reopen_requested")))
+        self.reopen_check.state(["!disabled"] if enabled and not state.get("pending") else ["disabled"])
         retry_http = state.get("pending") == "http" and state.get("status") == "error"
         offer_http = (state.get("mode") != "http" and not state.get("compatible_http")) or retry_http
         self.http_button.state(["!disabled"] if enabled and state.get("can_request") and offer_http else ["disabled"])
@@ -1922,7 +1940,9 @@ class Dashboard:
         state = self.codex_transport_state
         if not state.get("can_request") or (mode == "original" and not state.get("can_restore")):
             return
-        self.codex_transport_worker("request", lambda: codex_transport.request_mode(mode, root=ROOT))
+        panel = self.codex_transport_dialog
+        reopen = bool(panel is not None and panel.reopen.get())
+        self.codex_transport_worker("request", lambda: codex_transport.request_mode(mode, reopen=reopen, root=ROOT))
 
     def cancel_codex_transport(self) -> None:
         if self.codex_transport_state.get("pending"):
@@ -1988,10 +2008,15 @@ class Dashboard:
         except queue.Empty:
             self.codex_transport_poll_id = self.root.after(100, self.poll_codex_transport)
             return
+        operation = self.codex_transport_busy
         self.codex_transport_busy = None
         self.codex_transport_state = state
         if self.codex_transport_dialog is not None:
             self.codex_transport_dialog.refresh()
+        if operation == "apply" and state.get("status") == "applied":
+            self.notify(str(state.get("explanation") or "Codex 连接设置已保存。"), 45)
+            if self.tray is not None:
+                self.tray.show_notification("Codex 连接配置完成", str(state.get("explanation") or "连接设置已保存。"))
         if state.get("pending") and state.get("status") not in ("error", "unsupported"):
             self.schedule_codex_transport_check(4000 if state.get("running") else 0)
 

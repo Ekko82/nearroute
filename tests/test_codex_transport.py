@@ -32,6 +32,10 @@ class TransportTests(unittest.TestCase):
         self.capabilities = Mock(return_value={"version": "codex-cli 0.166.0-alpha.5.1", "metadata_resume_supported": True})
         self.startup = Mock(return_value={"startup_validated": True})
         self.migration_calls = []
+        for name, value in (("discover_desktop", transport._DESKTOP_APP_ID), ("open_desktop", None)):
+            patcher = patch.object(transport, name, return_value=value)
+            setattr(self, name, patcher.start())
+            self.addCleanup(patcher.stop)
         self.manager = self.new_manager()
 
     def new_manager(self):
@@ -85,6 +89,104 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(result["pending"], None)
         self.assertEqual(self.parsed()["model_provider"], transport.PROVIDER_ID)
+
+    def test_user_click_reopen_intent_waits_for_exit_then_opens_once(self):
+        self.running.append({"ProcessId": 1234, "Name": "ChatGPT.exe"})
+        result = self.manager.request_mode("http", reopen=True)
+        self.assertTrue(result["reopen_requested"])
+        self.assertIn("尚未生效", result["explanation"])
+        self.assertEqual(self.manager._load("pending")["reopen_app_id"], transport._DESKTOP_APP_ID)
+        restarted = self.new_manager()
+        self.assertEqual(restarted.process_pending()["status"], "pending")
+        self.open_desktop.assert_not_called()
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.running.clear()
+        result = restarted.process_pending()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["reopened"])
+        self.assertIsNone(result["pending"])
+        self.open_desktop.assert_called_once_with(transport._DESKTOP_APP_ID)
+        self.assertIn("已请求自动打开", self.new_manager().inspect()["explanation"])
+        restarted.process_pending()
+        self.open_desktop.assert_called_once()
+        self.assertEqual(self.capabilities.call_count, 1)
+
+    def test_no_user_click_or_old_pending_never_opens_desktop(self):
+        self.manager.inspect()
+        self.manager.process_pending()
+        self.assertFalse((self.manager.state / "pending.json").exists())
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.manager.request_mode("http")
+        pending = self.manager._load("pending")
+        pending.pop("reopen")  # Intent saved by an earlier release.
+        self.manager._save("pending", pending)
+        self.assertTrue(self.new_manager().process_pending()["ok"])
+        self.discover_desktop.assert_not_called()
+        self.open_desktop.assert_not_called()
+
+    def test_launch_failure_keeps_completed_config_and_survives_restart(self):
+        self.open_desktop.side_effect = OSError("private launcher failure detail")
+        self.manager.request_mode("http", reopen=True)
+        result = self.manager.process_pending()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "applied")
+        self.assertEqual(self.parsed()["model_provider"], transport.PROVIDER_ID)
+        self.assertIsNone(result["pending"])
+        self.assertFalse(result["reopened"])
+        self.assertIn("手动打开", result["reopen_error"])
+        self.assertNotIn("private", result["reopen_error"])
+        restarted = self.new_manager()
+        self.assertEqual(restarted.inspect()["reopen_error"], result["reopen_error"])
+        self.assertIn("手动打开", restarted.process_pending()["explanation"])
+        self.assertEqual(self.capabilities.call_count, 1)
+        self.open_desktop.assert_called_once()
+
+    def test_cancelled_reopen_and_failed_switch_never_launch(self):
+        self.manager.request_mode("http", reopen=True)
+        self.manager.cancel_pending()
+        self.manager.process_pending()
+        self.open_desktop.assert_not_called()
+        self.manager.request_mode("http", reopen=True)
+        self.capabilities.side_effect = transport.Refused("当前引擎接口不可用。")
+        self.assertEqual(self.manager.process_pending()["status"], "error")
+        self.manager.process_pending()
+        self.open_desktop.assert_not_called()
+
+    def test_unavailable_launcher_preserves_an_existing_pending_request(self):
+        self.manager.request_mode("http")
+        before = (self.manager.state / "pending.json").read_bytes()
+        self.discover_desktop.side_effect = transport.Refused("未找到桌面应用；可取消自动打开后继续。")
+        result = self.manager.request_mode("http", reopen=True)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["status"], "pending")
+        self.assertIn("取消自动打开", result["request_error"])
+        self.assertEqual((self.manager.state / "pending.json").read_bytes(), before)
+        self.assertEqual(self.config.read_bytes(), self.original)
+
+    def test_malformed_persisted_launch_id_refuses_before_config_write(self):
+        self.manager.request_mode("http", reopen=True)
+        pending = self.manager._load("pending")
+        pending["reopen_app_id"] = "OpenAI.Codex_2p2nqsd0c76g0!App & unwanted"
+        self.manager._save("pending", pending)
+        result = self.manager.process_pending()
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.capabilities.assert_not_called()
+        self.open_desktop.assert_not_called()
+
+    def test_user_reopened_after_completed_migration_skips_duplicate_launch(self):
+        self.create_threads([("target", "openai", "gpt-6-sol", "high", 0)])
+        def migrate_then_reopen(*args, **kwargs):
+            result = self.migrate(*args, **kwargs)
+            self.running.append({"ProcessId": 4321, "Name": "ChatGPT.exe"})
+            return result
+        self.manager.migrate = migrate_then_reopen
+        self.manager.request_mode("http", reopen=True)
+        result = self.manager.process_pending()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["reopen_skipped"])
+        self.assertIsNone(result["pending"])
+        self.open_desktop.assert_not_called()
 
     def test_http_preserves_every_other_setting_and_backups_original(self):
         before = self.parsed()
@@ -391,6 +493,58 @@ class CapabilityTests(unittest.TestCase):
             with patch.object(transport, "_engine_run", return_value=b"codex-cli 0.165.0"):
                 with self.assertRaises(transport.Refused):
                     transport.validate_capabilities(root / "codex.exe", root, root / "state")
+
+
+class DesktopApplicationTests(unittest.TestCase):
+    registration = {"family": transport._DESKTOP_FAMILY, "application_id": "App",
+                    "install_location": r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1027.3384.0_x64__2p2nqsd0c76g0",
+                    "executable": "app/ChatGPT.exe"}
+
+    def test_inventory_keeps_official_wrapper_without_engine_and_ignores_other_chatgpt(self):
+        wrapper = transport.ntpath.join(self.registration["install_location"], "app", "ChatGPT.exe")
+        document = {"desktop": self.registration, "processes": [
+            {"ProcessId": 10, "Name": "ChatGPT.exe", "ExecutablePath": wrapper},
+            {"ProcessId": 20, "Name": "ChatGPT.exe", "ExecutablePath": r"C:\Other ChatGPT\ChatGPT.exe"}]}
+        with patch.object(transport.os, "name", "nt"), patch.object(transport, "_powershell_json", return_value=document):
+            self.assertEqual([row["ProcessId"] for row in transport.process_inventory()], [10])
+            document["processes"].append({"ProcessId": 30, "Name": "CODEX.EXE", "ExecutablePath": None})
+            self.assertEqual([row["ProcessId"] for row in transport.process_inventory()], [10, 30])
+            document["desktop"] = dict(self.registration, family="Other.ChatGPT_publisher")
+            self.assertEqual([row["ProcessId"] for row in transport.process_inventory()], [30])
+
+    def test_missing_desktop_process_path_is_not_mistaken_for_an_exited_app(self):
+        document = {"desktop": self.registration, "processes": [
+            {"ProcessId": 10, "Name": "ChatGPT.exe", "ExecutablePath": None}]}
+        with patch.object(transport.os, "name", "nt"), patch.object(transport, "_powershell_json", return_value=document):
+            with self.assertRaisesRegex(transport.Refused, "无法确认身份"):
+                transport.process_inventory()
+
+    def test_registered_app_opens_only_through_shell_app_id(self):
+        with patch.object(transport, "_require_user_launch"), \
+                patch.object(transport, "_powershell_json", return_value=self.registration), \
+                patch.object(transport.subprocess, "Popen") as launch:
+            self.assertEqual(transport.discover_desktop(), transport._DESKTOP_APP_ID)
+            transport.open_desktop(transport._DESKTOP_APP_ID)
+            command = launch.call_args.args[0]
+            self.assertEqual(transport.ntpath.basename(command[0]), "explorer.exe")
+            self.assertEqual(command[1:], ["shell:AppsFolder\\" + transport._DESKTOP_APP_ID])
+            launch.assert_called_once()
+
+    def test_invalid_app_ids_and_unregistered_or_elevated_launch_are_refused(self):
+        with patch.object(transport.subprocess, "Popen") as launch, \
+                patch.object(transport, "_require_user_launch"), \
+                patch.object(transport, "_powershell_json", return_value=None):
+            for app_id in (None, "com.openai.codex", transport._DESKTOP_APP_ID + " extra"):
+                with self.subTest(app_id=app_id), self.assertRaises(transport.Refused):
+                    transport.open_desktop(app_id)
+            with self.assertRaises(transport.Refused):
+                transport.discover_desktop()
+            launch.assert_not_called()
+        with patch.object(transport, "_require_user_launch", side_effect=transport.Refused("普通用户")), \
+                patch.object(transport, "_powershell_json") as query:
+            with self.assertRaises(transport.Refused):
+                transport.discover_desktop()
+            query.assert_not_called()
 
 
 if __name__ == "__main__":
