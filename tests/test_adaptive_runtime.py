@@ -24,7 +24,7 @@ class AdaptiveRuntimeTests(unittest.TestCase):
         optimizer.atomic_json(self.config, self.cfg)
         self.api = FakeController()
         self.stack.enter_context(patch.object(optimizer, "Controller", return_value=self.api))
-        signals = Mock(last_new_error_at=None)
+        signals = Mock(last_new_error_at=None, error_observations=[])
         signals.poll.return_value = 0
         self.stack.enter_context(patch.object(optimizer, "LogSignals", return_value=signals))
         self.discovery = self.stack.enter_context(patch.object(optimizer, "discover_clients"))

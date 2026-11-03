@@ -56,6 +56,24 @@ class TransportRecoveryTests(unittest.TestCase):
             self.assertEqual(f.helper.recovery_until, 1070)
             self.assertFalse(f.helper.recovery_scan_pending)
 
+    def test_error_journal_write_failure_does_not_change_recovery_or_selection(self):
+        with self.runtime() as f:
+            f.signals.last_new_error_at = f.clock[0]
+            f.signals.poll.return_value = 2
+            observation = {"error_at": "1970-01-01T08:16:40.000+08:00", "error_kind": "decode",
+                           "transport": None, "request_at": None, "request_age_seconds": None,
+                           "heartbeat_count": None, "last_heartbeat_age_seconds": None, "context_state": "missing"}
+            f.signals.error_observations = [observation]
+            with patch.object(optimizer, "event", side_effect=PermissionError("private destination")) as save:
+                f.helper.poll_transport_signals(force=True)
+                f.signals.error_observations = []  # Every real poll returns a fresh list.
+                self.assertFalse(f.helper.change_candidate(f.api.general, "Main", "JP old", "JP fast"))
+            save.assert_called_once_with("codex_transport_error", **observation)
+            self.assertEqual(f.helper.status["network_errors_recent"], 2)
+            self.assertEqual(f.helper.recovery_until, 1060)
+            self.assertTrue(f.helper.recovery_scan_pending)
+            self.assertEqual(f.api.select_calls, [])
+
     def test_run_keeps_health_checks_and_scans_once_when_recovery_expires(self):
         with self.runtime() as f:
             self.start_recovery(f)

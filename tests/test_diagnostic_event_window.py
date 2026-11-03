@@ -47,7 +47,7 @@ class DiagnosticEventWindowTests(unittest.TestCase):
 
         events = self.summarize([self.error_at.isoformat()])["events"]
 
-        self.assertEqual(original["files"]["events.previous.jsonl"], "not_needed")
+        self.assertEqual(original["files"]["events.previous.jsonl"], "ok")
         self.assertEqual(events["files"]["events.previous.jsonl"], "ok")
         self.assertEqual(events["installation_recent_events"], original["installation_recent_events"])
         self.assertEqual(len(events["installation_recent_events"]), 8)
@@ -112,7 +112,7 @@ class DiagnosticEventWindowTests(unittest.TestCase):
                 self.assertEqual(events["near_error_events"], [])
                 self.assertFalse(events["near_error_events_truncated"])
 
-    def test_default_and_empty_opt_in_skip_previous_and_stay_read_only(self):
+    def test_default_and_empty_opt_in_read_previous_for_saved_history_and_stay_read_only(self):
         self.write_events([self.event("scan_completed", seconds=300 + i) for i in range(8)])
         self.write_events([self.event()], "events.previous.jsonl")
         before = {path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
@@ -148,12 +148,12 @@ class DiagnosticEventWindowTests(unittest.TestCase):
             window = self.summarize([self.error_at.isoformat()])["events"]
 
         self.assertEqual(empty_opened, default_opened)
-        self.assertNotIn(self.root / "state/events.previous.jsonl", default_opened)
+        self.assertIn(self.root / "state/events.previous.jsonl", default_opened)
         self.assertIn(self.root / "state/events.previous.jsonl", opened)
         self.assertNotIn("near_error_events", default)
         self.assertNotIn("near_error_events_truncated", default)
         self.assertEqual(empty["installation_recent_events"], default["installation_recent_events"])
-        self.assertEqual(empty["files"]["events.previous.jsonl"], "not_needed")
+        self.assertEqual(empty["files"]["events.previous.jsonl"], "ok")
         self.assertEqual(window["near_error_events"], [{"type": "switched", "time": self.error_at.isoformat()}])
         self.assertEqual({path: path.read_bytes() for path in self.root.rglob("*") if path.is_file()}, before)
 
@@ -172,7 +172,9 @@ class DiagnosticEventWindowTests(unittest.TestCase):
 
     def test_rotation_between_file_reads_does_not_duplicate_window_or_claim_truncation(self):
         rows = [self.event(seconds=(index - 128) / 2) for index in range(256)]
-        self.write_events(rows + [{"event": "unknown", "padding": "x" * (2 * 1024 * 1024)}])
+        # Relevant records stay in the bounded tail while old oversized data
+        # falls outside it; rotation must not duplicate those retained records.
+        self.write_events([{"event": "unknown", "padding": "x" * (2 * 1024 * 1024)}] + rows)
         state = self.root / "state"
         current = state / "events.jsonl"
         self.assertGreater(current.stat().st_size, 2 * 1024 * 1024)
@@ -193,7 +195,7 @@ class DiagnosticEventWindowTests(unittest.TestCase):
         def open_with_rotation(path, *args, **kwargs):
             stream = original_open(path, *args, **kwargs)
             mode = args[0] if args else kwargs.get("mode", "r")
-            if path == current and mode == "r":
+            if path == current and mode == "rb":
                 return rotate_after_close(stream)
             return stream
 

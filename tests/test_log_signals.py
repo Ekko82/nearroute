@@ -1,6 +1,8 @@
 """Offline Codex transport signals using a temporary SQLite log schema."""
 
+from contextlib import closing
 from pathlib import Path
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -279,6 +281,209 @@ class LogSignalsTests(unittest.TestCase):
         self.assertEqual(self.signals.last_new_error_at, 819)
         self.assertEqual(self.signals.poll(), 0)
         self.assertIsNone(self.signals.last_new_error_at)
+
+    def request(self, *, stamp=900, transport="responses_http", **scope):
+        self.insert(f'api.path=/responses http.method=POST wire_api=responses transport={transport} '
+                    f'turn_id="{TURN_A}" PROMPT_SECRET TOKEN_SECRET',
+                    stamp=stamp, target="codex_http_client::request", **scope)
+
+    def heartbeat(self, *, stamp=950, **scope):
+        self.insert('unhandled responses event: "keepalive"', stamp=stamp,
+                    target="codex_api::sse::responses", **scope)
+
+    def test_saved_error_context_survives_source_deletion_without_private_fields(self):
+        self.prime()
+        self.request()
+        self.heartbeat(stamp=920)
+        self.heartbeat(stamp=970)
+        self.insert(body(DECODE))
+        helper = object.__new__(optimizer.Optimizer)
+        helper.signals = self.signals
+        helper.status = {}
+        helper.last_signal_poll = helper.recovery_until = 0
+        helper.recovery_scan_pending = False
+        state = self.path.parent / "state"
+        with patch.object(optimizer, "STATE", state):
+            helper.poll_transport_signals(force=True)
+            journal = state / "events.jsonl"
+            original = journal.read_text("utf-8")
+            saved = json.loads(original)
+            self.assertEqual(saved["event"], "codex_transport_error")
+            self.assertEqual(saved["error_kind"], "decode")
+            self.assertEqual(saved["transport"], "responses_http")
+            self.assertEqual(saved["request_age_seconds"], 100)
+            self.assertEqual(saved["heartbeat_count"], 2)
+            self.assertEqual(saved["last_heartbeat_age_seconds"], 30)
+            self.assertEqual(saved["context_state"], "ok")
+            self.assertEqual(helper.recovery_until, 1060)
+            for private in ("URL_SECRET", "PROMPT_SECRET", "TOKEN_SECRET", "process-a", "thread-a", TURN_A, str(self.path)):
+                self.assertNotIn(private, original)
+            self.db.execute("DELETE FROM logs")
+            self.db.commit()
+            helper.poll_transport_signals(force=True)
+            self.assertEqual(journal.read_text("utf-8"), original)
+            self.assertEqual(self.signals.error_observations, [])
+            self.assertEqual(helper.status["network_errors_recent"], 1)
+
+    def test_context_never_borrows_other_scope_threadless_or_later_retry(self):
+        self.prime()
+        self.request()
+        self.heartbeat(stamp=950)
+        self.heartbeat(stamp=990, process="other-process")
+        self.heartbeat(stamp=991, thread="other-thread")
+        self.heartbeat(stamp=992, thread=None)
+        self.request(stamp=999, thread="other-thread", transport="responses_websocket")
+        self.request(stamp=999, process="other-process", transport="responses_websocket")
+        self.insert(body(DECODE))
+        self.request(stamp=1000, transport="responses_websocket")
+        self.heartbeat(stamp=1000)
+        self.assertEqual(self.signals.poll(), 1)
+        record = self.signals.error_observations[0]
+        self.assertEqual(record["transport"], "responses_http")
+        self.assertEqual(record["request_age_seconds"], 100)
+        self.assertEqual(record["heartbeat_count"], 1)
+        self.assertEqual(record["last_heartbeat_age_seconds"], 50)
+
+    def test_context_missing_and_ambiguous_never_invent_fields(self):
+        self.prime()
+        self.request(stamp=399)  # Outside the bounded 600-second lookback.
+        self.heartbeat(stamp=990, thread=None)
+        self.insert(body(DECODE))
+        self.assertEqual(self.signals.poll(), 1)
+        record = self.signals.error_observations[0]
+        self.assertEqual(record["context_state"], "missing")
+        self.assertIsNone(record["request_at"])
+        self.assertIsNone(record["heartbeat_count"])
+        self.request()
+        self.insert(body(DECODE))
+        self.signals.poll()
+        record = self.signals.error_observations[0]
+        self.assertEqual(record["request_age_seconds"], 100)
+        self.assertIsNone(record["heartbeat_count"], "threadless keepalives cannot establish absence of heartbeat")
+        self.assertEqual(record["context_state"], "missing")
+        self.request(transport="responses_http transport=responses_websocket")
+        self.insert(body(DECODE))
+        self.signals.poll()
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "ambiguous")
+        self.assertIsNone(self.signals.error_observations[0]["transport"])
+
+    def test_context_rejects_different_turn_and_future_timestamp(self):
+        self.prime()
+        self.request()
+        self.insert(body(DECODE, turn=TURN_B))
+        self.signals.poll()
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "ambiguous")
+        self.request(stamp=1001)
+        self.insert(body(DECODE))
+        self.signals.poll()
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "ambiguous")
+
+    def test_request_trace_requires_exact_responses_path_method_and_wire_api(self):
+        for trace in ('api.path=/responses/compact http.method=POST wire_api=responses',
+                      'api.path=/responses http.method=GET wire_api=responses',
+                      'api.path=/responses http.method=POST wire_api=other',
+                      'api.path=/responses-extra http.method=POST wire_api=responses'):
+            with self.subTest(trace=trace):
+                signals = optimizer.LogSignals(str(self.path))
+                signals.poll()
+                self.insert(trace+' transport=responses_http', stamp=900, target="codex_http_client::request")
+                self.insert(body(DECODE))
+                signals.poll()
+                self.assertEqual(signals.error_observations[0]["context_state"], "missing")
+                self.assertIsNone(signals.error_observations[0]["transport"])
+
+    def test_compact_error_does_not_borrow_older_normal_request(self):
+        self.prime()
+        self.request(stamp=900)
+        self.heartbeat(stamp=930)
+        self.insert('api.path=/responses/compact http.method=POST wire_api=responses transport=responses_http',
+                    stamp=950, target="codex_http_client::request")
+        self.insert(compact_retry(), stamp=1000)
+        self.assertEqual(self.signals.poll(), 1)
+        observation = self.signals.error_observations[0]
+        self.assertEqual(observation["context_state"], "missing")
+        for field in ("transport", "request_at", "request_age_seconds", "heartbeat_count", "last_heartbeat_age_seconds"):
+            self.assertIsNone(observation[field])
+
+    def test_context_capture_is_truncated_at_501_rows_and_deadline_is_nonfatal(self):
+        self.prime()
+        self.request()
+        for _ in range(500):
+            self.heartbeat()
+        self.insert(body(DECODE))
+        self.assertEqual(self.signals.poll(), 1)
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "truncated")
+        self.assertIsNone(self.signals.error_observations[0]["request_at"])
+        self.insert(body(DECODE))
+        with patch.object(optimizer.time, "monotonic", side_effect=[0, 1]):
+            self.assertEqual(self.signals.poll(), 2)
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "unavailable")
+
+    def test_context_capture_sqlite_failure_preserves_count_and_clears_progress_handler(self):
+        self.prime()
+        self.request()
+        self.insert(body(DECODE))
+        real_connect = sqlite3.connect
+        handlers = []
+
+        class Reader:
+            def __init__(self, *args, **kwargs):
+                self.connection = real_connect(*args, **kwargs)
+
+            def execute(self, sql, parameters=()):
+                if "LIMIT 501" in sql:
+                    raise sqlite3.OperationalError("database is locked: PRIVATE_CONTEXT")
+                return self.connection.execute(sql, parameters)
+
+            def set_progress_handler(self, callback, steps):
+                handlers.append(callback is not None)
+                self.connection.set_progress_handler(callback, steps)
+
+            def close(self):
+                self.connection.close()
+
+        with patch.object(optimizer.sqlite3, "connect", side_effect=Reader):
+            self.assertEqual(self.signals.poll(), 1)
+        self.assertEqual(self.signals.last_new_error_at, 1000)
+        self.assertEqual(self.signals.error_observations[0]["context_state"], "unavailable")
+        self.assertEqual(handlers, [True, False])
+        self.assertNotIn("PRIVATE_CONTEXT", json.dumps(self.signals.error_observations))
+
+    def test_context_observations_follow_existing_pairing_and_initial_cursor(self):
+        self.request()
+        self.insert(body(SEND), target=CLIENT)
+        self.prime()
+        self.assertEqual(self.signals.error_observations, [])
+        self.insert(body(SEND), target=CLIENT)
+        self.insert(body(SEND), stamp=1001)
+        self.assertEqual(self.signals.poll(), 1)
+        self.assertEqual(len(self.signals.error_observations), 1)
+        self.assertEqual(self.signals.error_observations[0]["error_kind"], "send")
+        self.assertEqual(self.signals.poll(), 1)
+        self.assertEqual(self.signals.error_observations, [])
+
+    def test_legacy_schema_without_nanos_still_counts_and_preserves_recovery(self):
+        legacy_path = self.path.parent / "legacy.sqlite"
+        with closing(sqlite3.connect(legacy_path)) as writer:
+            writer.execute("CREATE TABLE logs(id INTEGER PRIMARY KEY,ts INTEGER,process_uuid TEXT,thread_id TEXT,"
+                           "target TEXT,feedback_log_body TEXT)")
+            writer.commit()
+            signals = optimizer.LogSignals(str(legacy_path))
+            self.assertEqual(signals.poll(), 0)
+            writer.execute("INSERT INTO logs VALUES(1,1000,'process-secret','thread-secret',?,?)", (RETRY, body(DECODE)))
+            writer.commit()
+            helper = object.__new__(optimizer.Optimizer)
+            helper.signals = signals
+            helper.status = {}
+            helper.last_signal_poll = helper.recovery_until = 0
+            helper.recovery_scan_pending = False
+            with patch.object(optimizer, "STATE", self.path.parent / "legacy-state"):
+                helper.poll_transport_signals(force=True)
+            self.assertEqual(helper.status["network_errors_recent"], 1)
+            self.assertEqual(helper.recovery_until, 1060)
+            self.assertEqual(signals.last_new_error_at, 1000)
+            self.assertEqual(signals.error_observations[0]["context_state"], "unavailable")
+            self.assertIsNone(signals.error_observations[0]["transport"])
 
     def test_rows_inserted_after_max_id_are_read_once_on_the_next_poll(self):
         self.prime()

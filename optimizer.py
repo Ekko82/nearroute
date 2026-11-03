@@ -1076,6 +1076,7 @@ class LogSignals:
         self.path = Path(path)
         self.last_id = None
         self.last_new_error_at = None
+        self.error_observations = []
         self.recent = collections.deque()
         self._unpaired = {}
 
@@ -1124,8 +1125,81 @@ class LogSignals:
             return "reset"
         return None
 
+    @staticmethod
+    def _responses_start(body):
+        # The installed engine's request trace records api.path, not a URL.
+        return all(re.search(r'\b' + re.escape(key) + r'\s*=\s*[\"\']?' + re.escape(value)
+                             + r'(?=$|[\s\"\',}\]])', body)
+                   for key, value in (("api.path", "/responses"), ("http.method", "POST"), ("wire_api", "responses")))
+
+    @staticmethod
+    def _error_context(db, ident, stamp, nanos, process, thread, kind, error_body, deadline):
+        precise = stamp + (nanos / 1000000000 if type(nanos) is int and 0 <= nanos < 1000000000 else 0)
+        record = {"error_at": datetime.fromtimestamp(precise, TZ).isoformat(timespec="milliseconds"),
+                  "error_kind": kind, "transport": None, "request_at": None, "request_age_seconds": None,
+                  "heartbeat_count": None, "last_heartbeat_age_seconds": None, "context_state": "missing"}
+        if nanos is None:
+            record["context_state"] = "unavailable"
+            return record
+        if not process or not thread:
+            return record
+        try:
+            if time.monotonic() >= deadline:
+                record["context_state"] = "unavailable"
+                return record
+            db.set_progress_handler(lambda: time.monotonic() >= deadline, 1000)
+            rows = db.execute("""SELECT id,ts,ts_nanos,target,feedback_log_body FROM logs
+                WHERE process_uuid=? AND thread_id=? AND id<? AND ts>=? AND
+                (target='codex_http_client::request' OR
+                 (target='codex_api::sse::responses' AND feedback_log_body LIKE '%unhandled responses event:%keepalive%'))
+                ORDER BY id DESC LIMIT 501""", (process, thread, ident, math.floor(precise - 600))).fetchall()
+        except (sqlite3.Error, AttributeError):
+            record["context_state"] = "unavailable"
+            return record
+        finally:
+            # The capture deadline must never affect ordinary signal counting.
+            try:
+                if hasattr(db, "set_progress_handler"):
+                    db.set_progress_handler(None, 0)
+            except sqlite3.Error:
+                record["context_state"] = "unavailable"
+        if record["context_state"] == "unavailable" or time.monotonic() >= deadline:
+            record["context_state"] = "unavailable"
+            return record
+        if len(rows) > 500:
+            record["context_state"] = "truncated"
+            return record
+        request = next((row for row in rows if row[3] == "codex_http_client::request"), None)
+        if request is None or not LogSignals._responses_start(request[4] or ""):
+            return record
+        request_id, request_stamp, request_nanos, _, request_body = request
+        request_time = request_stamp + request_nanos / 1000000000
+        if request_time < precise - 600:
+            return record
+        transports = set(re.findall(r'\btransport\s*=\s*[\"\']?(responses_http|responses_websocket)(?=$|[\s\"\',}])', request_body))
+        turn_pattern = r'\bturn(?:_id|\.id)\s*=\s*[\"\']?([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})\b'
+        error_turn, request_turn = re.search(turn_pattern, error_body), re.search(turn_pattern, request_body)
+        if (request_time > precise or len(transports) > 1
+                or (error_turn and request_turn and error_turn[1].lower() != request_turn[1].lower())):
+            record["context_state"] = "ambiguous"
+            return record
+        if not transports:
+            return record
+        record.update(transport=transports.pop(), request_at=datetime.fromtimestamp(request_time, TZ).isoformat(timespec="milliseconds"),
+                      request_age_seconds=round(precise - request_time, 3), context_state="ok")
+        if record["transport"] == "responses_http":
+            heartbeats = [at + ns / 1000000000 for row_id, at, ns, target, body in rows
+                          if row_id > request_id and target == "codex_api::sse::responses"
+                          and request_time <= at + ns / 1000000000 <= precise
+                          and re.search(r'unhandled responses event:\s*[\"\']keepalive[\"\']', body or "")]
+            record.update(heartbeat_count=len(heartbeats) if heartbeats else None,
+                          last_heartbeat_age_seconds=round(precise - max(heartbeats), 3) if heartbeats else None,
+                          context_state="ok" if heartbeats else "missing")
+        return record
+
     def poll(self):
         self.last_new_error_at = None
+        self.error_observations = []
         if not self.enabled:
             return 0
         now = time.time()
@@ -1139,7 +1213,8 @@ class LogSignals:
             db = sqlite3.connect(uri, uri=True, timeout=0.15)
             highest = db.execute("SELECT MAX(id) FROM logs").fetchone()[0] or 0
             if self.last_id is not None and highest > self.last_id:
-                rows = db.execute("""SELECT ts,process_uuid,thread_id,target,feedback_log_body FROM logs
+                nanos_column = "ts_nanos" if any(row[1] == "ts_nanos" for row in db.execute("PRAGMA table_info(logs)")) else "NULL"
+                rows = db.execute(f"""SELECT id,ts,{nanos_column},process_uuid,thread_id,target,feedback_log_body FROM logs
                     WHERE id>? AND id<=? AND
                     ((target LIKE '%responses_retry%' AND
                       (feedback_log_body LIKE '%error sending request%' OR feedback_log_body LIKE '%error decoding response body%'))
@@ -1149,7 +1224,8 @@ class LogSignals:
                           OR feedback_log_body LIKE '%(os error 10054)%'
                           OR feedback_log_body LIKE '%tls handshake eof%')))
                     ORDER BY id""", (self.last_id, highest)).fetchall()
-                for stamp, process, thread, target, raw in rows:
+                capture_deadline = time.monotonic() + 0.15
+                for ident, stamp, nanos, process, thread, target, raw in rows:
                     body = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', raw or '')
                     source = "client" if target == "codex_http_client::client" else "retry"
                     if source == "client" and not self._responses_request(body):
@@ -1175,6 +1251,9 @@ class LogSignals:
                     if stamp >= cutoff:
                         self.recent.append(stamp)
                     self.last_new_error_at = max(stamp, self.last_new_error_at or stamp)
+                    if target in ("codex_core::responses_retry", "codex_http_client::client"):
+                        self.error_observations.append(self._error_context(
+                            db, ident, stamp, nanos, process, thread, kind, body, capture_deadline))
             self.last_id = highest
         except (OSError, sqlite3.Error):
             pass
@@ -1536,6 +1615,12 @@ class Optimizer:
             self.recovery_until = max(self.recovery_until, deadline)
             self.recovery_scan_pending = True
         self.status["transport_recovery_until"] = iso(self.recovery_until) if now < self.recovery_until else None
+        for observation in self.signals.error_observations:
+            try:
+                event("codex_transport_error", **observation)
+            except OSError:
+                # Diagnostic storage must not change recovery or node selection.
+                pass
 
     def transport_recovery_active(self, *, force=False):
         self.poll_transport_signals(force=force)

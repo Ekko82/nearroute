@@ -49,7 +49,7 @@ class DiagnosticRotationTests(unittest.TestCase):
         def open_with_rotation(path, *args, **kwargs):
             stream = real_open(path, *args, **kwargs)
             mode = args[0] if args else kwargs.get("mode", "r")
-            if path in (current, previous) and mode == "r":
+            if path in (current, previous) and mode in ("r", "rb"):
                 return rotate_after_close(stream)
             return stream
 

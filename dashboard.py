@@ -420,22 +420,63 @@ def diagnostic_summary(root=None, *, event_times=None) -> str:
     event_types = {"started", "stopped", "manual_selection", "external_selection_change", "switched", "rollback",
                    "selection_changed_during_validation", "candidate_rejected", "scan_completed", "restore", "error"}
     event_files, events, near_events = {}, [], []
+    saved_errors = []
+    saved_errors_truncated = event_read_truncated = False
     near_events_truncated = False
     for name in ("events.jsonl", "events.previous.jsonl"):
         recent_needed = name == "events.jsonl" or len(events) < 8
-        if not recent_needed and not error_times:
-            event_files[name] = "not_needed"
-            continue
         try:
-            with (root / "state" / name).open("r", encoding="utf-8-sig", errors="replace") as stream:
-                for line in stream:
+            # Both existing rotation files can contain saved observations even
+            # when the live Codex database has gone away. Bound each local read.
+            with (root / "state" / name).open("rb") as stream:
+                stream.seek(0, os.SEEK_END)
+                offset = max(0, stream.tell() - 2 * 1024 * 1024)
+                if offset:
+                    event_read_truncated = True
+                    stream.seek(offset - 1)
+                    boundary = stream.read(1)
+                else:
+                    boundary = b"\n"
+                    stream.seek(0)
+                data = stream.read(2 * 1024 * 1024)
+                if boundary != b"\n":
+                    data = data.partition(b"\n")[2]
+                for line in data.decode("utf-8-sig", errors="replace").splitlines():
                     try:
                         item = json.loads(line)
                     except ValueError:
                         continue
-                    if not isinstance(item, dict) or not isinstance(item.get("event"), str) or item["event"] not in event_types:
+                    if not isinstance(item, dict) or not isinstance(item.get("event"), str):
                         continue
                     at = timestamp(item.get("at"))
+                    if item["event"] == "codex_transport_error" and at is not None:
+                        error_at = timestamp(item.get("error_at"))
+                        kind, context = item.get("error_kind"), item.get("context_state")
+                        if (error_at is None or not isinstance(kind, str) or kind not in {"send", "decode", "tls", "websocket", "reset"}
+                                or not isinstance(context, str) or context not in {"ok", "missing", "ambiguous", "truncated", "unavailable"}):
+                            continue
+                        error_at = datetime.fromisoformat(error_at).isoformat(timespec="milliseconds")
+                        request_at = timestamp(item.get("request_at"))
+                        if request_at is not None:
+                            request_at = datetime.fromisoformat(request_at).isoformat(timespec="milliseconds")
+                        transport = item.get("transport")
+                        observation = {"detected_at": at, "error_at": error_at, "error_kind": kind,
+                                       "transport": transport if isinstance(transport, str) and transport in {"responses_http", "responses_websocket"} else None,
+                                       "request_at": request_at, "context_state": context}
+                        for key in ("request_age_seconds", "last_heartbeat_age_seconds"):
+                            value = item.get(key)
+                            observation[key] = value if type(value) in (int, float) and 0 <= value < float("inf") else None
+                        value = item.get("heartbeat_count")
+                        observation["heartbeat_count"] = value if type(value) is int and value >= 0 else None
+                        if observation not in saved_errors:
+                            saved_errors.append(observation)
+                            if len(saved_errors) > 20:
+                                saved_errors.sort(key=lambda row: datetime.fromisoformat(row["error_at"]))
+                                del saved_errors[:-20]
+                                saved_errors_truncated = True
+                        continue
+                    if item["event"] not in event_types:
+                        continue
                     if at is not None:
                         event = {"type": item["event"], "time": at}
                         if recent_needed:
@@ -455,7 +496,8 @@ def diagnostic_summary(root=None, *, event_times=None) -> str:
         except OSError:
             event_files[name] = "unreadable"
     events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
-    event_summary = {"files": event_files, "installation_recent_events": events[-8:]}
+    event_summary = {"files": event_files, "installation_recent_events": events[-8:],
+                     "read_truncated": event_read_truncated}
     if event_times is not None:
         near_events.sort(key=lambda item: datetime.fromisoformat(item["time"]))
         event_summary.update(near_error_events=near_events, near_error_events_truncated=near_events_truncated)
@@ -475,6 +517,10 @@ def diagnostic_summary(root=None, *, event_times=None) -> str:
         },
         "config": config, "status": status,
         "events": event_summary,
+        "saved_codex_connection": {
+            "source": "installation_events", "observations": sorted(saved_errors, key=lambda row: datetime.fromisoformat(row["error_at"])),
+            "truncated": saved_errors_truncated or event_read_truncated,
+        },
     }, ensure_ascii=False, indent=2)
 
 
@@ -1265,7 +1311,7 @@ class DiagnosticDialog:
         form.columnconfigure(0, weight=1)
         form.rowconfigure(4, weight=1)
         ttk.Label(form, text="诊断信息", style="Title.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        description = ttk.Label(form, text="查看本安装的运行摘要；仅手动复制，不会自动发送。", style="Muted.TLabel", wraplength=800)
+        description = ttk.Label(form, text="查看本安装的运行摘要与已保存的断流观察；仅手动复制，不会自动发送。", style="Muted.TLabel", wraplength=800)
         description.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(4, 8))
         self.version_note = tk.StringVar(value=self.runtime_note(json.loads(self.summary)))
         runtime_label = ttk.Label(form, textvariable=self.version_note, style="Muted.TLabel", wraplength=680)
@@ -1273,7 +1319,7 @@ class DiagnosticDialog:
         opt_in = ttk.Frame(form)
         opt_in.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(0, 8))
         opt_in.columnconfigure(0, weight=1)
-        privacy_label = ttk.Label(opt_in, text="仅此次读取配置路径或本机 Codex 默认日志，预览近 2 小时脱敏时间线。\n仅含时间、错误类别、重试次数与传输方式，不含原始日志、提示词、令牌或路径。", style="Muted.TLabel", wraplength=650)
+        privacy_label = ttk.Label(opt_in, text="仅此次读取配置路径或本机 Codex 默认日志，预览近 2 小时脱敏时间线。\n已保存的历史观察单独列出；仅含时间、错误类别与连接指标，不含原始日志、提示词、令牌或路径。", style="Muted.TLabel", wraplength=650)
         privacy_label.grid(row=0, column=0, sticky="ew")
         self.codex_button = ttk.Button(opt_in, text="读取 Codex 断流摘要", command=self.read_codex_summary)
         self.codex_button.grid(row=0, column=1, sticky="ne", padx=(16, 0))
@@ -1400,6 +1446,11 @@ class DiagnosticDialog:
             message += " 摘要已截断；错误数仅为已读取范围内的观察数，不代表近 2 小时完整错误数或最终失败数。"
         if summary["events"].get("near_error_events_truncated"):
             message += " 近舟事件对照已截断。"
+        saved = summary["saved_codex_connection"]
+        if saved["observations"]:
+            message += f" 单独列出 {len(saved['observations'])} 条已保存的历史观察，不计入此次日志错误数。"
+        if saved["truncated"]:
+            message += " 已保存的历史观察读取范围已截断。"
         self.codex_message.set(message)
 
     def copy_summary(self):

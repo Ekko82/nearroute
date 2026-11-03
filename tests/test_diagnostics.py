@@ -238,6 +238,98 @@ class DiagnosticSummaryTests(unittest.TestCase):
         self.assertEqual(blocked["status"]["file"], "unreadable")
         self.assertFalse(blocked["status"]["current"])
 
+    def saved_error(self, **overrides):
+        return {"event": "codex_transport_error", "at": self.now.isoformat(),
+                "error_at": self.now.replace(microsecond=123000).isoformat(timespec="milliseconds"),
+                "error_kind": "decode", "transport": "responses_http",
+                "request_at": (self.now - timedelta(seconds=180)).isoformat(timespec="milliseconds"),
+                "request_age_seconds": 180.123, "heartbeat_count": 2,
+                "last_heartbeat_age_seconds": 30.25, "context_state": "ok", **overrides}
+
+    def test_saved_error_whitelist_survives_deleted_source_database(self):
+        self.populate()
+        log = self.root / "PRIVATE_LOG.sqlite"
+        log.write_text("ERROR_BODY_MARKER", encoding="utf-8")
+        self.cfg["codex_log_db"] = str(log)
+        self.write("config.json", self.cfg)
+        error = self.saved_error(raw="ERROR_BODY_MARKER", thread_id="ABS_USER_MARKER",
+                                 path="ENV_TOKEN_MARKER", auth="SECRET_ENV_MARKER",
+                                 unknown={"body": "MESSAGE_BODY_MARKER"})
+        self.write("state/events.jsonl", json.dumps(error) + "\n")
+        saved = self.summarize()["saved_codex_connection"]
+        log.unlink()
+        summary = self.summarize()
+        self.assertEqual(summary["saved_codex_connection"], saved)
+        self.assertNotIn("codex_connection", summary)
+        self.assertEqual(summary["events"]["installation_recent_events"], [])
+        self.assertEqual(saved["source"], "installation_events")
+        self.assertFalse(saved["truncated"])
+        self.assertEqual(saved["observations"], [{
+            "detected_at": error["at"], **{key: error[key] for key in (
+                "error_at", "error_kind", "transport", "request_at", "request_age_seconds",
+                "heartbeat_count", "last_heartbeat_age_seconds", "context_state")}}])
+
+    def test_saved_errors_reject_invalid_required_fields_and_null_invalid_optional_fields(self):
+        self.populate()
+        invalid = [self.saved_error(**{key: value}) for key, value in (
+            ("at", "ERROR_BODY_MARKER"), ("error_at", "ENV_TOKEN_MARKER"),
+            ("error_kind", "MESSAGE_BODY_MARKER"), ("error_kind", ["decode"]),
+            ("context_state", "ABS_USER_MARKER"), ("context_state", ["ok"]))]
+        for value in (-1, True, "ERROR_BODY_MARKER", float("nan"), float("inf"), {}):
+            with self.subTest(value=value):
+                row = self.saved_error(transport="ENV_TOKEN_MARKER", request_at="ABS_USER_MARKER",
+                                       request_age_seconds=value, heartbeat_count=value,
+                                       last_heartbeat_age_seconds=value)
+                self.write("state/events.jsonl", "\n".join(json.dumps(item) for item in invalid + [row]))
+                saved = self.summarize()["saved_codex_connection"]["observations"]
+                self.assertEqual(len(saved), 1)
+                for key in ("transport", "request_at", "request_age_seconds", "heartbeat_count", "last_heartbeat_age_seconds"):
+                    self.assertIsNone(saved[0][key], key)
+        self.write("state/events.jsonl", json.dumps(self.saved_error(
+            transport=None, request_at=None, request_age_seconds=0, heartbeat_count=0,
+            last_heartbeat_age_seconds=0, context_state="missing")))
+        saved = self.summarize()["saved_codex_connection"]["observations"][0]
+        self.assertEqual(saved["context_state"], "missing")
+        self.assertEqual(saved["heartbeat_count"], 0)
+
+    def test_saved_error_history_uses_rotated_file_with_recent_ordinary_events_and_deduplicates(self):
+        self.populate()
+        error = self.saved_error()
+        recent = [{"event": "scan_completed", "at": (self.now + timedelta(seconds=i)).isoformat()} for i in range(8)]
+        self.write("state/events.jsonl", "\n".join(json.dumps(row) for row in [error, *recent]))
+        self.write("state/events.previous.jsonl", json.dumps(error) + "\n")
+        summary = self.summarize()
+        self.assertEqual(len(summary["saved_codex_connection"]["observations"]), 1)
+        self.assertFalse(summary["saved_codex_connection"]["truncated"])
+        self.assertEqual(summary["events"]["installation_recent_events"], [
+            {"type": row["event"], "time": row["at"]} for row in recent])
+        self.write("state/events.jsonl", "\n".join(json.dumps(row) for row in recent))
+        self.assertEqual(self.summarize()["saved_codex_connection"], summary["saved_codex_connection"])
+
+    def test_saved_error_history_reports_count_and_read_bounds(self):
+        self.populate()
+        rows = [self.saved_error(error_at=(self.now + timedelta(seconds=i)).isoformat(timespec="milliseconds")) for i in range(21)]
+        self.write("state/events.jsonl", "\n".join(json.dumps(row) for row in reversed(rows)))
+        saved = self.summarize()["saved_codex_connection"]
+        self.assertTrue(saved["truncated"])
+        self.assertEqual([row["error_at"] for row in saved["observations"]], [row["error_at"] for row in rows[-20:]])
+        self.write("state/events.jsonl", "x" * (2 * 1024 * 1024) + "\n" + json.dumps(rows[-1]) + "\n")
+        summary = self.summarize()
+        self.assertTrue(summary["events"]["read_truncated"])
+        self.assertTrue(summary["saved_codex_connection"]["truncated"])
+        self.assertEqual(len(summary["saved_codex_connection"]["observations"]), 1)
+        self.assertEqual(summary["saved_codex_connection"]["observations"][0]["error_at"], rows[-1]["error_at"])
+
+    def test_saved_history_tail_keeps_complete_first_line_at_exact_boundary(self):
+        self.populate()
+        row = self.saved_error()
+        line = (json.dumps(row) + "\n").encode("utf-8")
+        padding = b"\n" * (2 * 1024 * 1024 - len(line))
+        (self.root / "state/events.jsonl").write_bytes(b"old discarded data\n" + line + padding)
+        summary = self.summarize()
+        self.assertTrue(summary["events"]["read_truncated"])
+        self.assertEqual(len(summary["saved_codex_connection"]["observations"]), 1)
+
 
 class DiagnosticDialogTests(unittest.TestCase):
     def setUp(self):
@@ -368,6 +460,22 @@ class DiagnosticDialogTests(unittest.TestCase):
              patch.object(dialog.window, "clipboard_append") as append:
             dialog.copy_summary()
         append.assert_called_once_with(dialog.summary)
+
+    def test_missing_live_database_keeps_saved_history_separate_from_live_counts(self):
+        fixture, dialog = self.make_dialog()
+        fixture.write("state/events.jsonl", json.dumps(fixture.saved_error(raw="ERROR_BODY_MARKER")) + "\n")
+        result = self.connection_result()
+        result.update(state="missing", source="configured")
+        dialog.results.put((dashboard.diagnostic_summary(fixture.root), result))
+        self.receive_summary(dialog)
+        summary = json.loads(dialog.summary)
+        self.assertEqual(summary["codex_connection"]["state"], "missing")
+        self.assertEqual(summary["codex_connection"]["error_count"], 0)
+        self.assertEqual(summary["codex_connection"]["errors"], [])
+        self.assertEqual(len(summary["saved_codex_connection"]["observations"]), 1)
+        self.assertIn("已保存的历史观察", dialog.codex_message.get())
+        self.assertIn("不计入此次日志错误数", dialog.codex_message.get())
+        self.assertNotIn("ERROR_BODY_MARKER", dialog.summary)
 
     def test_each_explicit_read_refreshes_local_snapshot_and_replaces_previous_report(self):
         fixture, dialog = self.make_dialog()
