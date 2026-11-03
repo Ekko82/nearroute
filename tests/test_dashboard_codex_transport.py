@@ -211,6 +211,10 @@ class CodexTransportUITests(unittest.TestCase):
     def test_configuration_and_waiting_are_not_displayed_as_verified_transport(self):
         panel = self.panel()
         self.assertIn("尚未启用", panel.mode.get())
+        self.app.codex_transport_state = transport_state(affected_count=828, skipped_count=1032)
+        panel.refresh()
+        self.assertIn("待检查聊天：828", panel.scope.get())
+        self.assertIn("1032", panel.scope.get())
         self.app.codex_transport_state = transport_state(mode="http", compatible_http=True)
         panel.refresh()
         self.assertIn("配置已启用", panel.mode.get())

@@ -1446,6 +1446,7 @@ class CodexTransportDialog:
         card.columnconfigure(0, weight=1)
         self.mode = tk.StringVar()
         self.running = tk.StringVar()
+        self.scope = tk.StringVar()
         self.message = tk.StringVar()
         ttk.Label(card, textvariable=self.mode, style="Section.TLabel").grid(row=0, column=0, sticky="w")
         ttk.Label(card, textvariable=self.running, style="SurfaceMuted.TLabel").grid(row=1, column=0, sticky="w", pady=(8, 0))
@@ -1455,6 +1456,7 @@ class CodexTransportDialog:
         self.reopen_check = ttk.Checkbutton(card, text="完成配置后自动打开 Codex（推荐）", variable=self.reopen,
                                             style="Surface.TCheckbutton")
         self.reopen_check.grid(row=3, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(card, textvariable=self.scope, style="SurfaceMuted.TLabel", wraplength=740).grid(row=4, column=0, sticky="ew", pady=(10, 0))
         actions = ttk.Frame(self.window)
         actions.grid(row=3, column=0, sticky="ew", pady=(16, 0))
         self.http_button = ttk.Button(actions, text="一键启用兼容连接", style="Primary.TButton",
@@ -1500,6 +1502,11 @@ class CodexTransportDialog:
         self.mode.set(title + "\n已保存配置：" + mode)
         self.running.set("上次检查：Codex 正在运行。" if state.get("running") else
                          "上次检查：Codex 已退出。" if state.get("running") is False else "")
+        last = state.get("last_result") or {}
+        if "processed_count" in last:
+            self.scope.set(f"上次切换处理 {last['processed_count']} 个本机聊天；{last.get('preserved_count', 0)} 条不可用或异常记录保持原状。")
+        else:
+            self.scope.set(f"本机待检查聊天：{state.get('affected_count', 0)}；其他 {state.get('skipped_count', 0)} 条记录保持原状（不在本机或设置不完整）。")
         operation = owner.codex_transport_busy
         text = {"inspect": "正在读取 Codex 连接状态…", "request": "正在安排连接切换…",
                 "apply": "正在应用连接设置和处理现有聊天，请稍候…", "cancel": "正在取消待切换…"}.get(operation)

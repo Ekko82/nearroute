@@ -1,6 +1,7 @@
 """Isolated metadata migration tests: no user profile, engine, auth, or network."""
 
 from contextlib import ExitStack, contextmanager
+import ctypes
 import json
 import os
 from pathlib import Path, PureWindowsPath
@@ -8,7 +9,7 @@ import sqlite3
 import tempfile
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 import uuid
 
 import codex_history as history
@@ -22,6 +23,128 @@ def fixture_database(path):
             yield db
     finally:
         db.close()
+
+
+class NativeProcessInventoryTests(unittest.TestCase):
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(patch.object(history, "WINDOWS", True))
+        self.last_error = 0
+        self.stack.enter_context(patch.object(history.ctypes, "get_last_error",
+                                             side_effect=lambda: self.last_error, create=True))
+
+    def kernel(self, rows, *, first_error=None, next_error=18, open_ok=True, query_ok=True, close_ok=True):
+        # Handles above 32 bits make signature truncation visible on 64-bit Windows.
+        snapshot = 0x123456780000 if ctypes.sizeof(ctypes.c_void_p) == 8 else 100
+        process_handle = snapshot + 1
+        self.position = 0
+
+        def fill(pointer):
+            entry = pointer._obj
+            self.assertEqual(entry.dwSize, ctypes.sizeof(history._ProcessEntry32W))
+            row = rows[self.position]
+            entry.th32ProcessID = row["ProcessId"]
+            entry.th32ParentProcessID = row["ParentProcessId"]
+            entry.szExeFile = row["Name"]
+            return 1
+
+        def first(handle, pointer):
+            self.assertEqual(handle, snapshot)
+            self.position = 0
+            if first_error is not None or not rows:
+                self.last_error = first_error if first_error is not None else 18
+                return 0
+            return fill(pointer)
+
+        def next_process(handle, pointer):
+            self.assertEqual(handle, snapshot)
+            self.position += 1
+            if self.position >= len(rows):
+                self.last_error = next_error
+                return 0
+            return fill(pointer)
+
+        def image(handle, flags, buffer, size):
+            self.assertEqual(handle, process_handle)
+            self.assertEqual(flags, 0)
+            self.assertEqual(size._obj.value, len(buffer))
+            if query_ok:
+                buffer.value = rows[self.position].get("ExecutablePath", "")
+                size._obj.value = len(buffer.value)
+            return query_ok
+
+        kernel = SimpleNamespace(CreateToolhelp32Snapshot=Mock(return_value=snapshot),
+                                 Process32FirstW=Mock(side_effect=first), Process32NextW=Mock(side_effect=next_process),
+                                 OpenProcess=Mock(return_value=process_handle if open_ok else 0),
+                                 QueryFullProcessImageNameW=Mock(side_effect=image), CloseHandle=Mock(return_value=close_ok))
+        self.stack.enter_context(patch.object(history.ctypes, "WinDLL", return_value=kernel, create=True))
+        return kernel, snapshot, process_handle
+
+    def test_snapshot_retains_parent_ids_and_queries_only_chatgpt_with_pointer_safe_types(self):
+        rows = [{"ProcessId": 10, "ParentProcessId": 1, "Name": "CoDeX.exe"},
+                {"ProcessId": 11, "ParentProcessId": 10, "Name": "工具.exe"},
+                {"ProcessId": 12, "ParentProcessId": 1, "Name": "CHATGPT.EXE",
+                 "ExecutablePath": r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1_x64__2p2nqsd0c76g0\app\ChatGPT.exe"}]
+        kernel, snapshot, process_handle = self.kernel(rows)
+        with patch.object(history.subprocess, "run") as subprocess_run:
+            self.assertEqual(history.process_inventory(), rows)
+        subprocess_run.assert_not_called()
+        kernel.CreateToolhelp32Snapshot.assert_called_once_with(2, 0)
+        kernel.OpenProcess.assert_called_once_with(0x1000, False, 12)
+        self.assertEqual([call.args[0] for call in kernel.CloseHandle.call_args_list], [process_handle, snapshot])
+        self.assertIs(kernel.CreateToolhelp32Snapshot.restype, ctypes.c_void_p)
+        self.assertIs(kernel.OpenProcess.restype, ctypes.c_void_p)
+        self.assertIs(kernel.Process32FirstW.argtypes[0], ctypes.c_void_p)
+        self.assertIs(kernel.CloseHandle.argtypes[0], ctypes.c_void_p)
+        self.assertEqual(history._ProcessEntry32W._fields_[3], ("th32DefaultHeapID", ctypes.c_size_t))
+        self.assertEqual(ctypes.sizeof(history._ProcessEntry32W._fields_[0][1]), 4)
+
+    def test_invalid_snapshot_refuses_without_closing_invalid_handle(self):
+        for invalid in (None, 0, ctypes.c_void_p(-1).value):
+            with self.subTest(handle=invalid):
+                kernel, _, _ = self.kernel([])
+                kernel.CreateToolhelp32Snapshot.return_value = invalid
+                with self.assertRaises(history.Refused):
+                    history.process_inventory()
+                kernel.CloseHandle.assert_not_called()
+
+    def test_empty_snapshot_is_normal_but_enumeration_failures_close_and_refuse(self):
+        kernel, snapshot, _ = self.kernel([])
+        self.assertEqual(history.process_inventory(), [])
+        kernel.CloseHandle.assert_called_once_with(snapshot)
+        for first_error, next_error in ((5, 18), (None, 5)):
+            with self.subTest(first=first_error, next=next_error):
+                kernel, snapshot, _ = self.kernel([{"ProcessId": 1, "ParentProcessId": 0, "Name": "System"}],
+                                                 first_error=first_error, next_error=next_error)
+                with self.assertRaises(history.Refused):
+                    history.process_inventory()
+                kernel.CloseHandle.assert_called_once_with(snapshot)
+
+    def test_unidentifiable_chatgpt_refuses_and_closes_all_acquired_handles(self):
+        row = {"ProcessId": 42, "ParentProcessId": 1, "Name": "ChatGPT.exe", "ExecutablePath": ""}
+        for open_ok, query_ok in ((False, True), (True, False), (True, True)):
+            with self.subTest(open=open_ok, query=query_ok):
+                kernel, snapshot, process_handle = self.kernel([row], open_ok=open_ok, query_ok=query_ok)
+                with self.assertRaises(history.Refused) as caught:
+                    history.process_inventory()
+                self.assertIn("identify", str(caught.exception))
+                expected = [process_handle, snapshot] if open_ok else [snapshot]
+                self.assertEqual([call.args[0] for call in kernel.CloseHandle.call_args_list], expected)
+
+    def test_failed_handle_cleanup_refuses(self):
+        kernel, snapshot, _ = self.kernel([], close_ok=False)
+        with self.assertRaises(history.Refused):
+            history.process_inventory()
+        kernel.CloseHandle.assert_called_once_with(snapshot)
+
+    def test_unavailable_native_api_and_nonwindows_refuse(self):
+        with patch.object(history.ctypes, "WinDLL", side_effect=OSError("private image path"), create=True):
+            with self.assertRaises(history.Refused) as caught:
+                history.process_inventory()
+            self.assertNotIn("private", str(caught.exception))
+        with patch.object(history, "WINDOWS", False), self.assertRaises(history.Refused):
+            history.process_inventory()
 
 
 class HistoryMigrationTests(unittest.TestCase):
@@ -202,6 +325,48 @@ supports_standalone_web_search = true
             history.assert_no_user_codex(10)
             with self.assertRaises(history.Refused):
                 history.assert_no_user_codex(12)
+
+    def test_official_codex_wrapper_blocks_migration_but_other_chatgpt_does_not(self):
+        official = r"C:\Program Files\WindowsApps\OpenAI.Codex_26.1_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+        row = {"Name": "ChatGPT.exe", "ProcessId": 21, "ParentProcessId": 0}
+        for path in (official, official.upper(), "\\\\?\\" + official):
+            with self.subTest(path=path), patch.object(history, "process_inventory", return_value=[dict(row, ExecutablePath=path)]):
+                report = self.migrate()
+                self.assertFalse(report["ok"])
+                self.assertFalse(report["mutation_attempted"])
+                self.assertNotIn("backup_directory", report)
+        for path in (r"C:\Apps\ChatGPT.exe",
+                     official.replace("OpenAI.Codex_", "OpenAI.ChatGPT-Desktop_"),
+                     official.replace("WindowsApps", "WindowsApps-copy"),
+                     official.replace("2p2nqsd0c76g0", "anotherpublisher")):
+            with self.subTest(path=path), patch.object(history, "process_inventory", return_value=[dict(row, ExecutablePath=path)]):
+                history.assert_no_user_codex()
+        with patch.object(history, "process_inventory", return_value=[row]), self.assertRaises(history.Refused):
+            history.assert_no_user_codex()
+        self.assertFalse(self.calls)
+
+    def test_owned_mcp_descendant_wrapper_is_excluded_but_unrelated_wrapper_blocks(self):
+        official = r"D:\WindowsApps\OpenAI.Codex_26.1_x64__2p2nqsd0c76g0\app\ChatGPT.exe"
+        rows = [{"Name": "codex.exe", "ProcessId": 10, "ParentProcessId": 1},
+                {"Name": "mcp.exe", "ProcessId": 11, "ParentProcessId": 10},
+                {"Name": "ChatGPT.exe", "ProcessId": 12, "ParentProcessId": 11, "ExecutablePath": official}]
+        with patch.object(history, "process_inventory", return_value=rows):
+            history.assert_no_user_codex(10)
+            rows.append({"Name": "ChatGPT.exe", "ProcessId": 21, "ParentProcessId": 1, "ExecutablePath": official})
+            with self.assertRaises(history.Refused):
+                history.assert_no_user_codex(10)
+
+    def test_running_ui_is_rechecked_before_every_chat(self):
+        wrapper = {"Name": "ChatGPT.exe", "ProcessId": 21, "ParentProcessId": 1,
+                   "ExecutablePath": r"C:\WindowsApps\OpenAI.Codex_26.1_x64__2p2nqsd0c76g0\app\ChatGPT.exe"}
+        with patch.object(history, "process_inventory", side_effect=[[], [], [], [wrapper]]) as inventory:
+            report = self.migrate()
+        self.assertFalse(report["ok"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(inventory.call_count, 4)
+        self.assertEqual(self.closed, 1)
+        self.assertEqual(report["targets"][0]["state"], "resumed")
+        self.assertEqual(report["targets"][1]["state"], "inspected")
 
     def test_missing_model_effort_archived_or_original_refuses_before_backup(self):
         for assignment in ("model=NULL", "reasoning_effort=NULL", "archived=1"):

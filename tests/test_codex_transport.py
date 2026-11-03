@@ -32,6 +32,7 @@ class TransportTests(unittest.TestCase):
         self.capabilities = Mock(return_value={"version": "codex-cli 0.166.0-alpha.5.1", "metadata_resume_supported": True})
         self.startup = Mock(return_value={"startup_validated": True})
         self.migration_calls = []
+        self.preflight = Mock(return_value=(self.home / "state_5.sqlite", 0, []))
         for name, value in (("discover_desktop", transport._DESKTOP_APP_ID), ("open_desktop", None)):
             patcher = patch.object(transport, name, return_value=value)
             setattr(self, name, patcher.start())
@@ -41,12 +42,18 @@ class TransportTests(unittest.TestCase):
     def new_manager(self):
         return transport.TransportManager(root=self.root, home=self.home, engine=self.engine,
                                           process_check=self.process_check, migrate=self.migrate,
-                                          capability_check=self.capabilities, startup_check=self.startup)
+                                          capability_check=self.capabilities, startup_check=self.startup,
+                                          preflight=self.preflight)
+
+    def rollout(self, thread_id):
+        path = self.home / ("rollout-" + thread_id + ".jsonl")
+        path.write_text(json.dumps({"type": "session_meta", "payload": {"id": thread_id}}) + "\n", encoding="utf-8")
+        return str(path)
 
     def create_threads(self, rows):
         with self.database() as db:
-            db.execute("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,model TEXT,reasoning_effort TEXT,archived INTEGER)")
-            db.executemany("INSERT INTO threads VALUES(?,?,?,?,?)", rows)
+            db.execute("CREATE TABLE threads(id TEXT PRIMARY KEY,model_provider TEXT,model TEXT,reasoning_effort TEXT,archived INTEGER,rollout_path TEXT)")
+            db.executemany("INSERT INTO threads VALUES(?,?,?,?,?,?)", [(*row, self.rollout(row[0])) for row in rows])
 
     @contextmanager
     def database(self):
@@ -220,6 +227,63 @@ class TransportTests(unittest.TestCase):
         ownership = self.manager._load("ownership")
         self.assertEqual(ownership["targets"], {"target": "openai"})
 
+    def test_synced_missing_or_external_rollouts_are_preserved_without_blocking_local_chats(self):
+        self.create_threads([("local", "openai", "gpt-6.1-sol", "ultra", 0),
+                             ("missing", "openai", "gpt-6.1-sol", "ultra", 0),
+                             ("external", "openai", "gpt-6.1-sol", "ultra", 0)])
+        (self.home / "rollout-missing.jsonl").unlink()
+        external = self.root / "rollout-external.jsonl"
+        external.write_text('original external history\n', encoding="utf-8")
+        with self.database() as db:
+            db.execute("UPDATE threads SET rollout_path=? WHERE id='external'", (str(external),))
+        before = self.manager.inspect()
+        self.assertEqual((before["affected_count"], before["skipped_count"]), (1, 2))
+        self.apply_http()
+        self.assertEqual(self.migration_calls, [(["local"], transport.PROVIDER_ID, None)])
+        with self.database() as db:
+            self.assertEqual(db.execute("SELECT id,model_provider FROM threads ORDER BY id").fetchall(),
+                             [("external", "openai"), ("local", transport.PROVIDER_ID), ("missing", "openai")])
+        self.assertEqual(external.read_text('utf-8'), 'original external history\n')
+
+    def test_real_metadata_preflight_failure_leaves_original_configuration_and_ownership_untouched(self):
+        self.create_threads([("broken", "openai", "gpt-6.1-sol", "ultra", 0)])
+        rollout = self.home / "rollout-broken.jsonl"
+        rollout.write_text('{"type":"session_meta","payload":{"id":"wrong-id"}}\n', encoding="utf-8")
+        self.manager.preflight = None
+        self.manager.request_mode("http")
+        result = self.manager.process_pending()
+        self.assertEqual(result["status"], "error")
+        self.assertIn("尚未修改", result["explanation"])
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertFalse((self.manager.state / "ownership.json").exists())
+        self.startup.assert_not_called()
+        self.assertEqual(self.migration_calls, [])
+
+    def test_an_unreadable_old_rollout_does_not_prevent_valid_local_chats_from_switching(self):
+        self.create_threads([("local", "openai", "gpt-6.1-sol", "ultra", 0),
+                             ("corrupt", "openai", "gpt-6.1-sol", "ultra", 0)])
+        broken = self.home / "rollout-corrupt.jsonl"
+        broken.write_bytes(b'\xff\xff invalid original history\n')
+        self.manager.preflight = None
+        result = self.apply_http()
+        self.assertEqual(self.migration_calls, [(["local"], transport.PROVIDER_ID, None)])
+        self.assertEqual(broken.read_bytes(), b'\xff\xff invalid original history\n')
+        with self.database() as db:
+            self.assertEqual(db.execute("SELECT model_provider FROM threads WHERE id='corrupt'").fetchone(), ("openai",))
+        self.assertEqual(result["last_result"]["preserved_count"], 1)
+        self.assertEqual(result["last_result"]["processed_count"], 1)
+        self.assertEqual(self.manager._load("ownership")["targets"], {"local": "openai"})
+
+    def test_insufficient_backup_space_is_reported_before_configuration_is_changed(self):
+        self.create_threads([("target", "openai", "gpt-6.1-sol", "ultra", 0)])
+        self.manager.request_mode("http")
+        with patch.object(transport.shutil, "disk_usage", return_value=Mock(free=0)):
+            result = self.manager.process_pending()
+        self.assertIn("备份空间不足", result["explanation"])
+        self.assertEqual(self.config.read_bytes(), self.original)
+        self.assertFalse((self.manager.state / "ownership.json").exists())
+        self.assertEqual(self.migration_calls, [])
+
     def test_restore_owns_only_selected_fields_and_preserves_new_settings(self):
         self.create_threads([("target", "openai", "gpt-6-sol", "high", 0)])
         self.apply_http()
@@ -228,7 +292,7 @@ class TransportTests(unittest.TestCase):
         # Current saved per-chat settings can evolve after migration.
         with self.database() as db:
             db.execute("UPDATE threads SET model='user-model',reasoning_effort='max'")
-            db.execute("INSERT INTO threads VALUES('new-chat','nearroute-http','gpt-6-astra','ultra',0)")
+            db.execute("INSERT INTO threads VALUES('new-chat','nearroute-http','gpt-6-astra','ultra',0,?)", (self.rollout("new-chat"),))
         self.manager.request_mode("original")
         result = self.manager.process_pending()
         self.assertTrue(result["ok"], result)
@@ -243,7 +307,7 @@ class TransportTests(unittest.TestCase):
         self.apply_http()
         with self.database() as db:
             db.execute("UPDATE threads SET archived=1")
-            db.execute("INSERT INTO threads VALUES('empty','nearroute-http',NULL,NULL,0)")
+            db.execute("INSERT INTO threads VALUES('empty','nearroute-http',NULL,NULL,0,NULL)")
         self.manager.request_mode("original")
         result = self.manager.process_pending()
         self.assertTrue(result["ok"], result)
@@ -367,6 +431,7 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(self.migration_calls, [(["target"], transport.PROVIDER_ID, None)] * 2)
         self.assertNotIn("checkpoint", restarted._load("ownership"))
         self.assertEqual(restarted._load("ownership")["targets"], {"target": "openai"})
+        self.assertEqual(result["last_result"]["preserved_count"], 0)
 
     def test_retry_refuses_changed_original_prefix_before_new_baseline_or_write(self):
         rollout = self.failed_resume_fixture()

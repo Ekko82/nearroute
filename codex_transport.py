@@ -15,6 +15,7 @@ import ntpath
 import os
 from pathlib import Path
 import re
+import shutil
 import sqlite3
 import subprocess
 import tempfile
@@ -418,9 +419,24 @@ def _threads(home, config):
         db = sqlite3.connect(database.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
         try:
             db.row_factory = sqlite3.Row
-            return [dict(row) for row in db.execute(
-                "SELECT id,model_provider,model,reasoning_effort,archived FROM threads "
+            rows = [dict(row) for row in db.execute(
+                "SELECT id,model_provider,model,reasoning_effort,archived,rollout_path FROM threads "
                 "WHERE model_provider IN ('openai','nearroute-http')")]
+            from codex_history import comparison_path, Refused as HistoryRefused
+            for row in rows:
+                row["local_rollout_available"] = False
+                value = row.get("rollout_path")
+                if not isinstance(value, str) or not value:
+                    continue
+                try:
+                    path = Path(value)
+                    comparison_path(path)
+                    path = path.resolve(strict=True)
+                    comparison_path(path).relative_to(comparison_path(home.resolve()))
+                    row["local_rollout_available"] = path.is_file() and row["id"] in path.name
+                except (OSError, ValueError, HistoryRefused):
+                    pass  # Synced/relocated records remain untouched on this device.
+            return rows
         finally:
             db.close()
     except sqlite3.Error:
@@ -429,6 +445,7 @@ def _threads(home, config):
 
 def _eligible(rows, provider):
     return [row for row in rows if not row["archived"] and row["model_provider"] == provider
+            and row.get("local_rollout_available") is True
             and all(isinstance(row[key], str) and bool(row[key].strip()) for key in ("model", "reasoning_effort"))]
 
 
@@ -485,7 +502,7 @@ def _record_checkpoint_result(owned, result):
 
 class TransportManager:
     def __init__(self, root=None, home=None, engine=None, *, process_check=None, migrate=None,
-                 capability_check=None, startup_check=None):
+                 capability_check=None, startup_check=None, preflight=None):
         self.root = Path(root) if root is not None else ROOT
         self.home = (Path(home) if home is not None else Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")).expanduser().resolve()
         self.engine = Path(engine).resolve() if engine is not None else None
@@ -495,6 +512,7 @@ class TransportManager:
         self.migrate = migrate
         self.capability_check = capability_check or validate_capabilities
         self.startup_check = startup_check or validate_startup
+        self.preflight = preflight
 
     def _load(self, name):
         path = self.state / (name + ".json")
@@ -669,6 +687,8 @@ class TransportManager:
                 targets = _operation_targets(rows, owned, pending["mode"])
                 if pending["mode"] == "http":
                     candidate, expected, owned = prepare_http(before, config, owned)
+                    targets = self._preflight(expected, targets, PROVIDER_ID,
+                                              allow_skip=not bool(owned.get("checkpoint")))
                     owned["home"] = str(self.home)
                     for row in targets:
                         owned.setdefault("targets", {}).setdefault(row["id"], row["model_provider"])
@@ -692,6 +712,7 @@ class TransportManager:
                     # settings and archived chats retain a usable definition.
                     retain = any(row["model_provider"] == PROVIDER_ID and row not in targets for row in rows)
                     candidate, expected = prepare_original(before, config, owned, retain)
+                    self._preflight(config, targets, None, mapping)
                     _prepare_checkpoint(owned, targets)
                     self._save("ownership", owned)
                     result = self._migrate(engine, targets, None, mapping)
@@ -707,8 +728,13 @@ class TransportManager:
                     raise Refused("部分对话切换尚未完成，备份已保留。可重试或恢复原设置。")
                 (self.state / "pending.json").unlink(missing_ok=True)
                 self._journal("completed", mode=pending["mode"], target_count=len(targets))
+                target_ids = {row["id"] for row in targets}
                 completed = {"mode": pending["mode"], "home": str(self.home), "completed_at": _now(),
                              "provider": expected.get("model_provider", "openai"),
+                             "processed_count": len(targets),
+                             "preserved_count": sum(not row["archived"] and row["model_provider"] ==
+                                                    ("openai" if pending["mode"] == "http" else PROVIDER_ID)
+                                                    and row["id"] not in target_ids for row in rows),
                              "reopen_requested": pending.get("reopen") is True, "reopened": False,
                              "reopen_error": "", "reopen_skipped": False}
                 # Consume the switch intent before opening the app. A launch failure
@@ -737,6 +763,42 @@ class TransportManager:
                 return dict(self.inspect(), ok=False, status="error", explanation=reason)
             finally:
                 _release_home_lock(home_lock)
+
+    def _preflight(self, config, targets, provider, original=None, *, allow_skip=False):
+        if not targets:
+            return []
+        from codex_history import inspect_targets, Refused as HistoryRefused
+        check = self.preflight or inspect_targets
+        valid, skipped, total_bytes, database_bytes = [], [], 0, 0
+        try:
+            for row in targets:
+                try:
+                    _database, size, inspected = check(self.home, config, [row["id"]], provider, original or {})
+                except (HistoryRefused, OSError, ValueError) as error:
+                    if not allow_skip:
+                        raise
+                    skipped.append({"thread_id": row["id"], "error_type": type(error).__name__,
+                                    "reason": str(error) if isinstance(error, HistoryRefused) else "unavailable rollout metadata"})
+                    continue
+                database_bytes = max(database_bytes, size)
+                total_bytes += sum(item["size"] for item in inspected)
+                valid.append(row)
+            self._save("preflight", {"home": str(self.home), "provider": provider,
+                                     "checked_at": _now(), "valid_count": len(valid),
+                                     "backup_bytes": database_bytes + total_bytes,
+                                     "skipped": skipped})
+            if not valid:
+                raise Refused("本地聊天记录均未通过预检查，尚未修改 Codex 配置；原记录已保留，请检查诊断记录。")
+            required = database_bytes + total_bytes + len(self.config.read_bytes()) + 65536
+            if shutil.disk_usage(self.home).free < required:
+                raise Refused("备份空间不足，尚未修改 Codex 配置；请清理磁盘空间后重试。")
+            return valid
+        except Refused:
+            raise
+        except Exception as error:
+            self._journal("preflight_failed", error_type=type(error).__name__,
+                          reason=str(error) if isinstance(error, HistoryRefused) else "metadata validation failed")
+            raise Refused("本地聊天记录预检查未通过，尚未修改 Codex 配置；原记录已保留，请检查诊断记录。") from None
 
     def _migrate(self, engine, targets, provider, original=None):
         if not targets:

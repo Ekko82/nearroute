@@ -47,15 +47,88 @@ class Refused(Exception):
     pass
 
 
+class _ProcessEntry32W(ctypes.Structure):
+    _fields_ = [("dwSize", ctypes.c_uint32), ("cntUsage", ctypes.c_uint32),
+                ("th32ProcessID", ctypes.c_uint32), ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", ctypes.c_uint32), ("cntThreads", ctypes.c_uint32),
+                ("th32ParentProcessID", ctypes.c_uint32), ("pcPriClassBase", ctypes.c_int32),
+                ("dwFlags", ctypes.c_uint32), ("szExeFile", ctypes.c_wchar * 260)]
+
+
+def _process_api():
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [ctypes.c_uint32, ctypes.c_uint32]
+    kernel.CreateToolhelp32Snapshot.restype = ctypes.c_void_p
+    for name in ("Process32FirstW", "Process32NextW"):
+        function = getattr(kernel, name)
+        function.argtypes = [ctypes.c_void_p, ctypes.POINTER(_ProcessEntry32W)]
+        function.restype = ctypes.c_int32
+    kernel.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int32, ctypes.c_uint32]
+    kernel.OpenProcess.restype = ctypes.c_void_p
+    kernel.QueryFullProcessImageNameW.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                               ctypes.POINTER(ctypes.c_wchar), ctypes.POINTER(ctypes.c_uint32)]
+    kernel.QueryFullProcessImageNameW.restype = ctypes.c_int32
+    kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel.CloseHandle.restype = ctypes.c_int32
+    return kernel
+
+
+def _process_image(kernel, pid):
+    failure = "Cannot identify a ChatGPT desktop process; exit it normally before migration."
+    handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        raise Refused(failure)
+    try:
+        buffer = ctypes.create_unicode_buffer(32768)
+        size = ctypes.c_uint32(len(buffer))
+        if not kernel.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)) or not buffer.value:
+            raise Refused(failure)
+        return buffer.value
+    finally:
+        if not kernel.CloseHandle(handle):
+            raise Refused("Cannot close a process-query handle; no migration is permitted.")
+
+
 def process_inventory():
-    command = ("Get-CimInstance Win32_Process | "
-               "Select-Object ProcessId,ParentProcessId,Name | ConvertTo-Json -Compress")
-    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
-                            capture_output=True, timeout=20, creationflags=FLAGS)
-    if result.returncode:
-        raise Refused("Cannot verify running Windows processes; no migration is permitted.")
-    rows = json.loads(result.stdout.decode("utf-8-sig"))
-    return rows if isinstance(rows, list) else ([rows] if rows else [])
+    """Take a fresh native snapshot for every gate, without launching PowerShell."""
+    failure = "Cannot verify running Windows processes; no migration is permitted."
+    if not WINDOWS:
+        raise Refused("This migration helper supports Windows only.")
+    try:
+        kernel = _process_api()
+    except (AttributeError, OSError):
+        raise Refused(failure) from None
+    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, 0, ctypes.c_void_p(-1).value):
+        raise Refused(failure)
+    try:
+        entry = _ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        available = kernel.Process32FirstW(snapshot, ctypes.byref(entry))
+        rows = []
+        while available:
+            row = {"ProcessId": entry.th32ProcessID, "ParentProcessId": entry.th32ParentProcessID,
+                   "Name": entry.szExeFile}
+            if row["Name"].casefold() == "chatgpt.exe":
+                row["ExecutablePath"] = _process_image(kernel, row["ProcessId"])
+            rows.append(row)
+            available = kernel.Process32NextW(snapshot, ctypes.byref(entry))
+        if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES is the normal end.
+            raise Refused(failure)
+        return rows
+    finally:
+        if not kernel.CloseHandle(snapshot):
+            raise Refused("Cannot close a process snapshot; no migration is permitted.")
+
+
+def _is_codex_wrapper(path):
+    if not isinstance(path, str) or not path:
+        raise Refused("Cannot identify a ChatGPT desktop process; exit it normally before migration.")
+    parts = PureWindowsPath(path).parts
+    return (len(parts) >= 5 and PureWindowsPath(path).is_absolute()
+            and parts[-4].casefold() == "windowsapps"
+            and re.fullmatch(r"openai\.codex_[^\\]+__2p2nqsd0c76g0", parts[-3], re.IGNORECASE) is not None
+            and parts[-2].casefold() == "app" and parts[-1].casefold() == "chatgpt.exe")
 
 
 def assert_no_user_codex(owned_pid=None):
@@ -66,8 +139,10 @@ def assert_no_user_codex(owned_pid=None):
         if children <= owned:
             break
         owned.update(children)
-    running = [row["ProcessId"] for row in rows
-               if str(row.get("Name", "")).lower() == "codex.exe" and row["ProcessId"] not in owned]
+    running = [row["ProcessId"] for row in rows if row["ProcessId"] not in owned
+               and (str(row.get("Name", "")).casefold() == "codex.exe"
+                    or (str(row.get("Name", "")).casefold() == "chatgpt.exe"
+                        and _is_codex_wrapper(row.get("ExecutablePath"))))]
     if running:
         raise Refused("Codex UI/engine is running. Exit Codex normally before applying the switch.")
 
