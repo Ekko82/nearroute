@@ -7,6 +7,7 @@ from pathlib import Path
 import socket
 import subprocess
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 import urllib.error
@@ -23,7 +24,7 @@ class UpdaterProxyTests(unittest.TestCase):
     @contextmanager
     def windows_environment(self, environment, proxies=None):
         with patch.dict(os.environ, environment, clear=True), \
-             patch.object(updater.sys, "platform", "win32"), \
+             patch.object(updater, "sys", SimpleNamespace(platform="win32")), \
              patch.object(urllib.request, "getproxies_registry",
                           return_value=SYSTEM_PROXIES if proxies is None else proxies, create=True) as registry:
             yield registry
