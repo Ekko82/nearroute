@@ -153,12 +153,22 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def _update_proxies():
+    proxies = urllib.request.getproxies()
+    if (sys.platform == "win32" and set(proxies) == {"no"}
+            and not any(name.lower() in {"http_proxy", "https_proxy", "all_proxy"} for name in os.environ)):
+        # A bypass-only environment hides Windows routes in urllib's lookup.
+        proxies = urllib.request.getproxies_registry() | proxies
+    return proxies
+
+
 def _open_url(url):
     _https_url(url)
     request = urllib.request.Request(url, headers={"User-Agent": "NearRoute-Updater",
                                                   "Accept": "application/vnd.github+json"})
     try:
-        return urllib.request.build_opener(SafeRedirect()).open(request, timeout=15)
+        return urllib.request.build_opener(urllib.request.ProxyHandler(_update_proxies()),
+                                           SafeRedirect()).open(request, timeout=15)
     except urllib.error.HTTPError as error:
         error.close()
         raise
@@ -272,6 +282,12 @@ def _git(root, *arguments, message="无法检查源码更新，请确认 Git 可
         if key.startswith("GIT_TRACE") or key in {"GIT_CURL_VERBOSE", "GIT_DIR", "GIT_WORK_TREE",
                                                  "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_NAMESPACE"}:
             env.pop(key, None)
+    if (sys.platform == "win32" and arguments[:1] == ("fetch",)
+            and not any(name.lower() == "https_proxy" for name in env)):
+        proxy = _update_proxies().get("https")
+        if proxy and not urllib.request.proxy_bypass("github.com"):
+            # Git's explicit http.proxy configuration retains priority over this fallback.
+            env["HTTPS_PROXY"] = proxy
     try:
         result = subprocess.run(["git", "-C", str(root), *arguments], env=env,
                                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
