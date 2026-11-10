@@ -1,6 +1,7 @@
 {
   "enabled": true,
   "codex_recovery_enabled": true,
+  "switch_on_improvement": false,
   "controller": "http://127.0.0.1:9790",
   "controller_secret_env": "",
   "controller_api_mode": "standard",

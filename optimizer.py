@@ -53,6 +53,7 @@ TZ = timezone(timedelta(hours=8))
 DEFAULTS = {
     "enabled": True,
     "codex_recovery_enabled": True,
+    "switch_on_improvement": True,
     "controller": "http://127.0.0.1:9790",
     "controller_secret_env": "",
     "controller_api_mode": "standard",
@@ -224,7 +225,7 @@ def validate_config(raw):
         raise ValueError("enabled 必须为 true 或 false")
     if type(cfg["prefer_japan"]) is not bool:
         raise ValueError("prefer_japan 必须为 true 或 false")
-    for key in ("auto_detect_client", "auto_select_group", "codex_recovery_enabled"):
+    for key in ("auto_detect_client", "auto_select_group", "codex_recovery_enabled", "switch_on_improvement"):
         if type(cfg[key]) is not bool:
             raise ValueError(key + " 必须为 true 或 false")
     if cfg["scan_mode"] not in ("adaptive", "regions", "nodes", "all"):
@@ -462,7 +463,7 @@ def probe_identity(cfg):
 def selection_policy(cfg):
     return (cfg["scan_mode"], tuple(cfg["scan_regions"]), tuple(cfg["scan_nodes"]),
             cfg["prefer_japan"], cfg["japan_poor_latency_ms"], cfg["japan_fallback_score_ratio"],
-            probe_identity(cfg), state_context(cfg), cfg["codex_recovery_enabled"])
+            probe_identity(cfg), state_context(cfg), cfg["codex_recovery_enabled"], cfg["switch_on_improvement"])
 
 
 def select_shortlist(fresh, current, limit, prefer_japan=True):
@@ -2313,6 +2314,9 @@ class Optimizer:
             if recovering:
                 candidate = next((row["name"] for row in stats if row["eligible"]), None)
                 reason = "Codex 持续连接异常，没有尚未尝试且通过探测的候选节点，继续观察"
+            elif not self.cfg["switch_on_improvement"] and health["ok"] and current and not initial_selection:
+                candidate = None
+                reason = "稳定模式保持当前可用线路"
             else:
                 candidate, reason = choose_candidate(
                     [row for row in stats if row["name"] not in tried], current,

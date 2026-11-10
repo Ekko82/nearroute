@@ -233,10 +233,58 @@ class CodexRecoveryTests(unittest.TestCase):
             self.assertEqual(fixture.api.select_calls, [("Main", "JP fast")])
             self.assertEqual(len(fixture.helper.codex_recovery_budget()[1]), 1)
 
+    def test_stable_mode_holds_healthy_route_after_cooldown_but_real_errors_recover(self):
+        with self.runtime() as fixture:
+            fixture.cfg["switch_on_improvement"] = False
+            fixture.api.proxies["SG stable"] = {"type": "Trojan"}
+            fixture.api.proxies["Main"]["all"].append("SG stable")
+            fixture.api.delays["SG stable"] = 200
+            optimizer.request_manual_selection("SG stable")
+            self.assertTrue(fixture.helper.process_manual_selection())
+            fixture.clock[0] += fixture.cfg["switch_cooldown_seconds"] + 1
+            self.assertLess(fixture.helper.manual_until, fixture.clock[0])
+
+            fixture.helper.scan()
+
+            self.assertEqual(fixture.api.select_calls, [("Main", "SG stable")])
+            self.assertEqual(fixture.helper.status["message"], "稳定模式保持当前可用线路")
+            self.errors(fixture)
+            fixture.clock[0] += 60
+            fixture.helper.scan()
+            self.assertEqual(fixture.api.select_calls[-1], ("Main", "JP old"))
+            self.assertEqual(len(fixture.api.select_calls), 2)
+            self.assertIn("正在观察", fixture.helper.status["message"])
+
+    def test_stable_mode_keeps_initial_japan_selection_and_get_fault_recovery(self):
+        for initial in (True, False):
+            with self.subTest(initial=initial), self.runtime() as fixture:
+                fixture.cfg["switch_on_improvement"] = False
+                fixture.api.proxies["SG stable"] = {"type": "Trojan"}
+                fixture.api.proxies["Main"]["all"].append("SG stable")
+                fixture.api.delays["SG stable"] = 200
+                if initial:
+                    fixture.api.proxies["Main"]["now"] = "SG stable"
+                    fixture.helper = optimizer.Optimizer()
+                    fixture.helper.tick_health()
+                    self.assertEqual(fixture.helper.record, {})
+                else:
+                    optimizer.request_manual_selection("SG stable")
+                    self.assertTrue(fixture.helper.process_manual_selection())
+                    fixture.clock[0] += fixture.cfg["switch_cooldown_seconds"] + 1
+                    fixture.verify.side_effect = lambda *_args, **_kwargs: {
+                        "ok": fixture.api.proxies["Main"]["now"] != "SG stable"}
+
+                fixture.helper.scan()
+
+                self.assertEqual(fixture.api.select_calls[-1], ("Main", "JP old"))
+                self.assertEqual(len(fixture.api.select_calls), 1 if initial else 2)
+
     def test_flag_defaults_on_and_requires_a_boolean(self):
-        self.assertTrue(optimizer.validate_config({})["codex_recovery_enabled"])
-        with self.assertRaisesRegex(ValueError, "codex_recovery_enabled"):
-            optimizer.validate_config({"codex_recovery_enabled": "true"})
+        for flag in ("codex_recovery_enabled", "switch_on_improvement"):
+            with self.subTest(flag=flag):
+                self.assertTrue(optimizer.validate_config({})[flag])
+                with self.assertRaisesRegex(ValueError, flag):
+                    optimizer.validate_config({flag: "true"})
 
 
 if __name__ == "__main__":
