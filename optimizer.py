@@ -52,6 +52,7 @@ PROBE_REQUEST_TIMEOUT = 7.0
 TZ = timezone(timedelta(hours=8))
 DEFAULTS = {
     "enabled": True,
+    "codex_recovery_enabled": True,
     "controller": "http://127.0.0.1:9790",
     "controller_secret_env": "",
     "controller_api_mode": "standard",
@@ -223,7 +224,7 @@ def validate_config(raw):
         raise ValueError("enabled 必须为 true 或 false")
     if type(cfg["prefer_japan"]) is not bool:
         raise ValueError("prefer_japan 必须为 true 或 false")
-    for key in ("auto_detect_client", "auto_select_group"):
+    for key in ("auto_detect_client", "auto_select_group", "codex_recovery_enabled"):
         if type(cfg[key]) is not bool:
             raise ValueError(key + " 必须为 true 或 false")
     if cfg["scan_mode"] not in ("adaptive", "regions", "nodes", "all"):
@@ -461,7 +462,7 @@ def probe_identity(cfg):
 def selection_policy(cfg):
     return (cfg["scan_mode"], tuple(cfg["scan_regions"]), tuple(cfg["scan_nodes"]),
             cfg["prefer_japan"], cfg["japan_poor_latency_ms"], cfg["japan_fallback_score_ratio"],
-            probe_identity(cfg), state_context(cfg))
+            probe_identity(cfg), state_context(cfg), cfg["codex_recovery_enabled"])
 
 
 def select_shortlist(fresh, current, limit, prefer_japan=True):
@@ -1417,6 +1418,8 @@ class Optimizer:
         self.recovery_until = 0.0
         self.recovery_scan_pending = False
         self.observed_selection = None
+        self.observed_since = time.time()
+        self.codex_errors = {}
         self.tentative = False
         self.last_client_detection = -math.inf
         self.sync_probe_history()
@@ -1473,6 +1476,8 @@ class Optimizer:
             self.next_scan = 0
         if self.cfg["codex_log_db"] != previous["codex_log_db"]:
             self.signals = LogSignals(self.cfg["codex_log_db"])
+        if any(self.cfg[key] != previous[key] for key in ("enabled", "codex_recovery_enabled", "codex_log_db")):
+            self.reset_codex_observation(self.observed_selection)
 
     def adapt_client(self):
         """Recover an unavailable client/group while this helper owns the writer lock."""
@@ -1532,7 +1537,7 @@ class Optimizer:
         if context != self.state_context:
             self.record = current_selection(self.cfg)
             self.manual_until = self.record.get("manual_until", 0.0)
-            self.observed_selection = None
+            self.reset_codex_observation(None)
             self.failures = 0
             self.scan_display_names = []
             self.next_scan = self.last_scan = self.last_health = self.last_signal_poll = 0
@@ -1616,11 +1621,84 @@ class Optimizer:
             self.recovery_scan_pending = True
         self.status["transport_recovery_until"] = iso(self.recovery_until) if now < self.recovery_until else None
         for observation in self.signals.error_observations:
+            self.record_codex_error(observation, now)
             try:
                 event("codex_transport_error", **observation)
             except OSError:
                 # Diagnostic storage must not change recovery or node selection.
                 pass
+
+    def reset_codex_observation(self, path):
+        self.observed_selection = path
+        self.observed_since = time.time()
+        self.codex_errors = {}
+
+    def record_codex_error(self, observation, now):
+        if (getattr(self, "observed_selection", None) is None
+                or not self.cfg["codex_recovery_enabled"] or not self.cfg["enabled"]
+                or observation.get("transport") not in ("responses_http", "responses_websocket")):
+            return
+        try:
+            request = datetime.fromisoformat(observation["request_at"])
+            error = datetime.fromisoformat(observation["error_at"])
+            if request.tzinfo is None or error.tzinfo is None:
+                return
+            started, failed = request.timestamp(), error.timestamp()
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return
+        if (self.observed_since <= started <= failed <= now
+                and failed >= now - 600 and observation.get("error_kind") in ("decode", "send", "tls", "reset", "websocket")):
+            self.codex_errors[(started, observation["error_kind"])] = failed
+
+    def codex_recovery_due(self):
+        cutoff = time.time() - 600
+        self.codex_errors = {key: at for key, at in self.codex_errors.items() if at >= cutoff}
+        return (self.cfg["enabled"] and self.cfg["codex_recovery_enabled"]
+                and len(self.codex_errors) >= 3)
+
+    def codex_recovery_budget(self):
+        """Read the durable attempt budget before choosing or changing a node."""
+        path = STATE / "codex-recovery.json"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8-sig"))
+        except FileNotFoundError:
+            data = {"schema_version": 1, "attempts": []}
+        if (not isinstance(data, dict) or data.get("schema_version") != 1
+                or not isinstance(data.get("attempts"), list)):
+            raise ValueError("Codex 恢复记录格式无效")
+        for item in data["attempts"]:
+            if (not isinstance(item, dict) or not isinstance(item.get("context"), list)
+                    or type(item.get("at")) not in (int, float) or not math.isfinite(item["at"])
+                    or not isinstance(item.get("previous"), str) or not isinstance(item.get("candidate"), str)):
+                raise ValueError("Codex 恢复记录格式无效")
+        now = time.time()
+        data["attempts"] = [item for item in data["attempts"] if item["at"] > now - 3600]
+        attempts = [item for item in data["attempts"] if item["context"] == list(self.state_context)]
+        last_attempt = max((item["at"] for item in attempts), default=0)
+        last_change = max(last_attempt, self.record.get("last_switch_at", 0))
+        reason = None
+        if len(attempts) >= int(self.cfg["max_candidate_attempts"]):
+            reason = "Codex 持续连接异常，本小时恢复尝试已达上限，保持当前线路并继续观察"
+        elif last_change and now < last_change + self.cfg["switch_cooldown_seconds"]:
+            reason = "Codex 持续连接异常，等待恢复尝试冷却结束"
+        return data, attempts, reason
+
+    def reserve_codex_recovery(self, previous, candidate):
+        if not self.codex_recovery_due() or time.time() < self.manual_until:
+            return False
+        try:
+            data, attempts, reason = self.codex_recovery_budget()
+            tried = {item[key] for item in attempts for key in ("previous", "candidate")}
+            if reason or candidate in tried:
+                self.write_status(message=reason or "该节点本小时已参与 Codex 恢复尝试，继续观察当前线路")
+                return False
+            data["attempts"].append({"context": list(self.state_context), "at": time.time(),
+                                     "previous": previous, "candidate": candidate})
+            atomic_json(STATE / "codex-recovery.json", data)
+        except (OSError, ValueError):
+            self.write_status(message="无法保存 Codex 恢复记录，已停止本次恢复换点")
+            return False
+        return True
 
     def transport_recovery_active(self, *, force=False):
         self.poll_transport_signals(force=force)
@@ -1720,7 +1798,7 @@ class Optimizer:
                     # Rollback changed this leaf, not the user's grace deadline.
                     saved["path"] = list(observation)
                     atomic_json(path, data)
-                    self.observed_selection = observation
+                    self.reset_codex_observation(observation)
             self.publish_active_path(general, proxies, group, health=None,
                                      phase="monitoring" if self.cfg["enabled"] else "paused",
                                      next_scan_at=iso(), message=message,
@@ -1780,7 +1858,7 @@ class Optimizer:
             self.manual_until = manual_until
             self.recover_pending()
             self.manual_revision += 1
-            self.observed_selection = active_path(general, latest, group)
+            self.reset_codex_observation(active_path(general, latest, group))
             self.failures = 0
             self.next_scan = now + self.cfg["scan_interval_seconds"]
             result.update(ok=True, message="已手动切换；暂时尊重此选择")
@@ -1937,9 +2015,10 @@ class Optimizer:
             atomic_json(protection_path, {"schema_version": 1,
                                          "records": [item for item in records if item.get("context") != context] + [saved]})
             event("external_selection_change", group=observation[1], selected=observation[3])
-        self.observed_selection = observation
+        if external_change or observation != self.observed_selection:
+            self.reset_codex_observation(observation)
 
-    def change_candidate(self, general, group, previous, candidate, *, expected_path=None):
+    def change_candidate(self, general, group, previous, candidate, *, expected_path=None, codex_recovery=False):
         self.recover_pending()
         if self.defer_recovery_scan(force=True):
             return False
@@ -1962,6 +2041,8 @@ class Optimizer:
                 return None  # Removed before PUT; no candidate validation was attempted.
             endpoint = self.require_proxy_endpoint(general, latest, group)
             if self.defer_recovery_scan(force=True):
+                return False
+            if codex_recovery and not self.reserve_codex_recovery(previous, candidate):
                 return False
             self.protect_original(group, previous)
             # Journal only a selection that passed the final guards, before PUT
@@ -2009,7 +2090,7 @@ class Optimizer:
                 save_owned_record(STATE / "selection.json", record, latest=True)
                 self.record = record
                 committed = True
-                self.observed_selection = active_path(general, latest, group)
+                self.reset_codex_observation(active_path(general, latest, group))
                 self.failures = 0
                 self.last_health = now
                 self.write_status(selected=candidate, mode=mode[0], group=group,
@@ -2022,6 +2103,8 @@ class Optimizer:
                 self.prune_probe_history(force_quarantine=True)
             self.rollback(group, candidate, previous, pending=pending)
             event("candidate_rejected", node=candidate, reason=result.get("reason", "自动切换已暂停"))
+            if codex_recovery:
+                self.write_status(message="本次 Codex 恢复候选未通过验证，已恢复原选择并继续观察")
             return False
         except Exception as error:
             # If the controller is unreachable, retain the journal for recovery.
@@ -2150,7 +2233,7 @@ class Optimizer:
         if self.manual_revision != revision or self.process_manual_selection() or selection_policy(self.cfg) != policy:
             return
         _, proxies, _ = self.require_active_mode(mode, path, expected_endpoint=endpoint)
-        def ranking():
+        def ranking(recovery_excluded=()):
             rows = self.statistics(names)
             selectable = set(proxies[group].get("all", [])) & set(flatten_candidates(proxies, group))
             for row in rows:
@@ -2158,6 +2241,8 @@ class Optimizer:
                     row.update(eligible=False, reason="该节点不在主代理组可直接选择的列表中")
                 if self.failures >= 2 and row["name"] == current:
                     row.update(eligible=False, reason="所选组节点探测连续失败" if mode[0] == "unknown" else "当前实际连接连续失败")
+                if row["name"] in recovery_excluded:
+                    row.update(eligible=False, reason="Codex 恢复尝试中暂不重复选择")
             rows = apply_region_policy(rows, self.cfg["prefer_japan"], self.cfg["japan_poor_latency_ms"],
                                        self.cfg["japan_fallback_score_ratio"])
             return sorted(rows, key=lambda row: (not row["eligible"], row["score_ms"] if row["score_ms"] is not None else math.inf, row["name"]))
@@ -2198,7 +2283,20 @@ class Optimizer:
         if self.defer_recovery_scan():
             return
         healthy_path = path if health["ok"] else None
-        stats = ranking()
+        recovering = self.failures < 2 and self.codex_recovery_due()
+        recovery_excluded = set()
+        if recovering:
+            try:
+                _, recovery_attempts, wait_reason = self.codex_recovery_budget()
+            except (OSError, ValueError):
+                self.write_status(message="无法读取 Codex 恢复记录，已停止本次恢复换点")
+                return
+            if wait_reason:
+                self.write_status(message=wait_reason)
+                return
+            recovery_excluded = {item[key] for item in recovery_attempts for key in ("previous", "candidate")}
+            recovery_excluded.add(current)
+        stats = ranking(recovery_excluded)
         tried = set()
         reason = "测速完成"
         attempts = 0
@@ -2212,24 +2310,35 @@ class Optimizer:
                                   message="测速策略或自动开关已更新，停止本轮切换")
                 return
             initial_selection = not self.record.get("last_switch_at")
-            candidate, reason = choose_candidate(
-                [row for row in stats if row["name"] not in tried], current,
-                self.record.get("last_switch_at", 0), time.time(),
-                0 if initial_selection else self.cfg["min_improvement_ms"],
-                0 if initial_selection else self.cfg["min_improvement_ratio"],
-                self.cfg["switch_cooldown_seconds"], self.failures >= 2)
+            if recovering:
+                candidate = next((row["name"] for row in stats if row["eligible"]), None)
+                reason = "Codex 持续连接异常，没有尚未尝试且通过探测的候选节点，继续观察"
+            else:
+                candidate, reason = choose_candidate(
+                    [row for row in stats if row["name"] not in tried], current,
+                    self.record.get("last_switch_at", 0), time.time(),
+                    0 if initial_selection else self.cfg["min_improvement_ms"],
+                    0 if initial_selection else self.cfg["min_improvement_ratio"],
+                    self.cfg["switch_cooldown_seconds"], self.failures >= 2)
             if candidate is None or self.stopping():
                 break
-            changed = self.change_candidate(general, group, previous, candidate, expected_path=path)
+            if recovering:
+                changed = self.change_candidate(general, group, previous, candidate, expected_path=path, codex_recovery=True)
+            else:
+                changed = self.change_candidate(general, group, previous, candidate, expected_path=path)
             if changed is not None:
                 attempts += 1
             if changed:
                 healthy_path = self.observed_selection
-                reason = ("已优选所选代理组；Codex 实际出站未验证" if mode[0] == "unknown"
+                reason = ("已尝试其他节点，正在观察 Codex 真实请求" if recovering else
+                          "已优选所选代理组；Codex 实际出站未验证" if mode[0] == "unknown"
                           else "已选用通过连接验证的低延迟节点")
                 self.recover_pending()
                 break
             self.recover_pending()
+            if recovering:
+                reason = self.status.get("message", "Codex 恢复尝试已结束，继续观察当前线路")
+                break
             if self.process_manual_selection():
                 return
             if self.defer_recovery_scan():
