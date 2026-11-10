@@ -93,6 +93,7 @@ class CodexRecoveryTests(unittest.TestCase):
             fixture.clock[0] = 10100
             observation = self.observation(10001, 10090)
             fixture.signals.error_observations = [observation] * 3 + [
+                dict(observation, error_kind="send"), dict(observation, error_kind="tls"),
                 self.observation(9999, 10090), self.observation(10002, 10090, transport=None),
                 dict(observation, request_at=None),
             ]

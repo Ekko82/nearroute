@@ -1648,7 +1648,7 @@ class Optimizer:
             return
         if (self.observed_since <= started <= failed <= now
                 and failed >= now - 600 and observation.get("error_kind") in ("decode", "send", "tls", "reset", "websocket")):
-            self.codex_errors[(started, observation["error_kind"])] = failed
+            self.codex_errors[started] = failed
 
     def codex_recovery_due(self):
         cutoff = time.time() - 600
